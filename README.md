@@ -44,6 +44,7 @@ conda activate rev2fwd_il
 pip install -U torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install isaaclab[isaacsim,all]==2.3.0 --extra-index-url https://pypi.nvidia.com
 pip install wandb
+pip install -e ./isaaclab_tasks
 ```
 
 2) Install this repo (editable) and any optional extras:
