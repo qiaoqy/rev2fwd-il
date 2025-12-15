@@ -382,39 +382,256 @@ Saved forward BC dataset to data/A_forward_from_reverse.npz
 
 ---
 
-### 3.5 Step 3: Train policy A with Behavior Cloning
+### 3.5 Step 3: Train Policy A with Behavior Cloning
+
+This script trains an MLP policy using Behavior Cloning (BC) on the forward dataset generated in Step 2.
+
+**Behavior Cloning Algorithm:**
+- Supervised learning approach: treat imitation as regression
+- Input: observation `obs` (36-dim)
+- Output: action `act` (8-dim) = [ee_pose(7), gripper(1)]
+- Loss: weighted combination of position MSE, quaternion loss, and gripper MSE
+
+**Network Architecture:**
+- MLP with configurable hidden layers (default: 256-256)
+- Output constraints:
+  - Position (3D): direct output, no constraint
+  - Quaternion (4D): normalized to unit length
+  - Gripper (1D): tanh activation, maps to [-1, 1]
 
 ```bash
+# Standard training (recommended settings)
 python scripts/30_train_A_bc.py \
-  --dataset data/A_forward_from_reverse.npz \
-  --out runs/bc_A \
-  --epochs 200 \
-  --batch_size 256 \
-  --lr 1e-3 \
-  --seed 0
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A \
+    --epochs 200 \
+    --batch_size 256 \
+    --lr 1e-3 \
+    --seed 0
+
+# Quick test run
+python scripts/30_train_A_bc.py \
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A_test \
+    --epochs 10 \
+    --batch_size 64
+
+# Custom network architecture (deeper network)
+python scripts/30_train_A_bc.py \
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A_large \
+    --hidden 512 512 256 \
+    --epochs 300
+
+# Adjust loss weights (emphasize position accuracy)
+python scripts/30_train_A_bc.py \
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A_pos \
+    --pos_weight 2.0 \
+    --quat_weight 1.0 \
+    --gripper_weight 0.5
 ```
 
-Outputs:
-- `runs/bc_A/model.pt`
-- `runs/bc_A/norm.json`
-- `runs/bc_A/config.yaml`
+#### CLI Arguments
 
-### 3.6 Step 4: Evaluate policy A on the forward task
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset` | `data/A_forward_from_reverse.npz` | Input NPZ file with `obs` and `act` arrays |
+| `--out` | `runs/bc_A` | Output directory for model and config |
+| `--epochs` | `200` | Number of training epochs |
+| `--batch_size` | `256` | Mini-batch size for SGD |
+| `--lr` | `1e-3` | Learning rate for Adam optimizer |
+| `--seed` | `0` | Random seed for reproducibility |
+| `--hidden` | `256 256` | Hidden layer sizes (space-separated) |
+| `--pos_weight` | `1.0` | Weight for position MSE loss |
+| `--quat_weight` | `1.0` | Weight for quaternion loss |
+| `--gripper_weight` | `1.0` | Weight for gripper MSE loss |
+| `--print_every` | `10` | Print loss every N epochs |
+| `--device` | auto | Torch device (`cuda` or `cpu`) |
+
+#### Output Files
+
+The script saves three files to the `--out` directory:
+
+| File | Description |
+|------|-------------|
+| `model.pt` | PyTorch checkpoint with model weights and architecture info |
+| `norm.json` | Observation normalization statistics (mean, std) |
+| `config.yaml` | Training configuration and final metrics |
+
+#### Loss Functions
+
+| Component | Formula | Description |
+|-----------|---------|-------------|
+| Position | MSE(pos_pred, pos_gt) | Mean squared error on XYZ |
+| Quaternion | 1 - \|dot(q_pred, q_gt)\| | Handles q ≡ -q equivalence |
+| Gripper | MSE(grip_pred, grip_gt) | Works with -1/+1 labels |
+
+#### Example Output
+
+```
+============================================================
+Behavior Cloning Training
+============================================================
+Dataset: data/A_forward_from_reverse.npz
+Output: runs/bc_A
+Device: cuda
+Seed: 0
+============================================================
+
+Loading dataset...
+  Samples: 37121
+  Obs dim: 36
+  Act dim: 8
+
+Computing observation normalization...
+  Mean range: [-0.2673, 1.0000]
+  Std range: [0.0000, 1.1189]
+
+DataLoader created: 146 batches per epoch
+
+Model created: 77,320 parameters
+
+============================================================
+Starting training...
+============================================================
+
+Epoch    1/200 | Loss: 0.086595 (pos: 0.006664, quat: 0.009868, grip: 0.070064) | Time: 0.5s
+Epoch   10/200 | Loss: 0.000286 (pos: 0.000129, quat: 0.000104, grip: 0.000053) | Time: 2.6s
+...
+Epoch  200/200 | Loss: 0.000036 (pos: 0.000030, quat: 0.000005, grip: 0.000000) | Time: 46.3s
+
+Training completed in 46.3s
+
+============================================================
+Training Summary
+============================================================
+Final loss: 0.000036
+  Position: 0.000030
+  Quaternion: 0.000005
+  Gripper: 0.000000
+============================================================
+
+Saved model to runs/bc_A/model.pt
+Saved normalization to runs/bc_A/norm.json
+Saved config to runs/bc_A/config.yaml
+```
+
+---
+
+### 3.6 Step 4: Evaluate Policy A on the Forward Task
+
+This script evaluates the trained BC policy on the actual forward pick-and-place task in Isaac Lab.
+
+**Forward Task Definition:**
+- Cube starts at a RANDOM position on the table (default env.reset behavior)
+- Policy A should pick it up and place it at the GOAL (plate center)
+- No teleportation of the cube is performed
+
+**Success Criterion:**
+- Cube XY distance to goal < `success_radius` (default 3cm)
+- Note: Gripper state is NOT considered for success determination
 
 ```bash
+# Standard evaluation (headless mode, 50 rollouts)
 python scripts/40_eval_A.py \
-  --task Isaac-Lift-Cube-Franka-IK-Abs-v0 \
-  --checkpoint runs/bc_A/model.pt \
-  --norm runs/bc_A/norm.json \
-  --num_rollouts 50 \
-  --horizon 250 \
-  --headless
+    --checkpoint runs/bc_A/model.pt \
+    --norm runs/bc_A/norm.json \
+    --num_rollouts 50 \
+    --horizon 450 \
+    --headless
+
+# Quick validation (fewer rollouts)
+python scripts/40_eval_A.py \
+    --checkpoint runs/bc_A/model.pt \
+    --norm runs/bc_A/norm.json \
+    --num_rollouts 5 \
+    --horizon 450 \
+    --headless
+
+# With GUI visualization (for debugging)
+python scripts/40_eval_A.py \
+    --checkpoint runs/bc_A/model.pt \
+    --norm runs/bc_A/norm.json \
+    --num_rollouts 10 \
+    --horizon 450
 ```
 
-Report:
-- success rate
-- mean final distance to goal
-- optional: save videos
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint` | `runs/bc_A/model.pt` | Path to trained model checkpoint |
+| `--norm` | `runs/bc_A/norm.json` | Path to normalization statistics |
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Isaac Lab Gym task ID |
+| `--num_envs` | `1` | Number of parallel environments |
+| `--num_rollouts` | `50` | Number of evaluation episodes |
+| `--horizon` | `250` | Maximum steps per episode |
+| `--seed` | `42` | Random seed for reproducibility |
+| `--disable_fabric` | `0` | If `1`, disables Fabric backend |
+| `--headless` | - | Run without GUI (from AppLauncher) |
+
+#### Evaluation Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Success Rate | Percentage of rollouts where cube reaches goal |
+| Avg Final Dist | Mean XY distance from cube to goal at episode end |
+| Min Final Dist | Best performance across all rollouts |
+| Max Final Dist | Worst performance across all rollouts |
+
+#### Example Output
+
+```
+============================================================
+Evaluating Policy A on Forward Task
+============================================================
+Goal XY: [0.5 0. ]
+Success radius: 0.03
+Horizon: 450
+Num rollouts: 10
+============================================================
+
+Rollout   1/10 | Steps: 250 | Final dist: 0.2173 | Gripper: +1.00 | Success: False
+Rollout   2/10 | Steps: 250 | Final dist: 0.1680 | Gripper: +1.00 | Success: False
+Rollout   3/10 | Steps: 250 | Final dist: 0.1718 | Gripper: +0.99 | Success: False
+Rollout   4/10 | Steps: 250 | Final dist: 0.0782 | Gripper: +0.99 | Success: False
+Rollout   5/10 | Steps: 250 | Final dist: 0.1818 | Gripper: +1.00 | Success: False
+Rollout   6/10 | Steps: 250 | Final dist: 0.0514 | Gripper: +1.00 | Success: False
+Rollout   7/10 | Steps: 250 | Final dist: 0.0225 | Gripper: -0.93 | Success: True
+Rollout   8/10 | Steps: 250 | Final dist: 0.0673 | Gripper: +1.00 | Success: False
+Rollout   9/10 | Steps: 250 | Final dist: 0.2377 | Gripper: +0.99 | Success: False
+Rollout  10/10 | Steps: 250 | Final dist: 0.0780 | Gripper: -1.00 | Success: False
+
+============================================================
+Evaluation Results
+============================================================
+Success rate: 10.0% (1/10)
+Average final distance: 0.1274m
+Min final distance: 0.0225m
+Max final distance: 0.2377m
+============================================================
+
+============================================================
+FINAL EVALUATION SUMMARY
+============================================================
+Checkpoint: runs/bc_A/model.pt
+Task: Isaac-Lift-Cube-Franka-IK-Abs-v0
+Num rollouts: 10
+Horizon: 450
+------------------------------------------------------------
+SUCCESS RATE: 10.0%
+AVG FINAL DIST: 0.1274m
+MIN FINAL DIST: 0.0225m
+MAX FINAL DIST: 0.2377m
+============================================================
+```
+
+#### Notes on Evaluation
+
+- **Episode Length:** The default environment timeout is 250 steps. Use `--horizon` to set the maximum, but the episode may terminate earlier.
+- **Random Initialization:** Each rollout starts with the cube at a different random position on the table.
+- **Sanity Check:** Even with low success rate, `avg_final_dist` should be smaller than random policy (~0.2-0.3m).
 
 ---
 
