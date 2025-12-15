@@ -1,0 +1,23 @@
+name: rev2fwd_il
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # Keep conda env minimal. Do NOT install Isaac Lab / Isaac Sim / Torch here.
+  # Install Isaac Lab first (per README), then:
+  #   pip install -e .
+  #   pip install -e ".[extras]"
+  - pip:
+      - numpy>=1.26
+      - scipy
+      - pyyaml
+      - tqdm
+      - h5py
+      - matplotlib
+      - rich
+      - imageio
+      - imageio-ffmpeg
+      - tensorboard
+      - einops
+      - wandb

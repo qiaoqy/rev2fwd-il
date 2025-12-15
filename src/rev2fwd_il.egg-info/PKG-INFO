@@ -1,3 +1,30 @@
+Metadata-Version: 2.4
+Name: rev2fwd-il
+Version: 0.0.0
+Summary: Minimal Isaac Lab runner / Reverse-to-Forward IL utilities
+Author: rev2fwd-il
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Provides-Extra: extras
+Requires-Dist: pyyaml; extra == "extras"
+Requires-Dist: tqdm; extra == "extras"
+Requires-Dist: h5py; extra == "extras"
+Requires-Dist: matplotlib; extra == "extras"
+Requires-Dist: rich; extra == "extras"
+Requires-Dist: imageio; extra == "extras"
+Requires-Dist: imageio-ffmpeg; extra == "extras"
+Requires-Dist: tensorboard; extra == "extras"
+Requires-Dist: einops; extra == "extras"
+Requires-Dist: wandb; extra == "extras"
+Provides-Extra: train
+Requires-Dist: torch; extra == "train"
+Requires-Dist: torchvision; extra == "train"
+Provides-Extra: dev
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+
 # rev2fwd-il: Reverse-to-Forward Imitation Learning (Isaac Lab)
 
 This repo is a minimal simulator validation for the idea:
@@ -68,77 +95,15 @@ pip install -e ".[extras]"
 ---
 
 ## 3. Quickstart
-
 ### 3.1 Sanity check: can we run the environment?
-
-This script launches Isaac Sim via Isaac Lab's `AppLauncher`, creates a gymnasium environment,
-prints action/observation spaces + key scene entities, and then steps the simulation.
-
 ```bash
-# Minimal headless smoke test (recommended)
-python scripts/00_sanity_check_env.py --headless --steps 50
+python scripts/00_sanity_check_env.py \
+  --task Isaac-Lift-Cube-Franka-IK-Abs-v0 \
+  --headless 0
 ```
-
-More examples:
-
-```bash
-# GUI mode (creates a window)
-python scripts/00_sanity_check_env.py --steps 200
-
-# Random actions (useful to verify actuation is alive)
-python scripts/00_sanity_check_env.py --headless --steps 50 --random_action 1
-
-# Deterministic micro-perturbation on action dim-0 (useful for IK tasks)
-python scripts/00_sanity_check_env.py --headless --steps 50 --nudge_action 0.01
-```
-
-#### CLI arguments (script-specific)
-
-- `--task`:
-  Gym task id to create via `gym.make(...)`.
-
-- `--num_envs`:
-  Number of parallel environments (vectorized) inside the same simulation.
-
-- `--rl_device`:
-  Alias for the AppLauncher `--device` argument (e.g. `cuda`, `cuda:0`, `cpu`).
-  Use this to avoid argparse name conflicts.
-
-- `--disable_fabric`:
-  If set to `1`, disables Fabric in the parsed env cfg.
-
-- `--steps`:
-  How many `env.step(...)` calls to run.
-
-- `--seed`:
-  RNG seed for python/numpy/torch.
-
-- `--random_action`:
-  If `1`, sample actions from `env.action_space` each step.
-
-- `--nudge_action`:
-  If non-zero, use a stable zero action and add a small deterministic value to action dimension 0.
-  Helpful for debugging IK control paths.
-
-- `--print_every`:
-  Print debug diagnostics every N steps (default: 1).
-
-- `--step_timeout_s`:
-  If a single `env.step()` is slower than this threshold, print a warning.
-
-#### AppLauncher arguments (Isaac Lab / Isaac Sim)
-
-The script also supports standard launcher flags injected by
-`isaaclab.app.AppLauncher.add_app_launcher_args(parser)`.
-Common ones include:
-
-- `--headless`:
-  Run Isaac Sim without opening a window.
-
-- `--device`:
-  Simulation device for Isaac Lab tensors (e.g. `cuda:0`).
-
-Run `python scripts/00_sanity_check_env.py --help` to see the full list provided by your Isaac Lab version.
+Expected:
+- Franka + cube on a table
+- the scripted expert should move towards the cube and perform a pick motion
 
 ### 3.2 Step 1: Collect reverse rollouts (policy B)
 

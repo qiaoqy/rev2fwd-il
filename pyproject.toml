@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rev2fwd-il"
+version = "0.0.0"
+description = "Minimal Isaac Lab runner / Reverse-to-Forward IL utilities"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "rev2fwd-il" }]
+
+# Keep the base install minimal so it can be layered on top of an existing Isaac Lab env.
+# Isaac Lab / Isaac Sim / Torch versions are intentionally NOT pinned here.
+dependencies = [
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Utilities that do not conflict with Isaac Lab installs.
+extras = [
+  "pyyaml",
+  "tqdm",
+  "h5py",
+  "matplotlib",
+  "rich",
+  "imageio",
+  "imageio-ffmpeg",
+  "tensorboard",
+  "einops",
+  "wandb",
+]
+
+# Training stack (left unpinned so you can match your Isaac Lab + CUDA toolchain).
+train = [
+  "torch",
+  "torchvision",
+]
+
+# Dev tooling (optional)
+dev = [
+  "ruff",
+  "mypy",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
