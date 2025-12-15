@@ -183,7 +183,7 @@ def load_policy_and_norm(
     checkpoint_path: str,
     norm_path: str,
     device: str = "cuda",
-) -> tuple["MLPPolicy", np.ndarray, np.ndarray]:
+):
     """Load trained policy and normalization statistics.
 
     Args:
@@ -195,6 +195,7 @@ def load_policy_and_norm(
         Tuple of (policy, mean, std).
     """
     from rev2fwd_il.models.mlp_policy import MLPPolicy
+    from rev2fwd_il.models.resnet_policy import ResNetPolicy
     from rev2fwd_il.data.normalize import load_norm
 
     # Load checkpoint
@@ -203,9 +204,24 @@ def load_policy_and_norm(
     obs_dim = checkpoint["obs_dim"]
     act_dim = checkpoint["act_dim"]
     hidden = tuple(checkpoint["hidden"])
+    arch = checkpoint.get("arch", "mlp")  # Default to mlp for backward compatibility
 
-    # Create model and load weights
-    policy = MLPPolicy(obs_dim=obs_dim, hidden=hidden, act_dim=act_dim)
+    # Create model based on architecture
+    if arch == "mlp":
+        policy = MLPPolicy(obs_dim=obs_dim, hidden=hidden, act_dim=act_dim)
+    elif arch == "resnet":
+        num_blocks = checkpoint.get("num_blocks", 3)
+        dropout = checkpoint.get("dropout", 0.0)
+        policy = ResNetPolicy(
+            obs_dim=obs_dim,
+            hidden_dim=hidden[0],
+            num_blocks=num_blocks,
+            act_dim=act_dim,
+            dropout=dropout,
+        )
+    else:
+        raise ValueError(f"Unknown architecture: {arch}")
+
     policy.load_state_dict(checkpoint["model_state_dict"])
     policy.to(device)
     policy.eval()

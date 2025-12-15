@@ -52,6 +52,8 @@ python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 50 \\
 # With GUI visualization (slower but useful for debugging)
 python scripts/10_collect_B_reverse_rollouts.py --num_episodes 10
 
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 1000 --num_envs 32
+
 =============================================================================
 """
 
@@ -85,6 +87,14 @@ def _parse_args() -> argparse.Namespace:
     # -----------------------------------------------------------------
     # Data collection parameters
     # -----------------------------------------------------------------
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=16,
+        help="Number of parallel environments for data collection. "
+             "Higher values = faster collection but more GPU memory. "
+             "Recommended: 8-32 depending on GPU memory.",
+    )
     parser.add_argument(
         "--num_episodes",
         type=int,
@@ -182,7 +192,7 @@ def main() -> None:
     from rev2fwd_il.sim.make_env import make_env
     from rev2fwd_il.sim.task_spec import PickPlaceTaskSpec
     from rev2fwd_il.experts.pickplace_expert_b import PickPlaceExpertB
-    from rev2fwd_il.data.recorder import rollout_expert_B_reverse
+    from rev2fwd_il.data.recorder import rollout_expert_B_reverse, rollout_expert_B_reverse_parallel
     from rev2fwd_il.data.io_npz import save_episodes
     from rev2fwd_il.utils.seed import set_seed
 
@@ -196,17 +206,17 @@ def main() -> None:
         # =================================================================
         # Step 4: Create the gymnasium environment
         # =================================================================
-        # We use num_envs=1 because the recorder is designed for single-env
-        # sequential data collection. For parallel collection, use a
-        # different approach with vectorized environments.
+        # Use num_envs from args for parallel data collection.
+        # Higher num_envs = faster collection but more GPU memory.
         # 
         # IMPORTANT: 
         # - Set episode_length_s to a large value to prevent auto-reset
         # - Set disable_terminations=True to prevent robot from teleporting
         #   back to initial position when task completes
+        num_envs = args.num_envs
         env = make_env(
             task_id=args.task,
-            num_envs=1,
+            num_envs=num_envs,
             device=args.device,
             use_fabric=not bool(args.disable_fabric),
             episode_length_s=100.0,  # Prevent auto-reset (default is 5.0s)
@@ -214,7 +224,6 @@ def main() -> None:
         )
 
         device = env.unwrapped.device
-        num_envs = env.unwrapped.num_envs
 
         # =================================================================
         # Step 5: Define task specification
@@ -227,7 +236,7 @@ def main() -> None:
             goal_xy=(0.5, 0.0),      # Plate center position
             hover_z=0.25,            # Hover height (25cm above table)
             grasp_z_offset=0.0,      # Grasp at object center height
-            success_radius=0.03,     # 8cm tolerance for success 
+            success_radius=0.03,     # 3cm tolerance for success 
             settle_steps=10,         # Wait steps at each FSM state
         )
 
@@ -245,13 +254,13 @@ def main() -> None:
             device=device,
             hover_z=task_spec.hover_z,
             grasp_z_offset=task_spec.grasp_z_offset,
-            release_z_offset=-0.04,   # Lower 1.5cm before releasing for stability
+            release_z_offset=-0.04,   # Lower 4cm before releasing for stability
             position_threshold=0.015,  # 1.5cm threshold for reaching waypoints
             wait_steps=task_spec.settle_steps,
         )
 
         # =================================================================
-        # Step 7: Data collection loop
+        # Step 7: Data collection loop (PARALLEL)
         # =================================================================
         episodes = []           # List to store collected Episode objects
         completed_count = 0     # Number of episodes where Expert B reached DONE
@@ -261,6 +270,7 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"Collecting {args.num_episodes} reverse rollouts")
         print(f"Settings:")
+        print(f"  - num_envs (parallel): {num_envs}")
         print(f"  - horizon: {args.horizon}")
         print(f"  - settle_steps: {args.settle_steps}")
         print(f"  - success_radius: {task_spec.success_radius}m")
@@ -269,16 +279,16 @@ def main() -> None:
         print(f"{'='*60}\n")
 
         start_time = time.time()
-        attempt_count = 0
-        max_attempts = args.num_episodes * 3  # Limit total attempts to 3x requested
+        batch_count = 0
+        max_batches = (args.num_episodes // num_envs + 1) * 3  # Limit total batches
 
-        # Keep collecting until we have enough episodes or hit max attempts
-        while len(episodes) < args.num_episodes and attempt_count < max_attempts:
-            attempt_count += 1
+        # Keep collecting until we have enough episodes or hit max batches
+        while len(episodes) < args.num_episodes and batch_count < max_batches:
+            batch_count += 1
 
-            # Run one episode with Expert B
-            # Returns: (Episode object, whether expert completed FSM)
-            episode, expert_completed = rollout_expert_B_reverse(
+            # Run parallel episodes with Expert B
+            # Returns: list of (Episode, expert_completed) tuples
+            results = rollout_expert_B_reverse_parallel(
                 env=env,
                 expert=expert,
                 task_spec=task_spec,
@@ -287,44 +297,58 @@ def main() -> None:
                 settle_steps=args.settle_steps,
             )
 
-            # Only save episodes where Expert B completed the full FSM
-            # This ensures we have complete trajectories for time reversal
-            if expert_completed:
-                completed_count += 1
-                episodes.append(episode)
-                
-                # Track success rate (cube near target position)
-                if episode.success:
-                    success_count += 1
+            # Process results from all parallel envs
+            batch_completed = 0
+            batch_success = 0
+            for episode, expert_completed in results:
+                # Only save episodes where Expert B completed the full FSM
+                if expert_completed:
+                    completed_count += 1
+                    batch_completed += 1
+                    episodes.append(episode)
+                    
+                    # Track success rate (cube near target position)
+                    if episode.success:
+                        success_count += 1
+                        batch_success += 1
+                    
+                    # Stop if we have enough episodes
+                    if len(episodes) >= args.num_episodes:
+                        break
 
-            # Print progress every 10 episodes
-            if attempt_count % 10 == 0 or attempt_count == 1:
-                elapsed = time.time() - start_time
-                rate = attempt_count / elapsed
-                print(
-                    f"Attempt {attempt_count:4d} | "
-                    f"Saved: {len(episodes)}/{args.num_episodes} | "
-                    f"Completed: {completed_count} ({100*completed_count/attempt_count:.1f}%) | "
-                    f"Success: {success_count} | "
-                    f"Rate: {rate:.2f} ep/s | "
-                    f"Length: {episode.length}"
-                )
+            # Print progress every batch
+            elapsed = time.time() - start_time
+            total_attempts = batch_count * num_envs
+            rate = total_attempts / elapsed
+            print(
+                f"Batch {batch_count:3d} ({num_envs} envs) | "
+                f"Saved: {len(episodes)}/{args.num_episodes} | "
+                f"This batch: {batch_completed}/{num_envs} completed, {batch_success} success | "
+                f"Total: {completed_count} completed, {success_count} success | "
+                f"Rate: {rate:.1f} ep/s"
+            )
 
         # =================================================================
         # Step 8: Print summary statistics
         # =================================================================
         elapsed = time.time() - start_time
+        total_attempts = batch_count * num_envs
         print(f"\n{'='*60}")
         print(f"Collection finished in {elapsed:.1f}s")
-        print(f"Total attempts: {attempt_count}")
-        print(f"Completed FSM: {completed_count} ({100*completed_count/attempt_count:.1f}%)")
+        print(f"Parallel envs: {num_envs}")
+        print(f"Total batches: {batch_count}")
+        print(f"Total attempts: {total_attempts}")
+        print(f"Completed FSM: {completed_count} ({100*completed_count/total_attempts:.1f}%)")
         print(f"Saved episodes: {len(episodes)}")
         print(f"Success (cube at target): {success_count} ({100*success_count/len(episodes) if episodes else 0:.1f}%)")
+        print(f"Effective rate: {len(episodes)/elapsed:.2f} episodes/s")
         print(f"{'='*60}\n")
 
         # =================================================================
         # Step 9: Save collected episodes to NPZ file
         # =================================================================
+        # Trim to exact number requested
+        episodes = episodes[:args.num_episodes]
         save_episodes(args.out, episodes)
 
         # Clean up environment

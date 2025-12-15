@@ -111,6 +111,9 @@ def _parse_args() -> argparse.Namespace:
             - lr: Learning rate for Adam optimizer
             - seed: Random seed for reproducibility
             - hidden: List of hidden layer sizes
+            - arch: Model architecture
+            - num_blocks: Number of residual blocks
+            - dropout: Dropout probability
             - pos_weight: Weight for position loss
             - quat_weight: Weight for quaternion loss
             - gripper_weight: Weight for gripper loss
@@ -175,13 +178,35 @@ def _parse_args() -> argparse.Namespace:
     # Model Architecture
     # =========================================================================
     parser.add_argument(
+        "--arch",
+        type=str,
+        default="resnet",
+        choices=["mlp", "resnet"],
+        help="Model architecture: 'mlp' (vanilla MLP) or 'resnet' (ResNet-style MLP "
+             "with residual connections and LayerNorm). Default: resnet.",
+    )
+    parser.add_argument(
         "--hidden",
         type=int,
         nargs="+",
         default=[256, 256],
-        help="Hidden layer sizes for the MLP policy. Specify as space-separated "
-             "integers. Example: --hidden 256 256 (two layers of 256 units). "
+        help="For MLP: hidden layer sizes (e.g., --hidden 256 256). "
+             "For ResNet: first value is hidden_dim (e.g., --hidden 256). "
              "Default: [256, 256].",
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=int,
+        default=3,
+        help="Number of residual blocks (only for resnet architecture). "
+             "More blocks = deeper network. Default: 3.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability in residual blocks (only for resnet). "
+             "Set to 0.1-0.2 for regularization. Default: 0.0.",
     )
 
     # =========================================================================
@@ -258,6 +283,9 @@ def main() -> None:
         lr=args.lr,
         seed=args.seed,
         hidden=tuple(args.hidden),
+        arch=args.arch,
+        num_blocks=args.num_blocks,
+        dropout=args.dropout,
         pos_weight=args.pos_weight,
         quat_weight=args.quat_weight,
         gripper_weight=args.gripper_weight,
