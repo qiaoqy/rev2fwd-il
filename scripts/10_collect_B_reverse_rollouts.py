@@ -127,7 +127,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=str,
-        default="data/B_reverse_100eps.npz",
+        default="data/B_reverse_latest.npz",
         help="Output path for the NPZ file containing collected episodes.",
     )
     
@@ -199,11 +199,18 @@ def main() -> None:
         # We use num_envs=1 because the recorder is designed for single-env
         # sequential data collection. For parallel collection, use a
         # different approach with vectorized environments.
+        # 
+        # IMPORTANT: 
+        # - Set episode_length_s to a large value to prevent auto-reset
+        # - Set disable_terminations=True to prevent robot from teleporting
+        #   back to initial position when task completes
         env = make_env(
             task_id=args.task,
             num_envs=1,
             device=args.device,
             use_fabric=not bool(args.disable_fabric),
+            episode_length_s=100.0,  # Prevent auto-reset (default is 5.0s)
+            disable_terminations=True,  # Prevent robot teleport on task completion
         )
 
         device = env.unwrapped.device
@@ -220,7 +227,7 @@ def main() -> None:
             goal_xy=(0.5, 0.0),      # Plate center position
             hover_z=0.25,            # Hover height (25cm above table)
             grasp_z_offset=0.0,      # Grasp at object center height
-            success_radius=0.08,     # 8cm tolerance for success (relaxed)
+            success_radius=0.03,     # 8cm tolerance for success 
             settle_steps=10,         # Wait steps at each FSM state
         )
 

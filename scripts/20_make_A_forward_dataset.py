@@ -61,7 +61,7 @@ USAGE EXAMPLES
 =============================================================================
 # Basic usage (process all episodes, including failures)
 python scripts/20_make_A_forward_dataset.py \\
-    --input data/B_reverse_100eps.npz \\
+    --input data/B_reverse_latest.npz \\
     --out data/A_forward_from_reverse.npz \\
     --success_only 0
 

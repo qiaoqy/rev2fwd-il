@@ -270,11 +270,19 @@ def main() -> None:
     # =========================================================================
     print(f"\nCreating environment: {args.task}")
 
+    # env = make_env(
+    #     task_id=args.task,
+    #     num_envs=args.num_envs,
+    #     device=device,
+    #     use_fabric=(args.disable_fabric == 0),
+    # )
     env = make_env(
         task_id=args.task,
         num_envs=args.num_envs,
         device=device,
         use_fabric=(args.disable_fabric == 0),
+        episode_length_s=100.0,  # Prevent auto-reset (default is 5.0s)
+        disable_terminations=True,  # Prevent robot teleport on task completion
     )
 
     print(f"Environment created with {env.unwrapped.num_envs} envs")

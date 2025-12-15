@@ -169,11 +169,15 @@ def main() -> None:
         # - num_envs: Vectorized env count (parallel simulations)
         # - device: GPU/CPU for tensor operations
         # - use_fabric: Fabric backend for faster USD operations
+        # - episode_length_s: Set large value to prevent auto-reset during debugging
+        # - disable_terminations: Prevent robot from teleporting back on task completion
         env = make_env(
             task_id=args.task,
             num_envs=args.num_envs,
             device=args.device,
             use_fabric=not bool(args.disable_fabric),
+            episode_length_s=100.0,  # Prevent auto-reset (default is 5.0s = ~250 steps)
+            disable_terminations=True,  # Prevent robot teleport on task completion
         )
 
         device = env.unwrapped.device  # Actual device used by simulation
