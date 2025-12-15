@@ -145,7 +145,7 @@ python scripts/01_debug_expert_B_one_episode.py --headless --seed 123 --steps 60
 The expert follows this finite state machine sequence:
 
 ```
-REST → GO_ABOVE_OBJ → GO_TO_OBJ → CLOSE → LIFT → GO_ABOVE_PLACE → GO_TO_PLACE → OPEN → RETURN_REST → DONE
+REST → GO_ABOVE_OBJ → GO_TO_OBJ → CLOSE → LIFT → GO_ABOVE_PLACE → GO_TO_PLACE → LOWER_TO_RELEASE → OPEN → RETURN_REST → DONE
 ```
 
 | State | Description | Gripper |
@@ -157,6 +157,7 @@ REST → GO_ABOVE_OBJ → GO_TO_OBJ → CLOSE → LIFT → GO_ABOVE_PLACE → GO
 | `LIFT` | Lift object to hover height | Close |
 | `GO_ABOVE_PLACE` | Move to above place position | Close |
 | `GO_TO_PLACE` | Lower to place position | Close |
+| `LOWER_TO_RELEASE` | Lower further for stable release | Close |
 | `OPEN` | Open gripper to release object | Open |
 | `RETURN_REST` | Return to initial REST pose | Open |
 | `DONE` | Episode complete | Open |
@@ -207,40 +208,179 @@ EE distance to rest: 0.0046
 
 ### 3.3 Step 1: Collect reverse rollouts (policy B)
 
-Reverse task:
+This script collects demonstration data from Expert B performing the **reverse** pick-and-place task.
 
-- cube starts at the GOAL region ("in the plate")
-- B picks and places the cube to a random table location
+**Reverse task definition:**
+- Cube starts at the GOAL position (plate center at ~[0.5, 0.0])
+- Expert B picks it up and places it at a RANDOM position on the table
+- Robot returns to REST pose
 
 ```bash
-python scripts/10_collect_B_reverse_rollouts.py \
-  --task Isaac-Lift-Cube-Franka-IK-Abs-v0 \
-  --num_episodes 100 \
-  --horizon 250 \
-  --seed 0 \
-  --out data/B_reverse_100eps.npz \
-  --headless
+# Basic usage (headless mode, 100 episodes)
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 100
+
+# Custom output path and seed
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 50 \
+    --out data/B_reverse_50eps.npz --seed 42
+
+# With longer horizon (if expert doesn't complete FSM)
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 100 \
+    --horizon 500 --settle_steps 50
 ```
 
-Notes:
-- We only keep SUCCESS episodes (or keep all and filter later).
-- After placing, we add settle_steps so the cube comes to rest on the table.
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Isaac Lab Gym task ID |
+| `--num_episodes` | `100` | Number of episodes to collect |
+| `--horizon` | `400` | Max steps per episode (Expert B needs ~300-400 steps) |
+| `--settle_steps` | `40` | Extra steps after expert finishes to let cube settle |
+| `--seed` | `0` | Random seed for reproducibility |
+| `--out` | `data/B_reverse_100eps.npz` | Output NPZ file path |
+| `--disable_fabric` | `0` | If `1`, disables Fabric backend |
+| `--headless` | - | Run without GUI |
+
+#### Output Data Format
+
+The script saves an NPZ file with the following structure for each episode `i`:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `obs_i` | `(T, 36)` | Policy observation sequence |
+| `ee_pose_i` | `(T, 7)` | End-effector pose `[x, y, z, qw, qx, qy, qz]` |
+| `obj_pose_i` | `(T, 7)` | Object (cube) pose `[x, y, z, qw, qx, qy, qz]` |
+| `gripper_i` | `(T,)` | Gripper action (`+1`=open, `-1`=close) |
+| `place_pose_i` | `(7,)` | Target place position (random table position) |
+| `goal_pose_i` | `(7,)` | Goal position (plate center, fixed) |
+| `success_i` | `bool` | Whether cube ended up near target position |
+
+**Notes:**
+- Only episodes where Expert B completes the full FSM (reaches DONE state) are saved
+- The `success` flag indicates whether the cube is within `success_radius` of the target
+- Episode length `T` is typically 330-400 steps
+
+#### Example Output
+
+```
+============================================================
+Collecting 30 reverse rollouts
+Settings:
+  - horizon: 400
+  - settle_steps: 40
+  - success_radius: 0.08m
+  - release_z_offset: -0.015m
+  - Only saving episodes with completed FSM (DONE state)
+============================================================
+
+Attempt    1 | Saved: 1/30 | Completed: 1 (100.0%) | Success: 0 | Rate: 0.25 ep/s | Length: 394
+Attempt   10 | Saved: 10/30 | Completed: 10 (100.0%) | Success: 1 | Rate: 0.31 ep/s | Length: 330
+Attempt   20 | Saved: 20/30 | Completed: 20 (100.0%) | Success: 2 | Rate: 0.33 ep/s | Length: 394
+Attempt   30 | Saved: 30/30 | Completed: 30 (100.0%) | Success: 3 | Rate: 0.33 ep/s | Length: 392
+
+============================================================
+Collection finished in 92.3s
+Total attempts: 30
+Completed FSM: 30 (100.0%)
+Saved episodes: 30
+Success (cube at target): 3 (10.0%)
+============================================================
+
+Saved 30 episodes to data/B_reverse_30eps.npz
+```
+
+---
 
 ### 3.4 Step 2: Reverse trajectories -> build forward BC dataset for A
 
-Forward task we want A to learn:
-- cube starts at random table location
-- A moves it into GOAL region
+This script converts REVERSE rollouts from Expert B into FORWARD training data for Policy A.
 
-We DO NOT simply reverse B actions. Instead we:
-- reverse (obs, ee_pose, gripper) sequences
-- build action labels as the next-step (ee_pose, gripper)
+**Core idea:** A reverse trajectory (goal → table) when played backwards becomes a forward trajectory (table → goal).
+
+**Key challenge:** We cannot simply reverse the actions because:
+1. The gripper open/close timing would be wrong
+2. IK-Abs actions are absolute poses, not deltas
+
+**Solution:** We reconstruct action labels using heuristics:
+- **EE pose action:** Use the NEXT timestep's EE pose (where we want to go)
+- **Gripper action:** Infer from EE-object distance and object-goal proximity
 
 ```bash
+# Basic usage (use all episodes)
 python scripts/20_make_A_forward_dataset.py \
-  --in data/B_reverse_100eps.npz \
-  --out data/A_forward_from_reverse.npz
+    --input data/B_reverse_100eps.npz \
+    --out data/A_forward_from_reverse.npz \
+    --success_only 0
+
+# Only use successful episodes (stricter filtering)
+python scripts/20_make_A_forward_dataset.py \
+    --input data/B_reverse_100eps.npz \
+    --out data/A_forward_from_reverse.npz \
+    --success_only 1
 ```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input` | `data/B_reverse_100eps.npz` | Input NPZ file from script 10 |
+| `--out` | `data/A_forward_from_reverse.npz` | Output NPZ file for BC training |
+| `--success_only` | `1` | If `1`, only use successful episodes |
+
+#### Gripper Heuristic
+
+For the forward task (table → goal), the gripper action is inferred as:
+
+| Condition | Gripper | Reasoning |
+|-----------|---------|-----------|
+| EE close to object AND object far from goal | **CLOSE** (-1) | Grasp object to transport it |
+| EE far from object OR object close to goal | **OPEN** (+1) | Approaching or finished placing |
+
+A healthy gripper CLOSE ratio is typically **30-50%** (grasping/transporting phase).
+
+#### Output Data Format
+
+The script outputs a flat NPZ file for BC training:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `obs` | `(N, 36)` | Observations in FORWARD time order |
+| `act` | `(N, 8)` | Actions: `[ee_pose(7), gripper(1)]` |
+| `ep_id` | `(N,)` | Episode index (for debugging/analysis) |
+
+Where `N = sum(T_i - 1)` for all episodes (we lose one step per episode because `action[t] = next_ee_pose[t+1]`).
+
+#### Example Output
+
+```
+Loading episodes from data/B_reverse_30eps.npz
+Loaded 30 episodes from data/B_reverse_30eps.npz
+
+============================================================
+Processing 30 episodes
+============================================================
+
+Episode    1 | Length:  329 | CLOSE ratio: 35.0%
+Episode   20 | Length:  393 | CLOSE ratio: 34.1%
+
+============================================================
+Dataset Statistics
+============================================================
+Total episodes: 30
+Total steps: 10170
+Average episode length: 339.0
+Observation dim: 36
+Action dim: 8
+Gripper CLOSE ratio: 35.0%
+============================================================
+
+Saved forward BC dataset to data/A_forward_from_reverse.npz
+  obs shape: (10170, 36)
+  act shape: (10170, 8)
+  ep_id shape: (10170,)
+```
+
+---
 
 ### 3.5 Step 3: Train policy A with Behavior Cloning
 
@@ -278,7 +418,41 @@ Report:
 
 ---
 
-## 4. What "success" means in this repo
+## 4. Data Formats Reference
+
+### 4.1 Episode Data Structure (from script 10)
+
+Each episode contains the following fields:
+
+| Field | Shape | Physical Meaning |
+|-------|-------|------------------|
+| `obs` | `(T, 36)` | Policy observation: joint_pos(9), joint_vel(9), object_pos(3), target_pos(7), prev_actions(8) |
+| `ee_pose` | `(T, 7)` | End-effector pose `[x, y, z, qw, qx, qy, qz]` in world frame |
+| `obj_pose` | `(T, 7)` | Object (cube) pose `[x, y, z, qw, qx, qy, qz]` in world frame |
+| `gripper` | `(T,)` | Gripper action: `+1.0` = open, `-1.0` = close |
+| `place_pose` | `(7,)` | Target place pose (Expert B's random table target) |
+| `goal_pose` | `(7,)` | Fixed goal pose (plate center for forward task) |
+| `success` | `bool` | Whether cube ended up near target position |
+
+### 4.2 BC Training Dataset (from script 20)
+
+| Field | Shape | Physical Meaning |
+|-------|-------|------------------|
+| `obs` | `(N, 36)` | Observations in FORWARD time order |
+| `act` | `(N, 8)` | Actions: `[ee_pose(7), gripper(1)]` |
+| `ep_id` | `(N,)` | Episode index (for debugging/analysis) |
+
+### 4.3 Coordinate System
+
+- **World frame:** Z-up, origin at robot base
+- **Table height:** ~0.0m (Z coordinate)
+- **Cube size:** ~5cm cube, center at ~0.025m when on table
+- **Goal position:** Plate center at approximately `[0.5, 0.0, 0.055]`
+- **Table bounds:** X ∈ [0.35, 0.65], Y ∈ [-0.3, 0.3]
+
+---
+
+## 5. What "success" means in this repo
 
 A rollout is SUCCESS if:
 - cube XY distance to goal center < `success_radius`
@@ -287,13 +461,16 @@ A rollout is SUCCESS if:
 
 ---
 
-## 5. Code structure
+## 6. Code structure
 
 ```text
 rev2fwd-il/
 ├── README.md
 ├── environment.yml
 ├── pyproject.toml
+├── data/                              # Collected datasets
+│   ├── B_reverse_*.npz               # Reverse rollouts from Expert B
+│   └── A_forward_from_reverse.npz    # Forward BC dataset for Policy A
 ├── src/
 │   └── rev2fwd_il/
 │       ├── __init__.py
@@ -306,8 +483,8 @@ rev2fwd-il/
 │       │   └── pickplace_expert_b.py  # Expert B: FSM for reverse pick-and-place
 │       ├── data/
 │       │   ├── episode.py           # Episode data structure
-│       │   ├── recorder.py          # Rollout recorder
-│       │   ├── io_npz.py            # Save/load npz datasets
+│       │   ├── recorder.py          # Rollout recorder for Expert B
+│       │   ├── io_npz.py            # Save/load NPZ datasets
 │       │   ├── reverse_time.py      # Time reversal + action reconstruction
 │       │   └── normalize.py         # Obs/action normalization
 │       ├── models/
@@ -323,12 +500,12 @@ rev2fwd-il/
 │           ├── config.py            # Configuration utilities
 │           └── logging.py           # Logging utilities
 └── scripts/
-    ├── 00_sanity_check_env.py       # Environment sanity check
-    ├── 01_debug_expert_B_one_episode.py  # Debug Expert B FSM
-    ├── 10_collect_B_reverse_rollouts.py  # Collect reverse rollouts
-    ├── 20_make_A_forward_dataset.py      # Build forward dataset
-    ├── 30_train_A_bc.py                  # Train policy A
-    └── 40_eval_A.py                      # Evaluate policy A
+    ├── 00_sanity_check_env.py           # Environment sanity check
+    ├── 01_debug_expert_B_one_episode.py # Debug Expert B FSM
+    ├── 10_collect_B_reverse_rollouts.py # Step 1: Collect reverse rollouts
+    ├── 20_make_A_forward_dataset.py     # Step 2: Build forward dataset
+    ├── 30_train_A_bc.py                 # Step 3: Train policy A (TODO)
+    └── 40_eval_A.py                     # Step 4: Evaluate policy A (TODO)
 ```
 
 ### Key Modules
@@ -339,10 +516,13 @@ rev2fwd-il/
 | `sim/scene_api.py` | Helper functions to read/write scene state (EE pose, object pose, teleport) |
 | `sim/task_spec.py` | Task parameters (goal position, table bounds, success radius) |
 | `experts/pickplace_expert_b.py` | Finite state machine expert for reverse task |
+| `data/recorder.py` | Rollout recorder that runs Expert B and saves trajectories |
+| `data/reverse_time.py` | Time reversal and gripper heuristic for action reconstruction |
+| `data/io_npz.py` | NPZ file I/O for episodes and datasets |
 
 ---
 
-## 6. Reproducibility checklist
+## 7. Reproducibility checklist
 
 - [ ] Fix seeds (python/numpy/torch)
 - [ ] Log simulator step dt and action decimation
@@ -351,7 +531,7 @@ rev2fwd-il/
 
 ---
 
-## 7. Common pitfalls
+## 8. Common pitfalls
 
 | Issue | Solution |
 |-------|----------|
@@ -359,10 +539,12 @@ rev2fwd-il/
 | Cube still moving when B finishes | Add settle steps after placing |
 | IK-Rel is harder to reverse | Use IK-Abs for this sanity check |
 | Expert B sometimes fails | Filter to SUCCESS-only episodes |
+| Expert B doesn't reach DONE state | Increase `--horizon` (default 400 steps) |
+| Gripper CLOSE ratio is 0% or 100% | Check gripper heuristic thresholds in `reverse_time.py` |
 
 ---
 
-## 8. Shell command notes
+## 9. Shell command notes
 
 When running scripts, you may see commands like:
 

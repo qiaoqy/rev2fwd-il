@@ -25,9 +25,10 @@ class ExpertState(IntEnum):
     LIFT = 4
     GO_ABOVE_PLACE = 5
     GO_TO_PLACE = 6
-    OPEN = 7
-    RETURN_REST = 8
-    DONE = 9
+    LOWER_TO_RELEASE = 7  # New: Lower to release height
+    OPEN = 8
+    RETURN_REST = 9
+    DONE = 10
 
 
 # Gripper action values
@@ -52,6 +53,7 @@ class PickPlaceExpertB:
         device: str | torch.device,
         hover_z: float = 0.25,
         grasp_z_offset: float = 0.02,  # grasp slightly into the object
+        release_z_offset: float = -0.01,  # lower slightly into the object for stable release
         position_threshold: float = 0.01,
         wait_steps: int = 15,
     ):
@@ -62,6 +64,7 @@ class PickPlaceExpertB:
             device: Torch device.
             hover_z: Height for hovering above objects.
             grasp_z_offset: Offset from object top when grasping.
+            release_z_offset: Offset for release height (negative = lower).
             position_threshold: Distance threshold for reaching waypoints.
             wait_steps: Steps to wait after reaching a waypoint.
         """
@@ -69,6 +72,7 @@ class PickPlaceExpertB:
         self.device = torch.device(device)
         self.hover_z = hover_z
         self.grasp_z_offset = grasp_z_offset
+        self.release_z_offset = release_z_offset
         self.position_threshold = position_threshold
         self.wait_steps = wait_steps
 
@@ -161,8 +165,12 @@ class PickPlaceExpertB:
         above_place_pos[:, :2] = self.place_pose[:, :2]
         above_place_pos[:, 2] = self.hover_z
 
-        # At place position
+        # At place position (approach height)
         at_place_pos = self.place_pose[:, :3].clone()
+
+        # Release position (lower than place position for stable release)
+        release_pos = self.place_pose[:, :3].clone()
+        release_pos[:, 2] = self.place_pose[:, 2] + self.release_z_offset
 
         # Process each state
         for state_val in ExpertState:
@@ -263,7 +271,7 @@ class PickPlaceExpertB:
                 self.wait_counter[transition] = 0
 
             elif state_val == ExpertState.GO_TO_PLACE:
-                # Move down to place position
+                # Move down to place position (first stage)
                 action[mask, :3] = at_place_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_CLOSE
@@ -276,18 +284,36 @@ class PickPlaceExpertB:
                 self.wait_counter[reached_envs] += 1
 
                 transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.LOWER_TO_RELEASE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.LOWER_TO_RELEASE:
+                # Lower further for stable release
+                action[mask, :3] = release_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                dist = torch.norm(ee_pose[mask, :3] - release_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                # 等待时间恢复正常
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
                 self.state[transition] = ExpertState.OPEN
                 self.wait_counter[transition] = 0
 
             elif state_val == ExpertState.OPEN:
-                # Open gripper to release object
-                action[mask, :3] = at_place_pos[mask]
+                # Open gripper to release object (stay at release height)
+                action[mask, :3] = release_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_OPEN
 
-                # Wait for gripper to open
+                # Wait for gripper to open and object to settle
                 self.wait_counter[mask] += 1
-                transition = mask & (self.wait_counter >= self.wait_steps)
+                transition = mask & (self.wait_counter >= self.wait_steps)  # 恢复正常等待时间
                 self.state[transition] = ExpertState.RETURN_REST
                 self.wait_counter[transition] = 0
 
