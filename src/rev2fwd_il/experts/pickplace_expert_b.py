@@ -27,8 +27,9 @@ class ExpertState(IntEnum):
     GO_TO_PLACE = 6
     LOWER_TO_RELEASE = 7  # New: Lower to release height
     OPEN = 8
-    RETURN_REST = 9
-    DONE = 10
+    LIFT_AFTER_RELEASE = 9  # New: Lift to hover height after release
+    RETURN_REST = 10
+    DONE = 11
 
 
 # Gripper action values
@@ -53,7 +54,7 @@ class PickPlaceExpertB:
         device: str | torch.device,
         hover_z: float = 0.25,
         grasp_z_offset: float = 0.02,  # grasp slightly into the object
-        release_z_offset: float = -0.01,  # lower slightly into the object for stable release
+        release_z_offset: float = -0.03,  # lower slightly into the object for stable release
         position_threshold: float = 0.01,
         wait_steps: int = 15,
     ):
@@ -314,6 +315,23 @@ class PickPlaceExpertB:
                 # Wait for gripper to open and object to settle
                 self.wait_counter[mask] += 1
                 transition = mask & (self.wait_counter >= self.wait_steps)  # 恢复正常等待时间
+                self.state[transition] = ExpertState.LIFT_AFTER_RELEASE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.LIFT_AFTER_RELEASE:
+                # Lift to hover height after release
+                action[mask, :3] = above_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                dist = torch.norm(ee_pose[mask, :3] - above_place_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
                 self.state[transition] = ExpertState.RETURN_REST
                 self.wait_counter[transition] = 0
 

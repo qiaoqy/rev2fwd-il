@@ -122,28 +122,36 @@ def reverse_episode_build_forward_pairs(
     # For training, obs[t] -> act[t] where act[t] is the target EE pose at t+1
     ee_label = ee_fwd[1:]  # (T-1, 7)
 
-    # C) Infer gripper labels for forward trajectory
-    ee_pos_fwd = ee_fwd[:, :3]  # (T, 3)
-    obj_pos_fwd = obj_fwd[:, :3]  # (T, 3)
+    # =========================================================================
+    # C) 直接反转B的夹爪序列（用于对比实验）
+    # =========================================================================
+    gripper_fwd = ep.gripper[::-1].copy()  # (T,) 直接时间反转
+    gripper_label = gripper_fwd[1:]  # (T-1,)
 
-    # Note: In forward task, goal is ep.goal_pose (plate center)
-    # In reverse task, goal is ep.place_pose (random table position)
-    # For forward A, we want to reach goal_pose
-    goal_xy = (ep.goal_pose[0], ep.goal_pose[1])
-    table_z = ep.goal_pose[2]  # Use goal z as table height approximation
-
-    gripper_full = infer_gripper_labels(
-        ee_pos_fwd=ee_pos_fwd,
-        obj_pos_fwd=obj_pos_fwd,
-        goal_xy=goal_xy,
-        table_z=table_z,
-        grasp_dist=0.035,
-        goal_release_radius=0.05,
-        z_margin=0.03,
-    )
-
-    # Gripper label for action at time t is the gripper state at t+1
-    gripper_label = gripper_full[1:]  # (T-1,)
+    # =========================================================================
+    # [已注释] 启发式重建夹爪 - 根据正向任务语义推断抓取/释放时机
+    # =========================================================================
+    # ee_pos_fwd = ee_fwd[:, :3]  # (T, 3)
+    # obj_pos_fwd = obj_fwd[:, :3]  # (T, 3)
+    #
+    # # Note: In forward task, goal is ep.goal_pose (plate center)
+    # # In reverse task, goal is ep.place_pose (random table position)
+    # # For forward A, we want to reach goal_pose
+    # goal_xy = (ep.goal_pose[0], ep.goal_pose[1])
+    # table_z = ep.goal_pose[2]  # Use goal z as table height approximation
+    #
+    # gripper_full = infer_gripper_labels(
+    #     ee_pos_fwd=ee_pos_fwd,
+    #     obj_pos_fwd=obj_pos_fwd,
+    #     goal_xy=goal_xy,
+    #     table_z=table_z,
+    #     grasp_dist=0.035,
+    #     goal_release_radius=0.05,
+    #     z_margin=0.03,
+    # )
+    #
+    # # Gripper label for action at time t is the gripper state at t+1
+    # gripper_label = gripper_full[1:]  # (T-1,)
 
     # D) Concatenate EE pose and gripper to form action
     act = np.concatenate([ee_label, gripper_label[:, None]], axis=-1)  # (T-1, 8)

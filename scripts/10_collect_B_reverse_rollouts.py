@@ -245,7 +245,7 @@ def main() -> None:
             device=device,
             hover_z=task_spec.hover_z,
             grasp_z_offset=task_spec.grasp_z_offset,
-            release_z_offset=-0.015,   # Lower 1.5cm before releasing for stability
+            release_z_offset=-0.04,   # Lower 1.5cm before releasing for stability
             position_threshold=0.015,  # 1.5cm threshold for reaching waypoints
             wait_steps=task_spec.settle_steps,
         )
