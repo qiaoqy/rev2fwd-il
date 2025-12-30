@@ -291,7 +291,137 @@ Saved 30 episodes to data/B_reverse_30eps.npz
 
 ---
 
-### 3.4 Step 2: Reverse trajectories -> build forward BC dataset for A
+### 3.4 Replay B Episode (Video Recording)
+
+This script replays a single episode from the collected B dataset and saves it as an MP4 video.
+
+```bash
+# Replay episode 0 with GUI
+python scripts/11_replay_B_episode.py
+
+# Replay episode 5 in headless mode
+python scripts/11_replay_B_episode.py --episode 5 --headless
+
+# Custom dataset and output
+python scripts/11_replay_B_episode.py --dataset data/B_reverse_100eps.npz --episode 10 --out data/B_ep10.mp4
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset` | `data/B_reverse_latest.npz` | Path to B dataset NPZ file |
+| `--episode` | `0` | Episode index to replay |
+| `--out` | `data/B_ep{episode}.mp4` | Output video path |
+| `--playback_speed` | `1.0` | Playback speed multiplier |
+
+---
+
+### 3.5 Collect Reverse Rollouts with Images
+
+This script extends script 10 by adding a camera sensor to capture RGB images at each step.
+The camera is dynamically added to the environment configuration without modifying isaaclab_tasks.
+
+```bash
+# Basic usage (headless mode, 100 episodes)
+python scripts/12_collect_B_with_images.py --headless --num_episodes 100
+
+# Custom resolution
+python scripts/12_collect_B_with_images.py --headless --num_episodes 50 \
+    --image_width 256 --image_height 256 --out data/B_images_256.npz
+
+# With GUI visualization
+python scripts/12_collect_B_with_images.py --num_episodes 10
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Isaac Lab Gym task ID |
+| `--num_episodes` | `100` | Number of episodes to collect |
+| `--num_envs` | `4` | Parallel environments (fewer for images due to memory) |
+| `--image_width` | `128` | Width of captured images |
+| `--image_height` | `128` | Height of captured images |
+| `--horizon` | `400` | Max steps per episode |
+| `--settle_steps` | `40` | Extra steps after expert finishes |
+| `--seed` | `0` | Random seed |
+| `--out` | `data/B_images_latest.npz` | Output NPZ file path |
+
+#### Output Data Format
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `obs` | `(T, 36)` | Policy observation sequence |
+| `images` | `(T, H, W, 3)` | RGB images (uint8, 0-255) |
+| `ee_pose` | `(T, 7)` | End-effector pose |
+| `obj_pose` | `(T, 7)` | Object pose |
+| `gripper` | `(T,)` | Gripper action |
+| `place_pose` | `(7,)` | Target place position |
+| `goal_pose` | `(7,)` | Goal position |
+| `success` | `bool` | Success flag |
+
+**Note:** The `--headless` mode requires `enable_cameras=True` internally for image rendering.
+
+---
+
+### 3.6 Inspect Image Data
+
+This script inspects the image dataset collected by script 12, without requiring Isaac Lab:
+- Extracts a single frame as PNG + JSON for inspection
+- Generates an MP4 video from one episode's camera sequence
+
+```bash
+# Basic usage - inspect episode 0, frame 0
+python scripts/13_inspect_B_images.py
+
+# Specify dataset and episode
+python scripts/13_inspect_B_images.py --dataset data/B_images_latest.npz --episode 5
+
+# Specify which frame to extract
+python scripts/13_inspect_B_images.py --episode 3 --frame 100
+
+# Custom output folder name
+python scripts/13_inspect_B_images.py --name my_inspection
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset` | `data/B_images_latest.npz` | Path to image dataset |
+| `--episode` | `0` | Episode index to inspect |
+| `--frame` | `0` | Frame index for PNG/JSON extraction |
+| `--name` | `""` | Optional suffix for output folder |
+| `--fps` | `30` | FPS for output video |
+
+#### Output Files
+
+```
+data/inspect_YYYYMMDD_HHMMSS_<name>/
+├── episode_info.json       # Episode metadata and dataset statistics
+├── frame_<N>.png           # Single frame image
+├── frame_<N>_data.json     # Frame data (obs breakdown, poses, gripper)
+└── episode_<M>_video.mp4   # Full episode video (H.264 encoded)
+```
+
+#### Observation Vector Breakdown
+
+The `obs` field is a 36-dimensional vector:
+
+| Index | Dim | Field | Description |
+|-------|-----|-------|-------------|
+| 0-8 | 9 | `joint_pos_rel` | Joint positions relative to default |
+| 9-17 | 9 | `joint_vel_rel` | Joint velocities |
+| 18-20 | 3 | `object_position` | Object XYZ in robot root frame |
+| 21-27 | 7 | `target_object_position` | Target pose (pos + quat) |
+| 28-35 | 8 | `last_action` | Previous action |
+
+**Note:** At frame 0, most values are 0 because the robot is at default position and stationary.
+
+---
+
+### 3.8 Step 2: Reverse trajectories -> build forward BC dataset for A
 
 This script converts REVERSE rollouts from Expert B into FORWARD training data for Policy A.
 
@@ -382,7 +512,7 @@ Saved forward BC dataset to data/A_forward_from_reverse.npz
 
 ---
 
-### 3.5 Step 3: Train Policy A with Behavior Cloning
+### 3.9 Step 3: Train Policy A with Behavior Cloning
 
 This script trains an MLP policy using Behavior Cloning (BC) on the forward dataset generated in Step 2.
 
@@ -519,7 +649,7 @@ Saved config to runs/bc_A/config.yaml
 
 ---
 
-### 3.6 Step 4: Evaluate Policy A on the Forward Task
+### 3.10 Step 4: Evaluate Policy A on the Forward Task
 
 This script evaluates the trained BC policy on the actual forward pick-and-place task in Isaac Lab.
 
@@ -719,10 +849,14 @@ rev2fwd-il/
 └── scripts/
     ├── 00_sanity_check_env.py           # Environment sanity check
     ├── 01_debug_expert_B_one_episode.py # Debug Expert B FSM
-    ├── 10_collect_B_reverse_rollouts.py # Step 1: Collect reverse rollouts
+    ├── 10_collect_B_reverse_rollouts.py # Step 1: Collect reverse rollouts (state-only)
+    ├── 11_replay_B_episode.py           # Replay & record B episode as video
+    ├── 12_collect_B_with_images.py      # Collect reverse rollouts with camera images
+    ├── 13_inspect_B_images.py           # Inspect image data (PNG, JSON, MP4)
     ├── 20_make_A_forward_dataset.py     # Step 2: Build forward dataset
-    ├── 30_train_A_bc.py                 # Step 3: Train policy A (TODO)
-    └── 40_eval_A.py                     # Step 4: Evaluate policy A (TODO)
+    ├── 21_replay_A_episode.py           # Replay forward dataset episode
+    ├── 30_train_A_bc.py                 # Step 3: Train policy A
+    └── 40_eval_A.py                     # Step 4: Evaluate policy A
 ```
 
 ### Key Modules

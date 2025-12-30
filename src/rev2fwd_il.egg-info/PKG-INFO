@@ -71,6 +71,7 @@ conda activate rev2fwd_il
 pip install -U torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install isaaclab[isaacsim,all]==2.3.0 --extra-index-url https://pypi.nvidia.com
 pip install wandb
+pip install -e ./isaaclab_tasks
 ```
 
 2) Install this repo (editable) and any optional extras:
@@ -89,187 +90,717 @@ conda env create -f environment.yml
 conda activate rev2fwd_il
 pip install -e .
 pip install -e ".[extras]"
-
 ```
 
 ---
 
 ## 3. Quickstart
+
 ### 3.1 Sanity check: can we run the environment?
+
+This script launches Isaac Sim via Isaac Lab's `AppLauncher`, creates a gymnasium environment,
+prints action/observation spaces + key scene entities, and then steps the simulation.
+
 ```bash
-python scripts/00_sanity_check_env.py \
-  --task Isaac-Lift-Cube-Franka-IK-Abs-v0 \
-  --headless 0
+# Minimal headless smoke test (recommended)
+python scripts/00_sanity_check_env.py --headless --steps 50
 ```
-Expected:
-- Franka + cube on a table
-- the scripted expert should move towards the cube and perform a pick motion
 
-### 3.2 Step 1: Collect reverse rollouts (policy B)
-
-Reverse task:
-
-- cube starts at the GOAL region ("in the plate")
-- B picks and places the cube to a random table location
+More examples:
 
 ```bash
-python scripts/10_collect_B_reverse_rollouts.py \
-  --task Isaac-Lift-Cube-Franka-IK-Abs-v0 \
-  --num_episodes 100 \
-  --horizon 250 \
-  --seed 0 \
-  --out data/B_reverse_100eps.npz \
-  --headless 1
+# GUI mode (creates a window)
+python scripts/00_sanity_check_env.py --steps 200
+
+# Random actions (useful to verify actuation is alive)
+python scripts/00_sanity_check_env.py --headless --steps 50 --random_action 1
+
+# Deterministic micro-perturbation on action dim-0 (useful for IK tasks)
+python scripts/00_sanity_check_env.py --headless --steps 50 --nudge_action 0.01
 ```
-Notes:
 
-- We only keep SUCCESS episodes (or keep all and filter later).
-- After placing, we add settle_steps so the cube comes to rest on the table.
+#### CLI arguments (script-specific)
 
-### 3.3 Step 2: Reverse trajectories -> build forward BC dataset for A
-Forward task we want A to learn:
+| Argument | Description |
+|----------|-------------|
+| `--task` | Gym task id to create via `gym.make(...)`. |
+| `--num_envs` | Number of parallel environments (vectorized) inside the same simulation. |
+| `--rl_device` | Alias for the AppLauncher `--device` argument (e.g. `cuda`, `cuda:0`, `cpu`). |
+| `--disable_fabric` | If set to `1`, disables Fabric in the parsed env cfg. |
+| `--steps` | How many `env.step(...)` calls to run. |
+| `--seed` | RNG seed for python/numpy/torch. |
+| `--random_action` | If `1`, sample actions from `env.action_space` each step. |
+| `--nudge_action` | If non-zero, use a stable zero action and add a small deterministic value to action dimension 0. |
+| `--print_every` | Print debug diagnostics every N steps (default: 1). |
+| `--step_timeout_s` | If a single `env.step()` is slower than this threshold, print a warning. |
 
-- cube starts at random table location
-- A moves it into GOAL region
-We DO NOT simply reverse B actions.
-Instead we:
+#### AppLauncher arguments (Isaac Lab / Isaac Sim)
 
-- reverse (obs, ee_pose, gripper) sequences
-- build action labels as the next-step (ee_pose, gripper)
+The script also supports standard launcher flags injected by
+`isaaclab.app.AppLauncher.add_app_launcher_args(parser)`.
+Common ones include:
+
+| Argument | Description |
+|----------|-------------|
+| `--headless` | Run Isaac Sim without opening a window. Use `--headless` or `--headless 1` for headless mode, `--headless 0` for GUI. |
+| `--device` | Simulation device for Isaac Lab tensors (e.g. `cuda:0`). |
+
+Run `python scripts/00_sanity_check_env.py --help` to see the full list provided by your Isaac Lab version.
+
+---
+
+### 3.2 Debug Expert B (Reverse Task)
+
+This script tests the Expert B finite state machine, which performs the **reverse** pick-and-place task:
+- Cube starts at the GOAL position (plate center)
+- Expert B picks it up and places it at a random table position
+- Robot returns to REST pose
 
 ```bash
+# Run with GUI visualization (recommended for first-time debugging)
+python scripts/01_debug_expert_B_one_episode.py
+
+# Run in headless mode (faster, no rendering)
+python scripts/01_debug_expert_B_one_episode.py --headless
+
+# Custom parameters
+python scripts/01_debug_expert_B_one_episode.py --headless --seed 123 --steps 600 --goal_xy 0.5 0.1
+```
+
+#### Expert B State Machine
+
+The expert follows this finite state machine sequence:
+
+```
+REST → GO_ABOVE_OBJ → GO_TO_OBJ → CLOSE → LIFT → GO_ABOVE_PLACE → GO_TO_PLACE → LOWER_TO_RELEASE → OPEN → RETURN_REST → DONE
+```
+
+| State | Description | Gripper |
+|-------|-------------|---------|
+| `REST` | Initial resting position | Open |
+| `GO_ABOVE_OBJ` | Move EE above the object | Open |
+| `GO_TO_OBJ` | Lower EE to grasp position | Open |
+| `CLOSE` | Close gripper to grasp object | Close |
+| `LIFT` | Lift object to hover height | Close |
+| `GO_ABOVE_PLACE` | Move to above place position | Close |
+| `GO_TO_PLACE` | Lower to place position | Close |
+| `LOWER_TO_RELEASE` | Lower further for stable release | Close |
+| `OPEN` | Open gripper to release object | Open |
+| `RETURN_REST` | Return to initial REST pose | Open |
+| `DONE` | Episode complete | Open |
+
+#### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Gym task ID |
+| `--num_envs` | `1` | Number of parallel environments |
+| `--steps` | `500` | Maximum simulation steps per episode |
+| `--seed` | `42` | Random seed for reproducibility |
+| `--goal_xy` | `0.5 0.0` | Goal (x, y) position for initial cube placement |
+| `--disable_fabric` | `0` | If `1`, disables Fabric backend |
+| `--headless` | - | Run without GUI (from AppLauncher) |
+| `--device` | `cuda:0` | Compute device (from AppLauncher) |
+
+#### Example Output
+
+```
+Initial EE pose: [0.463, 0.0, 0.385]
+Object teleported to: [0.500, 0.0, 0.021]
+Target place position: (0.582, -0.031)
+
+============================================================
+Starting Expert B episode
+============================================================
+Step    0 | State: GO_ABOVE_OBJ     | EE: [0.375, -0.001, 0.525] | Obj: [0.500, -0.000, 0.021] | Gripper: +1.0
+Step   80 | State: GO_TO_OBJ        | EE: [0.494, -0.000, 0.254] | Obj: [0.500, -0.000, 0.021] | Gripper: +1.0
+Step  120 | State: CLOSE            | EE: [0.499, -0.000, 0.027] | Obj: [0.500, -0.000, 0.021] | Gripper: -1.0
+Step  140 | State: LIFT             | EE: [0.487, -0.000, 0.194] | Obj: [0.488, 0.000, 0.188] | Gripper: -1.0
+Step  200 | State: GO_TO_PLACE      | EE: [0.575, -0.030, 0.115] | Obj: [0.576, -0.030, 0.109] | Gripper: -1.0
+Step  240 | State: RETURN_REST      | EE: [0.463, 0.000, 0.385] | Obj: [0.580, -0.031, 0.055] | Gripper: +1.0
+
+Expert finished at step 279
+
+============================================================
+Episode finished
+============================================================
+Final object position: [0.580, -0.031, 0.055]
+Target place position: [0.582, -0.031]
+XY distance to target: 0.0023
+Success (within 0.03m): True
+EE distance to rest: 0.0046
+```
+
+---
+
+### 3.3 Step 1: Collect reverse rollouts (policy B)
+
+This script collects demonstration data from Expert B performing the **reverse** pick-and-place task.
+
+**Reverse task definition:**
+- Cube starts at the GOAL position (plate center at ~[0.5, 0.0])
+- Expert B picks it up and places it at a RANDOM position on the table
+- Robot returns to REST pose
+
+```bash
+# Basic usage (headless mode, 100 episodes)
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 100
+
+# Custom output path and seed
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 50 \
+    --out data/B_reverse_50eps.npz --seed 42
+
+# With longer horizon (if expert doesn't complete FSM)
+python scripts/10_collect_B_reverse_rollouts.py --headless --num_episodes 100 \
+    --horizon 500 --settle_steps 50
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Isaac Lab Gym task ID |
+| `--num_episodes` | `100` | Number of episodes to collect |
+| `--horizon` | `400` | Max steps per episode (Expert B needs ~300-400 steps) |
+| `--settle_steps` | `40` | Extra steps after expert finishes to let cube settle |
+| `--seed` | `0` | Random seed for reproducibility |
+| `--out` | `data/B_reverse_100eps.npz` | Output NPZ file path |
+| `--disable_fabric` | `0` | If `1`, disables Fabric backend |
+| `--headless` | - | Run without GUI |
+
+#### Output Data Format
+
+The script saves an NPZ file with the following structure for each episode `i`:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `obs_i` | `(T, 36)` | Policy observation sequence |
+| `ee_pose_i` | `(T, 7)` | End-effector pose `[x, y, z, qw, qx, qy, qz]` |
+| `obj_pose_i` | `(T, 7)` | Object (cube) pose `[x, y, z, qw, qx, qy, qz]` |
+| `gripper_i` | `(T,)` | Gripper action (`+1`=open, `-1`=close) |
+| `place_pose_i` | `(7,)` | Target place position (random table position) |
+| `goal_pose_i` | `(7,)` | Goal position (plate center, fixed) |
+| `success_i` | `bool` | Whether cube ended up near target position |
+
+**Notes:**
+- Only episodes where Expert B completes the full FSM (reaches DONE state) are saved
+- The `success` flag indicates whether the cube is within `success_radius` of the target
+- Episode length `T` is typically 330-400 steps
+
+#### Example Output
+
+```
+============================================================
+Collecting 30 reverse rollouts
+Settings:
+  - horizon: 400
+  - settle_steps: 40
+  - success_radius: 0.08m
+  - release_z_offset: -0.015m
+  - Only saving episodes with completed FSM (DONE state)
+============================================================
+
+Attempt    1 | Saved: 1/30 | Completed: 1 (100.0%) | Success: 0 | Rate: 0.25 ep/s | Length: 394
+Attempt   10 | Saved: 10/30 | Completed: 10 (100.0%) | Success: 1 | Rate: 0.31 ep/s | Length: 330
+Attempt   20 | Saved: 20/30 | Completed: 20 (100.0%) | Success: 2 | Rate: 0.33 ep/s | Length: 394
+Attempt   30 | Saved: 30/30 | Completed: 30 (100.0%) | Success: 3 | Rate: 0.33 ep/s | Length: 392
+
+============================================================
+Collection finished in 92.3s
+Total attempts: 30
+Completed FSM: 30 (100.0%)
+Saved episodes: 30
+Success (cube at target): 3 (10.0%)
+============================================================
+
+Saved 30 episodes to data/B_reverse_30eps.npz
+```
+
+---
+
+### 3.4 Step 2: Reverse trajectories -> build forward BC dataset for A
+
+This script converts REVERSE rollouts from Expert B into FORWARD training data for Policy A.
+
+**Core idea:** A reverse trajectory (goal → table) when played backwards becomes a forward trajectory (table → goal).
+
+**Key challenge:** We cannot simply reverse the actions because:
+1. The gripper open/close timing would be wrong
+2. IK-Abs actions are absolute poses, not deltas
+
+**Solution:** We reconstruct action labels using heuristics:
+- **EE pose action:** Use the NEXT timestep's EE pose (where we want to go)
+- **Gripper action:** Infer from EE-object distance and object-goal proximity
+
+```bash
+# Basic usage (use all episodes)
 python scripts/20_make_A_forward_dataset.py \
-  --in data/B_reverse_100eps.npz \
-  --out data/A_forward_from_reverse.npz
+    --input data/B_reverse_100eps.npz \
+    --out data/A_forward_from_reverse.npz \
+    --success_only 0
+
+# Only use successful episodes (stricter filtering)
+python scripts/20_make_A_forward_dataset.py \
+    --input data/B_reverse_100eps.npz \
+    --out data/A_forward_from_reverse.npz \
+    --success_only 1
 ```
 
-### 3.4 Step 3: Train policy A with Behavior Cloning
+#### CLI Arguments
 
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input` | `data/B_reverse_100eps.npz` | Input NPZ file from script 10 |
+| `--out` | `data/A_forward_from_reverse.npz` | Output NPZ file for BC training |
+| `--success_only` | `1` | If `1`, only use successful episodes |
+
+#### Gripper Heuristic
+
+For the forward task (table → goal), the gripper action is inferred as:
+
+| Condition | Gripper | Reasoning |
+|-----------|---------|-----------|
+| EE close to object AND object far from goal | **CLOSE** (-1) | Grasp object to transport it |
+| EE far from object OR object close to goal | **OPEN** (+1) | Approaching or finished placing |
+
+A healthy gripper CLOSE ratio is typically **30-50%** (grasping/transporting phase).
+
+#### Output Data Format
+
+The script outputs a flat NPZ file for BC training:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `obs` | `(N, 36)` | Observations in FORWARD time order |
+| `act` | `(N, 8)` | Actions: `[ee_pose(7), gripper(1)]` |
+| `ep_id` | `(N,)` | Episode index (for debugging/analysis) |
+
+Where `N = sum(T_i - 1)` for all episodes (we lose one step per episode because `action[t] = next_ee_pose[t+1]`).
+
+#### Example Output
+
+```
+Loading episodes from data/B_reverse_30eps.npz
+Loaded 30 episodes from data/B_reverse_30eps.npz
+
+============================================================
+Processing 30 episodes
+============================================================
+
+Episode    1 | Length:  329 | CLOSE ratio: 35.0%
+Episode   20 | Length:  393 | CLOSE ratio: 34.1%
+
+============================================================
+Dataset Statistics
+============================================================
+Total episodes: 30
+Total steps: 10170
+Average episode length: 339.0
+Observation dim: 36
+Action dim: 8
+Gripper CLOSE ratio: 35.0%
+============================================================
+
+Saved forward BC dataset to data/A_forward_from_reverse.npz
+  obs shape: (10170, 36)
+  act shape: (10170, 8)
+  ep_id shape: (10170,)
+```
+
+---
+
+### 3.5 Step 3: Train Policy A with Behavior Cloning
+
+This script trains an MLP policy using Behavior Cloning (BC) on the forward dataset generated in Step 2.
+
+**Behavior Cloning Algorithm:**
+- Supervised learning approach: treat imitation as regression
+- Input: observation `obs` (36-dim)
+- Output: action `act` (8-dim) = [ee_pose(7), gripper(1)]
+- Loss: weighted combination of position MSE, quaternion loss, and gripper MSE
+
+**Network Architecture:**
+- MLP with configurable hidden layers (default: 256-256)
+- Output constraints:
+  - Position (3D): direct output, no constraint
+  - Quaternion (4D): normalized to unit length
+  - Gripper (1D): tanh activation, maps to [-1, 1]
 
 ```bash
+# Standard training (recommended settings)
 python scripts/30_train_A_bc.py \
-  --dataset data/A_forward_from_reverse.npz \
-  --out runs/bc_A \
-  --epochs 200 \
-  --batch_size 256 \
-  --lr 1e-3 \
-  --seed 0
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A \
+    --epochs 200 \
+    --batch_size 256 \
+    --lr 1e-3 \
+    --seed 0
+
+# Quick test run
+python scripts/30_train_A_bc.py \
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A_test \
+    --epochs 10 \
+    --batch_size 64
+
+# Custom network architecture (deeper network)
+python scripts/30_train_A_bc.py \
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A_large \
+    --hidden 512 512 256 \
+    --epochs 300
+
+# Adjust loss weights (emphasize position accuracy)
+python scripts/30_train_A_bc.py \
+    --dataset data/A_forward_from_reverse.npz \
+    --out runs/bc_A_pos \
+    --pos_weight 2.0 \
+    --quat_weight 1.0 \
+    --gripper_weight 0.5
 ```
 
-Outputs:
+#### CLI Arguments
 
-- runs/bc_A/model.pt
-- runs/bc_A/norm.json
-- runs/bc_A/config.yaml
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset` | `data/A_forward_from_reverse.npz` | Input NPZ file with `obs` and `act` arrays |
+| `--out` | `runs/bc_A` | Output directory for model and config |
+| `--epochs` | `200` | Number of training epochs |
+| `--batch_size` | `256` | Mini-batch size for SGD |
+| `--lr` | `1e-3` | Learning rate for Adam optimizer |
+| `--seed` | `0` | Random seed for reproducibility |
+| `--hidden` | `256 256` | Hidden layer sizes (space-separated) |
+| `--pos_weight` | `1.0` | Weight for position MSE loss |
+| `--quat_weight` | `1.0` | Weight for quaternion loss |
+| `--gripper_weight` | `1.0` | Weight for gripper MSE loss |
+| `--print_every` | `10` | Print loss every N epochs |
+| `--device` | auto | Torch device (`cuda` or `cpu`) |
 
-### 3.5 Step 4: Evaluate policy A on the forward task
+#### Output Files
+
+The script saves three files to the `--out` directory:
+
+| File | Description |
+|------|-------------|
+| `model.pt` | PyTorch checkpoint with model weights and architecture info |
+| `norm.json` | Observation normalization statistics (mean, std) |
+| `config.yaml` | Training configuration and final metrics |
+
+#### Loss Functions
+
+| Component | Formula | Description |
+|-----------|---------|-------------|
+| Position | MSE(pos_pred, pos_gt) | Mean squared error on XYZ |
+| Quaternion | 1 - \|dot(q_pred, q_gt)\| | Handles q ≡ -q equivalence |
+| Gripper | MSE(grip_pred, grip_gt) | Works with -1/+1 labels |
+
+#### Example Output
+
+```
+============================================================
+Behavior Cloning Training
+============================================================
+Dataset: data/A_forward_from_reverse.npz
+Output: runs/bc_A
+Device: cuda
+Seed: 0
+============================================================
+
+Loading dataset...
+  Samples: 37121
+  Obs dim: 36
+  Act dim: 8
+
+Computing observation normalization...
+  Mean range: [-0.2673, 1.0000]
+  Std range: [0.0000, 1.1189]
+
+DataLoader created: 146 batches per epoch
+
+Model created: 77,320 parameters
+
+============================================================
+Starting training...
+============================================================
+
+Epoch    1/200 | Loss: 0.086595 (pos: 0.006664, quat: 0.009868, grip: 0.070064) | Time: 0.5s
+Epoch   10/200 | Loss: 0.000286 (pos: 0.000129, quat: 0.000104, grip: 0.000053) | Time: 2.6s
+...
+Epoch  200/200 | Loss: 0.000036 (pos: 0.000030, quat: 0.000005, grip: 0.000000) | Time: 46.3s
+
+Training completed in 46.3s
+
+============================================================
+Training Summary
+============================================================
+Final loss: 0.000036
+  Position: 0.000030
+  Quaternion: 0.000005
+  Gripper: 0.000000
+============================================================
+
+Saved model to runs/bc_A/model.pt
+Saved normalization to runs/bc_A/norm.json
+Saved config to runs/bc_A/config.yaml
+```
+
+---
+
+### 3.6 Step 4: Evaluate Policy A on the Forward Task
+
+This script evaluates the trained BC policy on the actual forward pick-and-place task in Isaac Lab.
+
+**Forward Task Definition:**
+- Cube starts at a RANDOM position on the table (default env.reset behavior)
+- Policy A should pick it up and place it at the GOAL (plate center)
+- No teleportation of the cube is performed
+
+**Success Criterion:**
+- Cube XY distance to goal < `success_radius` (default 3cm)
+- Note: Gripper state is NOT considered for success determination
 
 ```bash
+# Standard evaluation (headless mode, 50 rollouts)
 python scripts/40_eval_A.py \
-  --task Isaac-Lift-Cube-Franka-IK-Abs-v0 \
-  --checkpoint runs/bc_A/model.pt \
-  --norm runs/bc_A/norm.json \
-  --num_rollouts 50 \
-  --horizon 250 \
-  --headless 1
+    --checkpoint runs/bc_A/model.pt \
+    --norm runs/bc_A/norm.json \
+    --num_rollouts 50 \
+    --horizon 450 \
+    --headless
+
+# Quick validation (fewer rollouts)
+python scripts/40_eval_A.py \
+    --checkpoint runs/bc_A/model.pt \
+    --norm runs/bc_A/norm.json \
+    --num_rollouts 5 \
+    --horizon 450 \
+    --headless
+
+# With GUI visualization (for debugging)
+python scripts/40_eval_A.py \
+    --checkpoint runs/bc_A/model.pt \
+    --norm runs/bc_A/norm.json \
+    --num_rollouts 10 \
+    --horizon 450
 ```
-Report:
 
-- success rate
-- mean final distance to goal
-- optional: save videos
+#### CLI Arguments
 
-## 4. What "success" means in this repo
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint` | `runs/bc_A/model.pt` | Path to trained model checkpoint |
+| `--norm` | `runs/bc_A/norm.json` | Path to normalization statistics |
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Isaac Lab Gym task ID |
+| `--num_envs` | `1` | Number of parallel environments |
+| `--num_rollouts` | `50` | Number of evaluation episodes |
+| `--horizon` | `250` | Maximum steps per episode |
+| `--seed` | `42` | Random seed for reproducibility |
+| `--disable_fabric` | `0` | If `1`, disables Fabric backend |
+| `--headless` | - | Run without GUI (from AppLauncher) |
+
+#### Evaluation Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Success Rate | Percentage of rollouts where cube reaches goal |
+| Avg Final Dist | Mean XY distance from cube to goal at episode end |
+| Min Final Dist | Best performance across all rollouts |
+| Max Final Dist | Worst performance across all rollouts |
+
+#### Example Output
+
+```
+============================================================
+Evaluating Policy A on Forward Task
+============================================================
+Goal XY: [0.5 0. ]
+Success radius: 0.03
+Horizon: 450
+Num rollouts: 10
+============================================================
+
+Rollout   1/10 | Steps: 250 | Final dist: 0.2173 | Gripper: +1.00 | Success: False
+Rollout   2/10 | Steps: 250 | Final dist: 0.1680 | Gripper: +1.00 | Success: False
+Rollout   3/10 | Steps: 250 | Final dist: 0.1718 | Gripper: +0.99 | Success: False
+Rollout   4/10 | Steps: 250 | Final dist: 0.0782 | Gripper: +0.99 | Success: False
+Rollout   5/10 | Steps: 250 | Final dist: 0.1818 | Gripper: +1.00 | Success: False
+Rollout   6/10 | Steps: 250 | Final dist: 0.0514 | Gripper: +1.00 | Success: False
+Rollout   7/10 | Steps: 250 | Final dist: 0.0225 | Gripper: -0.93 | Success: True
+Rollout   8/10 | Steps: 250 | Final dist: 0.0673 | Gripper: +1.00 | Success: False
+Rollout   9/10 | Steps: 250 | Final dist: 0.2377 | Gripper: +0.99 | Success: False
+Rollout  10/10 | Steps: 250 | Final dist: 0.0780 | Gripper: -1.00 | Success: False
+
+============================================================
+Evaluation Results
+============================================================
+Success rate: 10.0% (1/10)
+Average final distance: 0.1274m
+Min final distance: 0.0225m
+Max final distance: 0.2377m
+============================================================
+
+============================================================
+FINAL EVALUATION SUMMARY
+============================================================
+Checkpoint: runs/bc_A/model.pt
+Task: Isaac-Lift-Cube-Franka-IK-Abs-v0
+Num rollouts: 10
+Horizon: 450
+------------------------------------------------------------
+SUCCESS RATE: 10.0%
+AVG FINAL DIST: 0.1274m
+MIN FINAL DIST: 0.0225m
+MAX FINAL DIST: 0.2377m
+============================================================
+```
+
+#### Notes on Evaluation
+
+- **Episode Length:** The default environment timeout is 250 steps. Use `--horizon` to set the maximum, but the episode may terminate earlier.
+- **Random Initialization:** Each rollout starts with the cube at a different random position on the table.
+- **Sanity Check:** Even with low success rate, `avg_final_dist` should be smaller than random policy (~0.2-0.3m).
+
+---
+
+## 4. Data Formats Reference
+
+### 4.1 Episode Data Structure (from script 10)
+
+Each episode contains the following fields:
+
+| Field | Shape | Physical Meaning |
+|-------|-------|------------------|
+| `obs` | `(T, 36)` | Policy observation: joint_pos(9), joint_vel(9), object_pos(3), target_pos(7), prev_actions(8) |
+| `ee_pose` | `(T, 7)` | End-effector pose `[x, y, z, qw, qx, qy, qz]` in world frame |
+| `obj_pose` | `(T, 7)` | Object (cube) pose `[x, y, z, qw, qx, qy, qz]` in world frame |
+| `gripper` | `(T,)` | Gripper action: `+1.0` = open, `-1.0` = close |
+| `place_pose` | `(7,)` | Target place pose (Expert B's random table target) |
+| `goal_pose` | `(7,)` | Fixed goal pose (plate center for forward task) |
+| `success` | `bool` | Whether cube ended up near target position |
+
+### 4.2 BC Training Dataset (from script 20)
+
+| Field | Shape | Physical Meaning |
+|-------|-------|------------------|
+| `obs` | `(N, 36)` | Observations in FORWARD time order |
+| `act` | `(N, 8)` | Actions: `[ee_pose(7), gripper(1)]` |
+| `ep_id` | `(N,)` | Episode index (for debugging/analysis) |
+
+### 4.3 Coordinate System
+
+- **World frame:** Z-up, origin at robot base
+- **Table height:** ~0.0m (Z coordinate)
+- **Cube size:** ~5cm cube, center at ~0.025m when on table
+- **Goal position:** Plate center at approximately `[0.5, 0.0, 0.055]`
+- **Table bounds:** X ∈ [0.35, 0.65], Y ∈ [-0.3, 0.3]
+
+---
+
+## 5. What "success" means in this repo
+
 A rollout is SUCCESS if:
-
-- cube XY distance to goal center < success_radius
+- cube XY distance to goal center < `success_radius`
 - (optional) cube Z close to table height
 - (optional) gripper is open at the end
 
-## 5. Code structure
-src/rev2fwd_il/sim/
+---
 
-make_env.py: create Isaac Lab env, unify reset/step, flatten obs["policy"]
-scene_api.py: get ee pose, object pose, set object pose, etc.
-task_spec.py: table bounds, goal pose, sampling, success predicate
-
-src/rev2fwd_il/experts/
-
-pickplace_sm.py: scripted expert policy B (state machine / motion primitive)
-wrappers.py: common policy interface
-
-src/rev2fwd_il/data/
-
-episode.py: Episode dataclass
-recorder.py: rollout and record episodes
-reverse_time.py: reverse episodes and reconstruct action labels for BC
-io_npz.py: save/load datasets
-normalize.py: obs/action normalization
-
-src/rev2fwd_il/models/
-
-mlp_policy.py: MLP policy A output (ee pose + gripper)
-losses.py: position + quaternion + gripper losses
-
-src/rev2fwd_il/train/
-
-bc_trainer.py: PyTorch BC training loop
-
-src/rev2fwd_il/eval/
-
-rollout.py: run policy and compute metrics
+## 6. Code structure
 
 ```text
 rev2fwd-il/
 ├── README.md
 ├── environment.yml
-├── pyproject.toml                  # 可选：做成可 pip install -e 的包
+├── pyproject.toml
+├── data/                              # Collected datasets
+│   ├── B_reverse_*.npz               # Reverse rollouts from Expert B
+│   └── A_forward_from_reverse.npz    # Forward BC dataset for Policy A
 ├── src/
 │   └── rev2fwd_il/
 │       ├── __init__.py
 │       ├── sim/
-│       │   ├── make_env.py          # 创建 Isaac Lab env、reset/step 的统一封装
-│       │   ├── scene_api.py         # 读取 ee/object pose、设置 object pose 的 helper
-│       │   └── task_spec.py         # 任务定义：目标点、采样桌面点、成功判据
+│       │   ├── make_env.py          # Create Isaac Lab env, unify reset/step
+│       │   ├── scene_api.py         # Get/set EE pose, object pose helpers
+│       │   └── task_spec.py         # Task definition: goal, table bounds, success criteria
 │       ├── experts/
-│       │   ├── pickplace_sm.py      # “现成 policy B”：复用/移植 IsaacLab lift_cube_sm state machine
-│       │   └── wrappers.py          # ExpertPolicy 接口封装（act/reset）
+│       │   ├── __init__.py
+│       │   └── pickplace_expert_b.py  # Expert B: FSM for reverse pick-and-place
 │       ├── data/
-│       │   ├── episode.py           # Episode 数据结构（obs, ee_pose, gripper, obj_pose, etc.）
-│       │   ├── recorder.py          # rollout 录制器
-│       │   ├── io_npz.py            # 保存/加载 npz
-│       │   ├── reverse_time.py      # 倒放 + 重建动作标签（关键）
-│       │   └── normalize.py         # obs/action 归一化统计与应用
+│       │   ├── episode.py           # Episode data structure
+│       │   ├── recorder.py          # Rollout recorder for Expert B
+│       │   ├── io_npz.py            # Save/load NPZ datasets
+│       │   ├── reverse_time.py      # Time reversal + action reconstruction
+│       │   └── normalize.py         # Obs/action normalization
 │       ├── models/
-│       │   ├── mlp_policy.py        # policy A：MLP 输出 ee pose + gripper
-│       │   └── losses.py            # pose loss / quat loss / gripper loss
+│       │   ├── mlp_policy.py        # Policy A: MLP outputs ee pose + gripper
+│       │   └── losses.py            # Pose/quat/gripper losses
 │       ├── train/
-│       │   └── bc_trainer.py        # 纯 pytorch BC 训练循环
+│       │   └── bc_trainer.py        # PyTorch BC training loop
 │       ├── eval/
-│       │   ├── rollout.py           # 用 policy A 跑 env 并算成功率
-│       │   └── metrics.py           # success rate / distance 曲线
+│       │   ├── rollout.py           # Run policy and compute metrics
+│       │   └── metrics.py           # Success rate / distance curves
 │       └── utils/
-│           ├── seed.py
-│           ├── config.py            # argparse/hydra 都行；最简就 argparse
-│           └── logging.py
+│           ├── seed.py              # Random seed utilities
+│           ├── config.py            # Configuration utilities
+│           └── logging.py           # Logging utilities
 └── scripts/
-    ├── 00_sanity_check_env.py
-    ├── 10_collect_B_reverse_rollouts.py
-    ├── 20_make_A_forward_dataset.py
-    ├── 30_train_A_bc.py
-    └── 40_eval_A.py
+    ├── 00_sanity_check_env.py           # Environment sanity check
+    ├── 01_debug_expert_B_one_episode.py # Debug Expert B FSM
+    ├── 10_collect_B_reverse_rollouts.py # Step 1: Collect reverse rollouts
+    ├── 20_make_A_forward_dataset.py     # Step 2: Build forward dataset
+    ├── 30_train_A_bc.py                 # Step 3: Train policy A (TODO)
+    └── 40_eval_A.py                     # Step 4: Evaluate policy A (TODO)
 ```
 
-## 6. Reproducibility checklist
-Fix seeds (python/numpy/torch)
-Log simulator step dt and action decimation
-Save dataset checksum + config
-Report how many SUCCESS reverse episodes were used to build the forward dataset
+### Key Modules
 
-## 7. Common pitfalls
-If you reverse raw actions, grasp/release timing will break.
-Use "next-step setpoint" reconstruction for actions.
-If the cube is still moving when B finishes, A will start from unstable states.
-Add settle steps after placing.
-IK-Rel is harder to reverse; use IK-Abs for this sanity check.
-If the expert B sometimes fails, filter to SUCCESS-only episodes.
+| Module | Description |
+|--------|-------------|
+| `sim/make_env.py` | Factory function to create Isaac Lab gymnasium environment |
+| `sim/scene_api.py` | Helper functions to read/write scene state (EE pose, object pose, teleport) |
+| `sim/task_spec.py` | Task parameters (goal position, table bounds, success radius) |
+| `experts/pickplace_expert_b.py` | Finite state machine expert for reverse task |
+| `data/recorder.py` | Rollout recorder that runs Expert B and saves trajectories |
+| `data/reverse_time.py` | Time reversal and gripper heuristic for action reconstruction |
+| `data/io_npz.py` | NPZ file I/O for episodes and datasets |
+
+---
+
+## 7. Reproducibility checklist
+
+- [ ] Fix seeds (python/numpy/torch)
+- [ ] Log simulator step dt and action decimation
+- [ ] Save dataset checksum + config
+- [ ] Report how many SUCCESS reverse episodes were used to build the forward dataset
+
+---
+
+## 8. Common pitfalls
+
+| Issue | Solution |
+|-------|----------|
+| Reversing raw actions breaks grasp/release timing | Use "next-step setpoint" reconstruction for actions |
+| Cube still moving when B finishes | Add settle steps after placing |
+| IK-Rel is harder to reverse | Use IK-Abs for this sanity check |
+| Expert B sometimes fails | Filter to SUCCESS-only episodes |
+| Expert B doesn't reach DONE state | Increase `--horizon` (default 400 steps) |
+| Gripper CLOSE ratio is 0% or 100% | Check gripper heuristic thresholds in `reverse_time.py` |
+
+---
+
+## 9. Shell command notes
+
+When running scripts, you may see commands like:
+
+```bash
+python script.py 2>&1 | head -100
+```
+
+**Explanation of `2>&1`:**
+- `2` = stderr (standard error stream)
+- `1` = stdout (standard output stream)
+- `>&` = redirect one stream to another
+- `2>&1` = redirect stderr to stdout (merge error messages with normal output)
+
+This is useful when you want to capture both normal output and error messages together,
+especially when piping to tools like `head`, `grep`, or `tee`.

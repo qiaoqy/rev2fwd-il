@@ -112,6 +112,15 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"Loading B (reverse) dataset: {args.dataset}")
         print(f"{'='*60}")
+        
+        # Check if dataset file exists
+        dataset_path = Path(args.dataset)
+        if not dataset_path.exists():
+            raise FileNotFoundError(
+                f"Dataset file not found: {args.dataset}\n"
+                f"Please run the data collection script first to generate the B dataset."
+            )
+        
         episodes = load_episodes(args.dataset)
 
         if args.episode < 0 or args.episode >= len(episodes):
