@@ -93,9 +93,12 @@ def _parse_args() -> argparse.Namespace:
 def load_episode_data(npz_path: str, episode_idx: int) -> dict:
     """Load data for a specific episode from NPZ file.
     
-    Script 12 saves data as: np.savez_compressed(path, episodes=episodes)
-    where episodes is a list of dicts, each containing:
-        obs, images, ee_pose, obj_pose, gripper, place_pose, goal_pose, success
+    Expects Episode format: {episodes: [ep1_dict, ep2_dict, ...]}
+    Each episode contains: obs, images, ee_pose, obj_pose, gripper, place_pose, goal_pose, success
+    
+    This format is produced by:
+    - Script 12 (reverse rollouts with images)
+    - Script 22 (forward dataset with images, time-reversed from script 12)
     
     Args:
         npz_path: Path to the NPZ file.
@@ -106,7 +109,7 @@ def load_episode_data(npz_path: str, episode_idx: int) -> dict:
     """
     data = np.load(npz_path, allow_pickle=True)
     
-    # Script 12 saves all episodes under the 'episodes' key as a list of dicts
+    # Expect Episode format with 'episodes' key
     if 'episodes' not in data.files:
         raise ValueError(f"Invalid dataset format. Expected 'episodes' key but found: {data.files}")
     
@@ -116,13 +119,11 @@ def load_episode_data(npz_path: str, episode_idx: int) -> dict:
     if episode_idx >= num_episodes:
         raise ValueError(f"Episode {episode_idx} not found. Dataset has {num_episodes} episodes.")
     
-    # Get the specific episode dict
     episode_data = episodes[episode_idx]
     
-    # Verify images are present
     if 'images' not in episode_data:
         raise ValueError(f"No images found for episode {episode_idx}. "
-                        "Make sure the dataset was collected with script 12.")
+                        "Make sure the dataset was collected with script 12 or 22.")
     
     return episode_data
 
