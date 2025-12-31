@@ -42,6 +42,8 @@ python scripts/12_collect_B_with_images.py --headless --num_episodes 50 \
 # With GUI visualization
 python scripts/12_collect_B_with_images.py --num_episodes 10
 
+CUDA_VISIBLE_DEVICES=2 python scripts/12_collect_B_with_images.py --headless --num_episodes 500 --num_envs 256
+
 =============================================================================
 """
 
@@ -74,13 +76,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image_width",
         type=int,
-        default=256,
+        default=128,
         help="Width of captured images.",
     )
     parser.add_argument(
         "--image_height",
         type=int,
-        default=256,
+        default=128,
         help="Height of captured images.",
     )
     

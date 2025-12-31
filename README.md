@@ -45,6 +45,8 @@ pip install -U torch==2.7.0 torchvision==0.22.0 --index-url https://download.pyt
 pip install isaaclab[isaacsim,all]==2.3.0 --extra-index-url https://pypi.nvidia.com
 pip install wandb
 pip install -e ./isaaclab_tasks
+pip install lerobot==0.4.2
+# pip install numpy==1.26.0 packaging==24.2
 ```
 
 2) Install this repo (editable) and any optional extras:
