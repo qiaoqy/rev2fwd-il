@@ -44,6 +44,8 @@ python scripts/12_collect_B_with_images.py --num_episodes 10
 
 CUDA_VISIBLE_DEVICES=2 python scripts/12_collect_B_with_images.py --headless --num_episodes 500 --num_envs 256
 
+CUDA_VISIBLE_DEVICES=3 python scripts/12_collect_B_with_images.py --headless --num_episodes 10 --num_envs 4 --out data/B_2images_test.npz
+
 =============================================================================
 """
 
@@ -220,11 +222,13 @@ def compute_camera_quat_from_lookat(eye: tuple, target: tuple, up: tuple = (0, 0
 
 
 def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
-    """Dynamically add a camera sensor to the environment configuration.
+    """Dynamically add camera sensors to the environment configuration.
     
-    This function modifies env_cfg.scene to add a table-view camera that
-    captures the workspace from above. This is done before creating the
-    gym environment, so no modifications to isaaclab_tasks are needed.
+    This function modifies env_cfg.scene to add:
+    1. A table-view camera (Camera) - fixed third-person view
+    2. A wrist camera (Camera) - mounted on robot's end-effector, follows the gripper
+    
+    Both cameras use standard CameraCfg for consistency and flexibility.
     
     Args:
         env_cfg: The environment configuration object (from parse_env_cfg).
@@ -232,8 +236,11 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
         image_height: Height of captured images.
     """
     import isaaclab.sim as sim_utils
-    from isaaclab.sensors import TiledCameraCfg
+    from isaaclab.sensors import CameraCfg
     
+    # =========================================================================
+    # Table Camera (Camera) - Third-person fixed view
+    # =========================================================================
     # Define camera using intuitive eye/lookat positions
     # Table center is at approximately (0.5, 0, 0)
     camera_eye = (1.6, 0.7, 0.8)      # Camera position: in front, slightly right, above
@@ -242,9 +249,8 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # Compute rotation quaternion from eye and lookat
     camera_quat = compute_camera_quat_from_lookat(camera_eye, camera_lookat)
     
-    # Use TiledCameraCfg for efficient multi-environment rendering
-    # TiledCamera uses tiled rendering which is more efficient for many parallel envs
-    env_cfg.scene.table_cam = TiledCameraCfg(
+    # Use standard CameraCfg (same as wrist camera for consistency)
+    env_cfg.scene.table_cam = CameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
         update_period=0.0,  # Update every physics step
         height=image_height,
@@ -259,10 +265,38 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
             clipping_range=(0.1, 2.5),
         ),
         # Camera position and orientation defined by eye/lookat above
-        offset=TiledCameraCfg.OffsetCfg(
+        offset=CameraCfg.OffsetCfg(
             pos=camera_eye,
             rot=camera_quat,
             convention="ros",  # ROS convention: +Z forward, +X right, +Y down
+        ),
+    )
+    
+    # =========================================================================
+    # Wrist Camera (Camera) - Eye-in-hand, attached to robot gripper
+    # =========================================================================
+    # Use standard CameraCfg (not TiledCamera) because we need it attached to a robot link.
+    # The prim_path includes the robot's hand link so the camera follows the gripper.
+    env_cfg.scene.wrist_cam = CameraCfg(
+        # Mount camera on panda_hand link - it will move with the gripper
+        prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_cam",
+        update_period=0.0,  # Update every physics step
+        height=image_height,
+        width=image_width,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 2.0),  # Short range since it's close to objects
+        ),
+        # Offset relative to panda_hand frame
+        # pos: forward from gripper, looking down at workspace
+        # rot: orientation to look forward and slightly down
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.13, 0.0, -0.15),  # Forward, centered, below the hand link
+            rot=(-0.70614, 0.03701, 0.03701, -0.70614),  # Looking forward/down
+            convention="ros",
         ),
     )
     
@@ -371,7 +405,7 @@ def rollout_expert_B_with_images(
     
     Returns:
         List of (episode_dict, expert_completed) tuples, one per environment.
-        Each episode_dict contains obs, images, ee_pose, obj_pose, gripper, etc.
+        Each episode_dict contains obs, images, wrist_images, ee_pose, obj_pose, gripper, etc.
     """
     import numpy as np
     import torch
@@ -383,10 +417,12 @@ def rollout_expert_B_with_images(
     num_envs = env.unwrapped.num_envs
     print(f"[DEBUG] rollout: device={device}, num_envs={num_envs}")
     
-    # Get camera sensor reference
-    print("[DEBUG] rollout: Getting camera sensor reference...")
-    camera = env.unwrapped.scene.sensors["table_cam"]
-    print(f"[DEBUG] rollout: Camera sensor acquired: {type(camera)}")
+    # Get camera sensor references
+    print("[DEBUG] rollout: Getting camera sensor references...")
+    table_camera = env.unwrapped.scene.sensors["table_cam"]
+    wrist_camera = env.unwrapped.scene.sensors["wrist_cam"]
+    print(f"[DEBUG] rollout: Table camera acquired: {type(table_camera)}")
+    print(f"[DEBUG] rollout: Wrist camera acquired: {type(wrist_camera)}")
     
     # =========================================================================
     # Step 1: Reset environment
@@ -401,8 +437,10 @@ def rollout_expert_B_with_images(
     # Test camera data access
     print("[DEBUG] rollout: Testing camera data access...")
     try:
-        test_rgb = camera.data.output["rgb"]
-        print(f"[DEBUG] rollout: Camera RGB shape: {test_rgb.shape}, dtype: {test_rgb.dtype}")
+        test_rgb = table_camera.data.output["rgb"]
+        print(f"[DEBUG] rollout: Table camera RGB shape: {test_rgb.shape}, dtype: {test_rgb.dtype}")
+        test_wrist_rgb = wrist_camera.data.output["rgb"]
+        print(f"[DEBUG] rollout: Wrist camera RGB shape: {test_wrist_rgb.shape}, dtype: {test_wrist_rgb.dtype}")
     except Exception as e:
         print(f"[ERROR] rollout: Failed to access camera data: {e}")
     
@@ -446,7 +484,8 @@ def rollout_expert_B_with_images(
     # Step 5: Initialize per-env recording buffers
     # =========================================================================
     obs_lists = [[] for _ in range(num_envs)]
-    image_lists = [[] for _ in range(num_envs)]
+    image_lists = [[] for _ in range(num_envs)]           # Table camera images
+    wrist_image_lists = [[] for _ in range(num_envs)]     # Wrist camera images
     ee_pose_lists = [[] for _ in range(num_envs)]
     obj_pose_lists = [[] for _ in range(num_envs)]
     gripper_lists = [[] for _ in range(num_envs)]
@@ -472,22 +511,27 @@ def rollout_expert_B_with_images(
         else:
             obs_vec = obs_dict
         
-        # Get camera images
-        # camera.data.output["rgb"] has shape (num_envs, H, W, C) where C is typically 3 or 4
-        rgb_images = camera.data.output["rgb"]
+        # Get camera images from both cameras
+        # table_camera.data.output["rgb"] has shape (num_envs, H, W, C) where C is typically 3 or 4
+        table_rgb = table_camera.data.output["rgb"]
+        wrist_rgb = wrist_camera.data.output["rgb"]
         # Ensure we have 3 channels (RGB) - handles both RGB and RGBA formats
-        if rgb_images.shape[-1] > 3:
-            rgb_images = rgb_images[..., :3]
+        if table_rgb.shape[-1] > 3:
+            table_rgb = table_rgb[..., :3]
+        if wrist_rgb.shape[-1] > 3:
+            wrist_rgb = wrist_rgb[..., :3]
         
         # Record data for each env
         obs_np = obs_vec.cpu().numpy()
         ee_pose_np = ee_pose.cpu().numpy()
         obj_pose_np = object_pose.cpu().numpy()
-        images_np = rgb_images.cpu().numpy().astype(np.uint8)
+        table_images_np = table_rgb.cpu().numpy().astype(np.uint8)
+        wrist_images_np = wrist_rgb.cpu().numpy().astype(np.uint8)
         
         for i in range(num_envs):
             obs_lists[i].append(obs_np[i])
-            image_lists[i].append(images_np[i])
+            image_lists[i].append(table_images_np[i])
+            wrist_image_lists[i].append(wrist_images_np[i])
             ee_pose_lists[i].append(ee_pose_np[i])
             obj_pose_lists[i].append(obj_pose_np[i])
         
@@ -527,20 +571,25 @@ def rollout_expert_B_with_images(
         else:
             obs_vec = obs_dict
         
-        # Get camera images
-        rgb_images = camera.data.output["rgb"]
-        if rgb_images.shape[-1] > 3:
-            rgb_images = rgb_images[..., :3]
+        # Get camera images from both cameras
+        table_rgb = table_camera.data.output["rgb"]
+        wrist_rgb = wrist_camera.data.output["rgb"]
+        if table_rgb.shape[-1] > 3:
+            table_rgb = table_rgb[..., :3]
+        if wrist_rgb.shape[-1] > 3:
+            wrist_rgb = wrist_rgb[..., :3]
         
         obs_np = obs_vec.cpu().numpy()
         ee_pose_np = ee_pose.cpu().numpy()
         obj_pose_np = object_pose.cpu().numpy()
-        images_np = rgb_images.cpu().numpy().astype(np.uint8)
+        table_images_np = table_rgb.cpu().numpy().astype(np.uint8)
+        wrist_images_np = wrist_rgb.cpu().numpy().astype(np.uint8)
         
         for i in range(num_envs):
             if expert_completed[i]:
                 obs_lists[i].append(obs_np[i])
-                image_lists[i].append(images_np[i])
+                image_lists[i].append(table_images_np[i])
+                wrist_image_lists[i].append(wrist_images_np[i])
                 ee_pose_lists[i].append(ee_pose_np[i])
                 obj_pose_lists[i].append(obj_pose_np[i])
                 gripper_lists[i].append(1.0)  # Open gripper during settle
@@ -570,7 +619,8 @@ def rollout_expert_B_with_images(
         
         episode_dict = {
             "obs": np.array(obs_lists[i], dtype=np.float32),
-            "images": np.array(image_lists[i], dtype=np.uint8),  # (T, H, W, 3)
+            "images": np.array(image_lists[i], dtype=np.uint8),  # (T, H, W, 3) - table camera
+            "wrist_images": np.array(wrist_image_lists[i], dtype=np.uint8),  # (T, H, W, 3) - wrist camera
             "ee_pose": np.array(ee_pose_lists[i], dtype=np.float32),
             "obj_pose": np.array(obj_pose_lists[i], dtype=np.float32),
             "gripper": np.array(gripper_lists[i], dtype=np.float32),
@@ -605,7 +655,8 @@ def save_episodes_with_images(path: str, episodes: list[dict]) -> None:
     if episodes:
         ep0 = episodes[0]
         print(f"  - State obs shape: {ep0['obs'].shape}")
-        print(f"  - Image shape: {ep0['images'].shape}")
+        print(f"  - Table camera image shape: {ep0['images'].shape}")
+        print(f"  - Wrist camera image shape: {ep0['wrist_images'].shape}")
         print(f"  - Episode length: {ep0['obs'].shape[0]}")
 
 

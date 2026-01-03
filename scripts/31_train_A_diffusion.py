@@ -38,7 +38,7 @@ The script converts the NPZ data to LeRobot v3.0 format:
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-CUDA_VISIBLE_DEVICES=1 
+CUDA_VISIBLE_DEVICES=2
 
 # Step 1: Convert data only (recommended for first run)
 python scripts/31_train_A_diffusion.py \
@@ -49,9 +49,10 @@ python scripts/31_train_A_diffusion.py \
 # Step 2: Train with converted data
 python scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_images.npz \
-    --out runs/diffusion_A \
-    --steps 1000 \
-    --batch_size 8
+    --out runs/diffusion_A1 \
+    --steps 5000 \
+    --batch_size 2048 \
+    --lr 0.0005
 
 # Quick test run
 python scripts/31_train_A_diffusion.py \
@@ -67,10 +68,12 @@ python scripts/31_train_A_diffusion.py \
     --resume
 
 Multi-GPU training
-CUDA_VISIBLE_DEVICES=1,2,3,4,5 torchrun --nproc_per_node=5 scripts/31_train_A_diffusion.py \
+CUDA_VISIBLE_DEVICES=1,4,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_images.npz \
     --out runs/diffusion_A \
-    --batch_size 32
+    --batch_size 2048 \
+    --steps 5000 \
+    --lr 0.0005
 
 =============================================================================
 """
@@ -210,14 +213,20 @@ def _parse_args() -> argparse.Namespace:
         "--crop_shape",
         type=int,
         nargs=2,
-        default=[84, 84],
-        help="Image crop shape (H, W). Default: 84 84.",
+        default=[128, 128],
+        help="Image crop shape (H, W). Default: 128 128.",
     )
     parser.add_argument(
         "--num_train_timesteps",
         type=int,
         default=100,
         help="Number of diffusion timesteps. Default: 100.",
+    )
+    parser.add_argument(
+        "--pretrained_backbone_weights",
+        type=str,
+        default= None,
+        help="Pretrained weights for vision backbone (e.g., 'ResNet18_Weights.IMAGENET1K_V1'). Default: None.",
     )
 
     # =========================================================================
@@ -239,6 +248,12 @@ def _parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Resume training from the latest checkpoint.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overwrite existing checkpoints directory if it exists. Default: True. Use --no-overwrite to disable.",
     )
 
     # =========================================================================
@@ -539,6 +554,22 @@ def train_with_lerobot_api(
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     
+    # Check if running in distributed mode
+    is_main_process = True
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        is_main_process = (local_rank == 0)
+    
+    # Handle overwrite: remove existing checkpoints directory (only on main process)
+    checkpoint_dir = out_dir / "checkpoints"
+    if is_main_process and args.overwrite and checkpoint_dir.exists() and not args.resume:
+        print(f"Removing existing checkpoints directory: {checkpoint_dir}")
+        shutil.rmtree(checkpoint_dir)
+    
+    # Sync all processes before continuing
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    
     # Device selection
     device = args.device
     if device is None:
@@ -573,6 +604,7 @@ def train_with_lerobot_api(
         vision_backbone=args.vision_backbone,
         crop_shape=tuple(args.crop_shape),
         num_train_timesteps=args.num_train_timesteps,
+        pretrained_backbone_weights=args.pretrained_backbone_weights,
         device=device,
         push_to_hub=False,
         optimizer_lr=args.lr,

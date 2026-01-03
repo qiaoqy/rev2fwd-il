@@ -71,8 +71,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frame",
         type=int,
-        default=0,
-        help="Frame index to extract as PNG (default: 0).",
+        default=30,
+        help="Frame index to extract as PNG (default: 30).",
     )
     parser.add_argument(
         "--name",
@@ -173,20 +173,40 @@ def save_frame_data_as_json(episode_data: dict, frame_idx: int, output_path: Pat
     print(f"Saved frame {frame_idx} data to {output_path}")
 
 
-def create_episode_video(images: np.ndarray, output_path: Path, fps: int) -> None:
+def create_episode_video(
+    images: np.ndarray,
+    output_path: Path,
+    fps: int,
+    wrist_images: np.ndarray | None = None,
+) -> None:
     """Create MP4 video from episode images.
     
     Uses H.264 codec (libx264) with yuv420p pixel format for broad compatibility,
     including direct playback in VSCode.
     
+    If wrist_images is provided, creates a side-by-side video with table camera
+    on the left and wrist camera on the right.
+    
     Args:
-        images: Array of shape (T, H, W, C) containing RGB images.
+        images: Array of shape (T, H, W, C) containing RGB images from table camera.
         output_path: Path to save the MP4 file.
         fps: Frames per second for the video.
+        wrist_images: Optional array of shape (T, H, W, C) from wrist camera.
+                      If provided, will be concatenated side-by-side with images.
     """
     import imageio
     
-    print(f"Creating video with {len(images)} frames at {fps} fps...")
+    if wrist_images is not None:
+        print(f"Creating side-by-side video with {len(images)} frames at {fps} fps...")
+        print(f"  - Left: Table camera ({images.shape[2]}x{images.shape[1]})")
+        print(f"  - Right: Wrist camera ({wrist_images.shape[2]}x{wrist_images.shape[1]})")
+        
+        # Concatenate images side-by-side (along width axis)
+        # Both should have shape (T, H, W, C), concatenate along axis=2 (width)
+        combined_images = np.concatenate([images, wrist_images], axis=2)
+    else:
+        print(f"Creating video with {len(images)} frames at {fps} fps...")
+        combined_images = images
     
     # Use libx264 codec with yuv420p for broad compatibility (including VSCode)
     with imageio.get_writer(
@@ -196,7 +216,7 @@ def create_episode_video(images: np.ndarray, output_path: Path, fps: int) -> Non
         quality=8,
         pixelformat='yuv420p'
     ) as writer:
-        for img in images:
+        for img in combined_images:
             writer.append_data(img)
     
     print(f"Saved video to {output_path}")
@@ -234,23 +254,37 @@ def main() -> None:
     num_frames = len(images)
     H, W = images.shape[1], images.shape[2]
     
+    # Check if wrist camera images are available
+    wrist_images = episode_data.get("wrist_images", None)
+    has_wrist = wrist_images is not None
+    
     print(f"Episode {args.episode}:")
     print(f"  - Number of frames: {num_frames}")
-    print(f"  - Image size: {W}x{H}")
+    print(f"  - Table camera image size: {W}x{H}")
+    if has_wrist:
+        wH, wW = wrist_images.shape[1], wrist_images.shape[2]
+        print(f"  - Wrist camera image size: {wW}x{wH}")
+    else:
+        print(f"  - Wrist camera: not available")
     print(f"  - Success: {episode_data['success']}")
     
-    # Save single frame as PNG
+    # Save single frame as PNG (table camera)
     frame_idx = min(args.frame, num_frames - 1)
-    png_path = output_dir / f"frame_{frame_idx}.png"
+    png_path = output_dir / f"frame_{frame_idx}_table.png"
     save_frame_as_png(images, frame_idx, png_path)
+    
+    # Save wrist camera frame if available
+    if has_wrist:
+        wrist_png_path = output_dir / f"frame_{frame_idx}_wrist.png"
+        save_frame_as_png(wrist_images, frame_idx, wrist_png_path)
     
     # Save frame data as JSON
     json_path = output_dir / f"frame_{frame_idx}_data.json"
     save_frame_data_as_json(episode_data, frame_idx, json_path)
     
-    # Create episode video
+    # Create episode video (side-by-side if wrist camera available)
     video_path = output_dir / f"episode_{args.episode}_video.mp4"
-    create_episode_video(images, video_path, args.fps)
+    create_episode_video(images, video_path, args.fps, wrist_images=wrist_images)
     
     print(f"\nInspection complete! Files saved to {output_dir}")
 

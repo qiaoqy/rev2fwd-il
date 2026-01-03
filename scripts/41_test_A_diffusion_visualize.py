@@ -18,28 +18,22 @@ This script performs evaluation of a vision-based diffusion policy:
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-# Basic evaluation (headless mode, 1 episode, save video)
+# Basic evaluation (headless mode, 5 episodes, auto-saves ep0.mp4 to ep4.mp4)
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out runs/diffusion_A/videos/ep0.mp4 \
-    --headless
-
-# Multiple episodes evaluation
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out runs/diffusion_A/videos/ep0.mp4 \
-    --num_episodes 10 \
+    --out_dir runs/diffusion_A/videos \
+    --num_episodes 5 \
     --headless
 
 # With GUI visualization (for debugging)
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out runs/diffusion_A/videos/ep0.mp4
+    --out_dir runs/diffusion_A/videos
 
 # Custom horizon and resolution
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out runs/diffusion_A/videos/ep0.mp4 \
+    --out_dir runs/diffusion_A/videos \
     --horizon 500 \
     --image_width 128 \
     --image_height 128 \
@@ -190,10 +184,10 @@ def _parse_args() -> argparse.Namespace:
         help="Path to LeRobot pretrained_model directory (contains config.json, model.safetensors, preprocessors).",
     )
     parser.add_argument(
-        "--out",
+        "--out_dir",
         type=str,
-        default="runs/diffusion_A/videos/ep0.mp4",
-        help="Output MP4 path for the recorded episode.",
+        default="runs/diffusion_A/videos",
+        help="Output directory for recorded videos. Each episode saves as ep0.mp4, ep1.mp4, etc.",
     )
     parser.add_argument(
         "--task",
@@ -204,7 +198,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_episodes",
         type=int,
-        default=1,
+        default=5,
         help="How many episodes to roll out (records first one).",
     )
     parser.add_argument(
@@ -371,18 +365,57 @@ def run_episode(
     postprocessor,
     horizon: int,
     writer,
+    goal_xy: tuple = (0.5, 0.0),
+    success_radius: float = 0.05,
+    min_init_dist: float = 0.08,
+    max_reset_attempts: int = 20,
 ) -> dict:
-    """Run one episode, write frames to writer if provided, return summary."""
+    """Run one episode, write frames to writer if provided, return summary.
+    
+    Args:
+        env: Isaac Lab environment.
+        policy: Diffusion policy.
+        preprocessor: Optional preprocessor (unused).
+        postprocessor: Optional postprocessor (unused).
+        horizon: Maximum steps per episode.
+        writer: Video writer (or None).
+        goal_xy: Goal XY position (plate center).
+        success_radius: Success radius in meters.
+        min_init_dist: Minimum initial distance from goal (reject if closer).
+        max_reset_attempts: Max attempts to find valid initial position.
+        
+    Returns:
+        Dictionary with episode statistics.
+    """
 
-    from rev2fwd_il.sim.scene_api import get_ee_pose_w
+    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w
 
     camera = env.unwrapped.scene.sensors["table_cam"]
     device = env.unwrapped.device
 
-    obs_dict, _ = env.reset()
+    # Reset until object is far enough from goal
+    goal_xy_arr = np.array(goal_xy)
+    for attempt in range(max_reset_attempts):
+        obs_dict, _ = env.reset()
+        init_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
+        init_obj_xy = init_obj_pose[:2]
+        init_dist = np.linalg.norm(init_obj_xy - goal_xy_arr)
+        
+        if init_dist >= min_init_dist:
+            break
+        
+        if attempt < max_reset_attempts - 1:
+            print(f"  Reset attempt {attempt+1}: object too close to goal "
+                  f"(dist={init_dist:.3f}m < {min_init_dist}m), retrying...")
+    
+    print(f"  Initial object XY: [{init_obj_pose[0]:.3f}, {init_obj_pose[1]:.3f}]")
+    print(f"  Goal XY: [{goal_xy[0]:.3f}, {goal_xy[1]:.3f}]")
+    print(f"  Initial distance to goal: {init_dist:.3f}m")
+    
     steps = 0
     success = False
     last_action = None
+    final_dist = None
 
 
     for t in range(horizon):
@@ -426,13 +459,25 @@ def run_episode(
 
         obs_dict, _, terminated, truncated, _ = env.step(action)
 
-        if (terminated[0] or truncated[0]) and t > 10:
+        # Check success: object XY distance to goal
+        obj_pose = get_object_pose_w(env)[0].cpu().numpy()
+        obj_xy = obj_pose[:2]
+        dist_to_goal = np.linalg.norm(obj_xy - np.array(goal_xy))
+        final_dist = dist_to_goal
+        
+        if dist_to_goal < success_radius:
             success = True
+            print(f"  SUCCESS at step {t+1}! Distance: {dist_to_goal:.4f}m")
+            break
+            
+        # Early termination (but not success)
+        if terminated[0] or truncated[0]:
             break
 
     return {
         "steps": steps,
         "success": success,
+        "final_dist": final_dist,
         "last_action": None if last_action is None else last_action.detach().cpu().numpy(),
     }
 
@@ -493,31 +538,67 @@ def main() -> None:
         policy.eval()
         print("Policy loaded.")
 
-        out_path = Path(args.out)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Only first episode is recorded to MP4 to avoid huge files
-        writer = imageio.get_writer(out_path, fps=args.fps)
+        # Goal position: plate center
+        goal_xy = (0.5, 0.0)
+        success_radius = 0.05  # 5cm - success if object within this distance
+        min_init_dist = 0.15   # 15cm - reject initial positions closer than this
+
+        print(f"\n{'='*60}")
+        print(f"Evaluation Settings:")
+        print(f"  Goal XY: {goal_xy}")
+        print(f"  Success radius: {success_radius}m")
+        print(f"  Min initial distance: {min_init_dist}m")
+        print(f"  Horizon: {args.horizon}")
+        print(f"  Num episodes: {args.num_episodes}")
+        print(f"{'='*60}")
 
         stats = []
+        video_paths = []
         for ep in range(args.num_episodes):
             print(f"\nEpisode {ep+1}/{args.num_episodes}")
+            
+            # Create a separate video writer for each episode
+            video_path = out_dir / f"ep{ep}.mp4"
+            writer = imageio.get_writer(video_path, fps=args.fps)
+            
             result = run_episode(
                 env=env,
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 horizon=args.horizon,
-                writer=writer if ep == 0 else None,
+                writer=writer,
+                goal_xy=goal_xy,
+                success_radius=success_radius,
+                min_init_dist=min_init_dist,
             )
+            
+            writer.close()
+            video_paths.append(video_path)
+            
             stats.append(result)
-            print(f"  steps={result['steps']} success={result['success']}")
+            status = "SUCCESS" if result['success'] else "FAILED"
+            print(f"  Result: {status} | steps={result['steps']} | final_dist={result['final_dist']:.4f}m")
+            print(f"  Video saved: {video_path}")
 
-        writer.close()
-        print(f"Saved video to {out_path}")
+        print(f"\nSaved {len(video_paths)} videos to {out_dir}/")
 
+        # Print summary statistics
+        num_success = sum(1 for s in stats if s["success"])
         avg_steps = np.mean([s["steps"] for s in stats])
-        print(f"Average steps: {avg_steps:.1f}")
+        avg_dist = np.mean([s["final_dist"] for s in stats])
+        min_dist = min(s["final_dist"] for s in stats)
+        
+        print(f"\n{'='*60}")
+        print(f"Evaluation Summary:")
+        print(f"  Success rate: {num_success}/{len(stats)} ({100*num_success/len(stats):.1f}%)")
+        print(f"  Average steps: {avg_steps:.1f}")
+        print(f"  Average final distance: {avg_dist:.4f}m")
+        print(f"  Min final distance: {min_dist:.4f}m")
+        print(f"{'='*60}")
 
         # Close env before simulation_app to avoid hang
         print("Closing environment...", flush=True)
