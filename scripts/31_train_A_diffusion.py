@@ -38,6 +38,8 @@ The script converts the NPZ data to LeRobot v3.0 format:
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
+CUDA_VISIBLE_DEVICES=1 
+
 # Step 1: Convert data only (recommended for first run)
 python scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_images.npz \
@@ -63,6 +65,12 @@ python scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_images.npz \
     --out runs/diffusion_A \
     --resume
+
+Multi-GPU training
+CUDA_VISIBLE_DEVICES=1,2,3,4,5 torchrun --nproc_per_node=5 scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_images.npz \
+    --out runs/diffusion_A \
+    --batch_size 32
 
 =============================================================================
 """

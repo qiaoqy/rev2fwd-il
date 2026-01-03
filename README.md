@@ -767,6 +767,176 @@ MAX FINAL DIST: 0.2377m
 
 ---
 
+### 3.11 Train Diffusion Policy A with Images (Script 31)
+
+This script trains a vision-based Diffusion Policy using the LeRobot library (v0.4.2) on the forward dataset with images created by script 22.
+
+**Diffusion Policy Overview:**
+- Uses RGB images + end-effector state as input
+- Generates action sequences via iterative denoising
+- More expressive than MLP but requires more training time
+
+```bash
+# Step 1: Convert data to LeRobot format only (recommended for first run)
+python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_images.npz \
+    --out runs/diffusion_A \
+    --convert_only
+
+# Step 2: Train the diffusion policy
+CUDA_VISIBLE_DEVICES=1 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_images.npz \
+    --out runs/diffusion_A \
+    --steps 100000 \
+    --batch_size 32
+
+# Quick test run (fewer steps)
+CUDA_VISIBLE_DEVICES=1 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_images.npz \
+    --out runs/diffusion_A_test \
+    --steps 1000 \
+    --batch_size 8
+
+# Resume training from checkpoint
+CUDA_VISIBLE_DEVICES=1 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_images.npz \
+    --out runs/diffusion_A \
+    --resume
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset` | `data/A_forward_with_images.npz` | Input NPZ file with images from script 22 |
+| `--out` | `runs/diffusion_A` | Output directory for checkpoints |
+| `--lerobot_dataset_dir` | `{out}/lerobot_dataset` | LeRobot dataset directory |
+| `--convert_only` | - | Only convert data, don't train |
+| `--skip_convert` | - | Skip data conversion |
+| `--force_convert` | - | Force re-conversion |
+| `--steps` | `100000` | Number of training steps |
+| `--batch_size` | `32` | Mini-batch size |
+| `--lr` | `1e-4` | Learning rate |
+| `--seed` | `0` | Random seed |
+| `--n_obs_steps` | `2` | Number of observation steps |
+| `--horizon` | `16` | Diffusion horizon |
+| `--n_action_steps` | `8` | Number of action steps to execute |
+| `--vision_backbone` | `resnet18` | Vision encoder backbone |
+| `--crop_shape` | `84 84` | Image crop shape |
+| `--wandb` | - | Enable WandB logging |
+
+#### Output Files
+
+```
+runs/diffusion_A/
+├── lerobot_dataset/          # Converted LeRobot dataset
+│   ├── data/
+│   ├── meta/
+│   └── videos/
+└── checkpoints/
+    └── checkpoints/
+        └── last/
+            └── pretrained_model/
+                ├── config.json
+                ├── model.safetensors
+                └── policy_*.json
+```
+
+---
+
+### 3.12 Evaluate Diffusion Policy A with Visualization (Script 41)
+
+This script evaluates the trained Diffusion Policy in Isaac Lab and records an MP4 video.
+
+**Evaluation Setup:**
+- Cube starts at random table position (default env.reset behavior)
+- Policy receives: RGB image (128x128) + EE pose (7D)
+- Policy outputs: target EE pose (7D) + gripper command (1D)
+- Video is recorded from the injected camera
+
+```bash
+# Basic evaluation with video recording
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
+    --out runs/diffusion_A/videos/ep0.mp4 \
+    --headless
+
+# Multiple episodes
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
+    --out runs/diffusion_A/videos/ep0.mp4 \
+    --num_episodes 10 \
+    --headless
+
+# With GUI visualization
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
+    --out runs/diffusion_A/videos/ep0.mp4
+
+# Custom settings
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
+    --out runs/diffusion_A/videos/ep0.mp4 \
+    --horizon 500 \
+    --image_width 128 \
+    --image_height 128 \
+    --headless
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint` | `runs/diffusion_A/.../pretrained_model` | Path to pretrained model directory |
+| `--out` | `runs/diffusion_A/videos/ep0.mp4` | Output video path |
+| `--task` | `Isaac-Lift-Cube-Franka-IK-Abs-v0` | Isaac Lab task ID |
+| `--num_episodes` | `1` | Number of episodes to run |
+| `--horizon` | `300` | Maximum steps per episode |
+| `--fps` | `20` | Video FPS |
+| `--image_width` | `128` | Camera width (must match training) |
+| `--image_height` | `128` | Camera height (must match training) |
+| `--seed` | `0` | Random seed |
+| `--headless` | - | Run without GUI |
+
+#### Example Output
+
+```
+[load_policy] dir=runs/diffusion_A/.../pretrained_model, device=cuda:0
+[load_policy] Creating DiffusionConfig...
+[load_policy] DiffusionConfig created
+[load_policy] Creating DiffusionPolicy model...
+[load_policy] DiffusionPolicy created in 2.15s
+[load_policy] Loading model weights...
+[load_policy] load_state_dict done in 0.03s
+[load_policy] Moved to device in 0.16s
+[load_policy] Policy loading complete!
+Policy loaded.
+
+Episode 1/1
+[Step 1/300]
+[Step 51/300]
+[Step 101/300]
+[Step 151/300]
+[Step 201/300]
+[Step 251/300]
+  steps=300 success=False
+Saved video to runs/diffusion_A/videos/ep0.mp4
+Average steps: 300.0
+Closing environment...
+Environment closed.
+Closing simulation app...
+Done.
+```
+
+#### Notes on Diffusion Policy Evaluation
+
+- **First Step Latency:** The first inference may be slow (~5-10s) due to CUDA JIT compilation.
+- **Isaac Sim Shutdown:** The simulator may hang during `simulation_app.close()`. Use Ctrl+C after video saves if needed.
+- **Success Criterion:** Same as MLP policy - cube XY distance to goal < 3cm.
+- **Training Requirement:** Diffusion policies typically need 50k-100k+ training steps for good performance.
+
+---
+
 ## 4. Data Formats Reference
 
 ### 4.1 Episode Data Structure (from script 10)
@@ -855,10 +1025,13 @@ rev2fwd-il/
     ├── 11_replay_B_episode.py           # Replay & record B episode as video
     ├── 12_collect_B_with_images.py      # Collect reverse rollouts with camera images
     ├── 13_inspect_B_images.py           # Inspect image data (PNG, JSON, MP4)
-    ├── 20_make_A_forward_dataset.py     # Step 2: Build forward dataset
+    ├── 20_make_A_forward_dataset.py     # Step 2: Build forward dataset (state-only)
     ├── 21_replay_A_episode.py           # Replay forward dataset episode
-    ├── 30_train_A_bc.py                 # Step 3: Train policy A
-    └── 40_eval_A.py                     # Step 4: Evaluate policy A
+    ├── 22_make_A_forward_dataset_with_images.py  # Build forward dataset with images
+    ├── 30_train_A_bc.py                 # Step 3a: Train policy A (MLP, state-only)
+    ├── 31_train_A_diffusion.py          # Step 3b: Train policy A (Diffusion, vision)
+    ├── 40_eval_A.py                     # Step 4a: Evaluate MLP policy A
+    └── 41_test_A_diffusion_visualize.py # Step 4b: Evaluate Diffusion policy A
 ```
 
 ### Key Modules
