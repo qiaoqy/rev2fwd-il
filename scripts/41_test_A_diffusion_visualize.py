@@ -20,8 +20,8 @@ USAGE EXAMPLES
 =============================================================================
 # Basic evaluation (headless mode, 5 episodes, auto-saves ep0.mp4 to ep4.mp4)
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A/videos \
+    --checkpoint runs/diffusion_A_2cam/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_2cam/videos \
     --num_episodes 5 \
     --headless
 
@@ -39,6 +39,13 @@ CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --image_height 128 \
     --headless
 
+# CUDA_VISIBLE_DEVICES=1,2,6 torchrun --nproc_per_node=3 scripts/31_train_A_diffusion.py \
+#     --dataset data/A_forward_with_2images.npz \
+#     --out runs/diffusion_A_2cam \
+#     --batch_size 2048 \
+#     --steps 200 \
+#     --lr 0.0005
+    
 =============================================================================
 CHECKPOINT STRUCTURE
 =============================================================================
@@ -100,15 +107,18 @@ def compute_camera_quat_from_lookat(eye: Tuple[float, float, float], target: Tup
 
 
 def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int) -> None:
-    """Inject a table-view camera into Isaac Lab env cfg."""
+    """Inject table-view and wrist cameras into Isaac Lab env cfg."""
     import isaaclab.sim as sim_utils
-    from isaaclab.sensors import TiledCameraCfg
+    from isaaclab.sensors import CameraCfg
 
+    # =========================================================================
+    # Table Camera - Third-person fixed view
+    # =========================================================================
     camera_eye = (1.6, 0.7, 0.8)
     camera_lookat = (0.4, 0.0, 0.2)
     camera_quat = compute_camera_quat_from_lookat(camera_eye, camera_lookat)
 
-    env_cfg.scene.table_cam = TiledCameraCfg(
+    env_cfg.scene.table_cam = CameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
         update_period=0.0,
         height=image_height,
@@ -120,9 +130,31 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int) -> None:
             horizontal_aperture=20.955,
             clipping_range=(0.1, 2.5),
         ),
-        offset=TiledCameraCfg.OffsetCfg(
+        offset=CameraCfg.OffsetCfg(
             pos=camera_eye,
             rot=camera_quat,
+            convention="ros",
+        ),
+    )
+    
+    # =========================================================================
+    # Wrist Camera - Eye-in-hand, attached to robot gripper
+    # =========================================================================
+    env_cfg.scene.wrist_cam = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_cam",
+        update_period=0.0,
+        height=image_height,
+        width=image_width,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 2.0),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.13, 0.0, -0.15),
+            rot=(-0.70614, 0.03701, 0.03701, -0.70614),
             convention="ros",
         ),
     )
@@ -238,6 +270,12 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Random seed for torch/numpy.",
     )
+    parser.add_argument(
+        "--min_init_dist",
+        type=float,
+        default=0.15,
+        help="Minimum initial distance from goal to accept (reject if closer). Default: 0.15m.",
+    )
 
     # Isaac Lab AppLauncher flags (headless, device, etc.)
     from isaaclab.app import AppLauncher
@@ -251,6 +289,66 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Policy loading helpers
 # ---------------------------------------------------------------------------
+def load_policy_config(pretrained_dir: str) -> Dict[str, Any]:
+    """Load policy configuration without loading model weights.
+    
+    This is useful for checking policy requirements (e.g., image size, 
+    whether wrist camera is needed) before creating the simulation environment.
+    
+    Args:
+        pretrained_dir: Path to the pretrained model directory.
+        
+    Returns:
+        Dictionary with policy configuration including:
+        - has_wrist: Whether policy expects wrist camera input
+        - image_shape: Expected image shape (C, H, W)
+        - state_dim: Expected state dimension
+        - action_dim: Expected action dimension
+    """
+    import json
+    from pathlib import Path
+    
+    config_path = Path(pretrained_dir) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Policy config not found: {config_path}")
+    
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+    
+    input_features = config_dict.get("input_features", {})
+    output_features = config_dict.get("output_features", {})
+    
+    # Check for wrist camera
+    has_wrist = "observation.wrist_image" in input_features
+    
+    # Get image shape from table camera
+    image_shape = None
+    if "observation.image" in input_features:
+        image_shape = tuple(input_features["observation.image"]["shape"])
+    
+    # Get state dimension
+    state_dim = None
+    if "observation.state" in input_features:
+        state_dim = input_features["observation.state"]["shape"][0]
+    
+    # Get action dimension
+    action_dim = None
+    if "action" in output_features:
+        action_dim = output_features["action"]["shape"][0]
+    
+    # Check if obj_pose is included (state_dim=14 means ee_pose(7) + obj_pose(7))
+    include_obj_pose = (state_dim == 14) if state_dim is not None else False
+    
+    return {
+        "has_wrist": has_wrist,
+        "image_shape": image_shape,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "include_obj_pose": include_obj_pose,
+        "raw_config": config_dict,
+    }
+
+
 def load_diffusion_policy(
     pretrained_dir: str,
     device: str,
@@ -369,6 +467,8 @@ def run_episode(
     success_radius: float = 0.05,
     min_init_dist: float = 0.08,
     max_reset_attempts: int = 20,
+    has_wrist: bool = False,
+    include_obj_pose: bool = False,
 ) -> dict:
     """Run one episode, write frames to writer if provided, return summary.
     
@@ -383,6 +483,8 @@ def run_episode(
         success_radius: Success radius in meters.
         min_init_dist: Minimum initial distance from goal (reject if closer).
         max_reset_attempts: Max attempts to find valid initial position.
+        has_wrist: Whether the policy expects wrist camera input.
+        include_obj_pose: Whether the policy expects object pose in state.
         
     Returns:
         Dictionary with episode statistics.
@@ -390,7 +492,8 @@ def run_episode(
 
     from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w
 
-    camera = env.unwrapped.scene.sensors["table_cam"]
+    table_camera = env.unwrapped.scene.sensors["table_cam"]
+    wrist_camera = env.unwrapped.scene.sensors.get("wrist_cam", None) if has_wrist else None
     device = env.unwrapped.device
 
     # Reset until object is far enough from goal
@@ -423,26 +526,52 @@ def run_episode(
         if t % 50 == 0:
             print(f"[Step {t+1}/{horizon}]", flush=True)
 
-        # Acquire camera RGB (num_envs, H, W, 3) -> float32 BCHW
-        rgb = camera.data.output["rgb"]
-        if rgb.shape[-1] > 3:
-            rgb = rgb[..., :3]
-        rgb_np = rgb.cpu().numpy().astype(np.uint8)
-        rgb_frame = rgb_np[0]
+        # Acquire table camera RGB (num_envs, H, W, 3) -> float32 BCHW
+        table_rgb = table_camera.data.output["rgb"]
+        if table_rgb.shape[-1] > 3:
+            table_rgb = table_rgb[..., :3]
+        table_rgb_np = table_rgb.cpu().numpy().astype(np.uint8)
+        table_rgb_frame = table_rgb_np[0]
+        
+        # Acquire wrist camera RGB if available
+        if wrist_camera is not None:
+            wrist_rgb = wrist_camera.data.output["rgb"]
+            if wrist_rgb.shape[-1] > 3:
+                wrist_rgb = wrist_rgb[..., :3]
+            wrist_rgb_np = wrist_rgb.cpu().numpy().astype(np.uint8)
+            wrist_rgb_frame = wrist_rgb_np[0]
+            # Concatenate side-by-side for video
+            combined_frame = np.concatenate([table_rgb_frame, wrist_rgb_frame], axis=1)
+        else:
+            combined_frame = table_rgb_frame
+        
         if writer is not None:
-            writer.append_data(rgb_frame)
+            writer.append_data(combined_frame)
 
-        # Convert to float32 [0, 1] and BCHW format for policy
-        rgb_chw = torch.from_numpy(rgb_frame).float() / 255.0  # uint8 -> float [0,1]
-        rgb_chw = rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)  # (1, C, H, W)
+        # Convert table image to float32 [0, 1] and BCHW format for policy
+        table_rgb_chw = torch.from_numpy(table_rgb_frame).float() / 255.0  # uint8 -> float [0,1]
+        table_rgb_chw = table_rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)  # (1, C, H, W)
 
         # EE state
         ee_pose = get_ee_pose_w(env)[0:1]
+        
+        # Build observation.state based on whether obj_pose is included
+        if include_obj_pose:
+            obj_pose = get_object_pose_w(env)[0:1]  # (1, 7)
+            state = torch.cat([ee_pose, obj_pose], dim=-1)  # (1, 14)
+        else:
+            state = ee_pose  # (1, 7)
 
         policy_inputs: Dict[str, torch.Tensor] = {
-            "observation.image": rgb_chw,
-            "observation.state": ee_pose,
+            "observation.image": table_rgb_chw,
+            "observation.state": state,
         }
+        
+        # Add wrist camera input if policy expects it
+        if wrist_camera is not None:
+            wrist_rgb_chw = torch.from_numpy(wrist_rgb_frame).float() / 255.0
+            wrist_rgb_chw = wrist_rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)
+            policy_inputs["observation.wrist_image"] = wrist_rgb_chw
 
         with torch.no_grad():
             action = policy.select_action(policy_inputs)
@@ -510,6 +639,38 @@ def main() -> None:
 
         print(f"[DEBUG] Using device: {device}")
 
+        # =====================================================================
+        # Step 1: Load policy config FIRST to check requirements
+        # =====================================================================
+        print(f"\n{'='*60}")
+        print("Loading policy configuration...")
+        print(f"{'='*60}")
+        policy_info = load_policy_config(args.checkpoint)
+        has_wrist = policy_info["has_wrist"]
+        include_obj_pose = policy_info["include_obj_pose"]
+        
+        print(f"  Policy checkpoint: {args.checkpoint}")
+        print(f"  Expected image shape: {policy_info['image_shape']} (C, H, W)")
+        print(f"  Expected state dim: {policy_info['state_dim']}")
+        print(f"  Expected action dim: {policy_info['action_dim']}")
+        print(f"  Requires wrist camera: {has_wrist}")
+        print(f"  Includes obj_pose in state: {include_obj_pose}")
+        
+        # Validate image dimensions match
+        if policy_info["image_shape"] is not None:
+            policy_h, policy_w = policy_info["image_shape"][1], policy_info["image_shape"][2]
+            if policy_h != args.image_height or policy_w != args.image_width:
+                print(f"\n  ⚠️  WARNING: Image size mismatch!")
+                print(f"      Policy expects: {policy_h}x{policy_w}")
+                print(f"      Args specify:   {args.image_height}x{args.image_width}")
+                print(f"      Using policy's expected size: {policy_h}x{policy_w}")
+                args.image_height = policy_h
+                args.image_width = policy_w
+        print(f"{'='*60}\n")
+
+        # =====================================================================
+        # Step 2: Create environment with appropriate cameras
+        # =====================================================================
         env = make_env_with_camera(
             task_id=args.task,
             num_envs=1,
@@ -521,14 +682,30 @@ def main() -> None:
             disable_terminations=False,
         )
 
-        print("[DEBUG] Env created; checking camera...")
+        print("[DEBUG] Env created; checking cameras...")
 
-        camera = env.unwrapped.scene.sensors.get("table_cam", None)
-        if camera is None:
+        table_camera = env.unwrapped.scene.sensors.get("table_cam", None)
+        if table_camera is None:
             raise RuntimeError("Camera sensor 'table_cam' not found; did add_camera_to_env_cfg run?")
-        print(f"[DEBUG] Camera cfg: {camera.cfg.width}x{camera.cfg.height}, data_types={camera.cfg.data_types}")
+        print(f"[DEBUG] Table camera cfg: {table_camera.cfg.width}x{table_camera.cfg.height}, data_types={table_camera.cfg.data_types}")
+        
+        wrist_camera = env.unwrapped.scene.sensors.get("wrist_cam", None)
+        if wrist_camera is not None:
+            print(f"[DEBUG] Wrist camera cfg: {wrist_camera.cfg.width}x{wrist_camera.cfg.height}, data_types={wrist_camera.cfg.data_types}")
+        else:
+            print("[DEBUG] Wrist camera not found in env")
+        
+        # Validate: if policy needs wrist camera, env must have it
+        if has_wrist and wrist_camera is None:
+            raise RuntimeError(
+                "Policy expects wrist camera input (observation.wrist_image) "
+                "but wrist_cam sensor not found in environment!"
+            )
 
-        print("Loading diffusion policy...")
+        # =====================================================================
+        # Step 3: Load full policy model
+        # =====================================================================
+        print("Loading diffusion policy weights...")
         policy, preprocessor, postprocessor = load_diffusion_policy(
             args.checkpoint,
             device,
@@ -544,7 +721,7 @@ def main() -> None:
         # Goal position: plate center
         goal_xy = (0.5, 0.0)
         success_radius = 0.05  # 5cm - success if object within this distance
-        min_init_dist = 0.15   # 15cm - reject initial positions closer than this
+        min_init_dist = args.min_init_dist   # 15cm - reject initial positions closer than this
 
         print(f"\n{'='*60}")
         print(f"Evaluation Settings:")
@@ -574,6 +751,8 @@ def main() -> None:
                 goal_xy=goal_xy,
                 success_radius=success_radius,
                 min_init_dist=min_init_dist,
+                has_wrist=has_wrist,
+                include_obj_pose=include_obj_pose,
             )
             
             writer.close()

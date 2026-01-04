@@ -139,6 +139,11 @@ def reverse_episode_with_images(ep: dict) -> dict:
     ee_fwd = ep["ee_pose"][::-1].copy()       # (T, 7)
     obj_fwd = ep["obj_pose"][::-1].copy()     # (T, 7)
     gripper_fwd = ep["gripper"][::-1].copy()  # (T,)
+    
+    # Check if wrist camera images exist
+    has_wrist = "wrist_images" in ep
+    if has_wrist:
+        wrist_images_fwd = ep["wrist_images"][::-1].copy()  # (T, H, W, 3)
 
     # Remove last timestep (no action target for it)
     # This keeps consistency: obs[t] corresponds to action target ee_pose[t+1]
@@ -147,9 +152,11 @@ def reverse_episode_with_images(ep: dict) -> dict:
     ee_out = ee_fwd[:-1]          # (T-1, 7) - current ee pose at each step
     obj_out = obj_fwd[:-1]        # (T-1, 7)
     gripper_out = gripper_fwd[:-1]  # (T-1,)
+    if has_wrist:
+        wrist_images_out = wrist_images_fwd[:-1]  # (T-1, H, W, 3)
 
     # Build new episode dict (same format as script 12 output)
-    return {
+    result = {
         "obs": obs_out.astype(np.float32),
         "images": images_out,  # Keep as uint8
         "ee_pose": ee_out.astype(np.float32),
@@ -162,6 +169,12 @@ def reverse_episode_with_images(ep: dict) -> dict:
         # success flag carried over
         "success": ep["success"],
     }
+    
+    # Add wrist camera images if present
+    if has_wrist:
+        result["wrist_images"] = wrist_images_out  # Keep as uint8
+    
+    return result
 
 
 def save_episodes_with_images(path: str, episodes: list[dict]) -> None:
@@ -180,7 +193,9 @@ def save_episodes_with_images(path: str, episodes: list[dict]) -> None:
     if episodes:
         ep0 = episodes[0]
         print(f"  - State obs shape: {ep0['obs'].shape}")
-        print(f"  - Image shape: {ep0['images'].shape}")
+        print(f"  - Table camera image shape: {ep0['images'].shape}")
+        if "wrist_images" in ep0:
+            print(f"  - Wrist camera image shape: {ep0['wrist_images'].shape}")
         print(f"  - Episode length: {ep0['obs'].shape[0]}")
 
 
@@ -262,7 +277,9 @@ def main() -> None:
     print(f"Average episode length: {avg_length:.1f}")
     if forward_episodes:
         print(f"Observation dim: {forward_episodes[0]['obs'].shape[1]}")
-        print(f"Image shape: {forward_episodes[0]['images'].shape[1:]}")
+        print(f"Table camera image shape: {forward_episodes[0]['images'].shape[1:]}")
+        if "wrist_images" in forward_episodes[0]:
+            print(f"Wrist camera image shape: {forward_episodes[0]['wrist_images'].shape[1:]}")
     print(f"Gripper CLOSE ratio: {100*total_close_ratio:.1f}%")
     print(f"{'='*60}\n")
 
