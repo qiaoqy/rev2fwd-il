@@ -73,6 +73,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import cv2
 import numpy as np
 import torch
 
@@ -545,9 +546,6 @@ def run_episode(
         else:
             combined_frame = table_rgb_frame
         
-        if writer is not None:
-            writer.append_data(combined_frame)
-
         # Convert table image to float32 [0, 1] and BCHW format for policy
         table_rgb_chw = torch.from_numpy(table_rgb_frame).float() / 255.0  # uint8 -> float [0,1]
         table_rgb_chw = table_rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)  # (1, C, H, W)
@@ -578,6 +576,44 @@ def run_episode(
 
         action = action.to(device)
         last_action = action
+        
+        # Get poses and action for text overlay
+        ee_pose_for_text = ee_pose[0].cpu().numpy()
+        obj_pose_for_text = get_object_pose_w(env)[0].cpu().numpy()
+        action_for_text = action.cpu().numpy().flatten()
+        
+        # Add text overlay with EE, object, and action XYZ coordinates
+        if writer is not None:
+            frame_with_text = combined_frame.copy()
+            ee_text = f"EE:  [{ee_pose_for_text[0]:.3f}, {ee_pose_for_text[1]:.3f}, {ee_pose_for_text[2]:.3f}]"
+            obj_text = f"Obj: [{obj_pose_for_text[0]:.3f}, {obj_pose_for_text[1]:.3f}, {obj_pose_for_text[2]:.3f}]"
+            act_text = f"Act: [{action_for_text[0]:.3f}, {action_for_text[1]:.3f}, {action_for_text[2]:.3f}]"
+            
+            # Text parameters (smaller font)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.3
+            thickness = 1
+            color = (255, 255, 255)  # White text
+            bg_color = (0, 0, 0)  # Black background
+            
+            # Draw EE text with background
+            (text_w, text_h), baseline = cv2.getTextSize(ee_text, font, font_scale, thickness)
+            cv2.rectangle(frame_with_text, (3, 3), (6 + text_w, 6 + text_h + baseline), bg_color, -1)
+            cv2.putText(frame_with_text, ee_text, (4, 4 + text_h), font, font_scale, color, thickness, cv2.LINE_AA)
+            
+            # Draw Obj text with background (below EE text)
+            y_offset1 = 8 + text_h + baseline
+            (text_w2, text_h2), baseline2 = cv2.getTextSize(obj_text, font, font_scale, thickness)
+            cv2.rectangle(frame_with_text, (3, y_offset1), (6 + text_w2, y_offset1 + 3 + text_h2 + baseline2), bg_color, -1)
+            cv2.putText(frame_with_text, obj_text, (4, y_offset1 + 1 + text_h2), font, font_scale, color, thickness, cv2.LINE_AA)
+            
+            # Draw Act text with background (below Obj text)
+            y_offset2 = y_offset1 + 5 + text_h2 + baseline2
+            (text_w3, text_h3), baseline3 = cv2.getTextSize(act_text, font, font_scale, thickness)
+            cv2.rectangle(frame_with_text, (3, y_offset2), (6 + text_w3, y_offset2 + 3 + text_h3 + baseline3), bg_color, -1)
+            cv2.putText(frame_with_text, act_text, (4, y_offset2 + 1 + text_h3), font, font_scale, color, thickness, cv2.LINE_AA)
+            
+            writer.append_data(frame_with_text)
 
         # Tile action for num_envs (vectorized env)
         num_envs = env.unwrapped.num_envs
