@@ -378,6 +378,7 @@ def load_diffusion_policy(
     from lerobot.configs.types import FeatureType, PolicyFeature, NormalizationMode
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
     from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+    from lerobot.policies.factory import make_pre_post_processors
 
     pretrained_path = Path(pretrained_dir)
     config_path = pretrained_path / "config.json"
@@ -453,8 +454,29 @@ def load_diffusion_policy(
     policy = policy.to(device)
     print(f"[load_policy] Moved to device in {time.time()-t0:.2f}s", flush=True)
     
+    # Load preprocessor and postprocessor from saved files
+    # These handle normalization (input) and unnormalization (output)
+    print(f"[load_policy] Loading preprocessor and postprocessor...", flush=True)
+    t0 = time.time()
+    
+    # Override device for preprocessor to match inference device
+    preprocessor_overrides = {
+        "device_processor": {"device": device},
+    }
+    postprocessor_overrides = {
+        "device_processor": {"device": device},
+    }
+    
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=cfg,
+        pretrained_path=str(pretrained_path),
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
+    print(f"[load_policy] Processors loaded in {time.time()-t0:.2f}s", flush=True)
+    
     print(f"[load_policy] Policy loading complete!", flush=True)
-    return policy, None, None
+    return policy, preprocessor, postprocessor
 
 
 def run_episode(
@@ -476,8 +498,8 @@ def run_episode(
     Args:
         env: Isaac Lab environment.
         policy: Diffusion policy.
-        preprocessor: Optional preprocessor (unused).
-        postprocessor: Optional postprocessor (unused).
+        preprocessor: Preprocessor pipeline for input normalization.
+        postprocessor: Postprocessor pipeline for action unnormalization.
         horizon: Maximum steps per episode.
         writer: Video writer (or None).
         goal_xy: Goal XY position (plate center).
@@ -571,8 +593,17 @@ def run_episode(
             wrist_rgb_chw = wrist_rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)
             policy_inputs["observation.wrist_image"] = wrist_rgb_chw
 
+        # Preprocess inputs (normalizes state and images)
+        if preprocessor is not None:
+            policy_inputs = preprocessor(policy_inputs)
+
         with torch.no_grad():
             action = policy.select_action(policy_inputs)
+
+        # Postprocess action (unnormalizes from [-1, 1] to original range)
+        # postprocessor expects a Tensor (PolicyAction) and returns a Tensor
+        if postprocessor is not None:
+            action = postprocessor(action)
 
         action = action.to(device)
         last_action = action
@@ -582,12 +613,12 @@ def run_episode(
         obj_pose_for_text = get_object_pose_w(env)[0].cpu().numpy()
         action_for_text = action.cpu().numpy().flatten()
         
-        # Add text overlay with EE, object, and action XYZ coordinates
+        # Add text overlay with EE, object, and action XYZ coordinates + gripper
         if writer is not None:
             frame_with_text = combined_frame.copy()
             ee_text = f"EE:  [{ee_pose_for_text[0]:.3f}, {ee_pose_for_text[1]:.3f}, {ee_pose_for_text[2]:.3f}]"
             obj_text = f"Obj: [{obj_pose_for_text[0]:.3f}, {obj_pose_for_text[1]:.3f}, {obj_pose_for_text[2]:.3f}]"
-            act_text = f"Act: [{action_for_text[0]:.3f}, {action_for_text[1]:.3f}, {action_for_text[2]:.3f}]"
+            act_text = f"Act: [{action_for_text[0]:.3f}, {action_for_text[1]:.3f}, {action_for_text[2]:.3f}] G:{action_for_text[-1]:.2f}"
             
             # Text parameters (smaller font)
             font = cv2.FONT_HERSHEY_SIMPLEX
