@@ -504,6 +504,35 @@ def load_diffusion_policy(
     if actual_inference_steps is None:
         actual_inference_steps = cfg.num_train_timesteps
     
+    # =========================================================================
+    # DEBUG: Print normalization settings for inference
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("[DEBUG] INFERENCE Normalization Settings")
+    print("=" * 60)
+    print(f"  policy_cfg.normalization_mapping:")
+    for feat_type, norm_mode in cfg.normalization_mapping.items():
+        print(f"    {feat_type}: {norm_mode}")
+    print("\n  Preprocessor steps:")
+    for i, step in enumerate(preprocessor.steps):
+        step_name = getattr(step, '__class__', type(step)).__name__
+        print(f"    [{i}] {step_name}")
+        # Print normalizer details if it's a normalizer step
+        if hasattr(step, 'norm_map'):
+            print(f"        norm_map: {step.norm_map}")
+        if hasattr(step, 'features'):
+            print(f"        features: {list(step.features.keys())}")
+    print("\n  Postprocessor steps:")
+    for i, step in enumerate(postprocessor.steps):
+        step_name = getattr(step, '__class__', type(step)).__name__
+        print(f"    [{i}] {step_name}")
+        # Print unnormalizer details if it's an unnormalizer step
+        if hasattr(step, 'norm_map'):
+            print(f"        norm_map: {step.norm_map}")
+        if hasattr(step, 'features'):
+            print(f"        features: {list(step.features.keys())}")
+    print("=" * 60 + "\n")
+    
     print(f"[load_policy] Policy loading complete! (num_inference_steps={actual_inference_steps})", flush=True)
     return policy, preprocessor, postprocessor, actual_inference_steps
 
@@ -623,17 +652,36 @@ def run_episode(
             policy_inputs["observation.wrist_image"] = wrist_rgb_chw
 
         # Preprocess inputs (normalizes state and images)
+        # DEBUG: Print before/after normalization on first step
+        if t == 0 and preprocessor is not None:
+            print("\n[DEBUG] Step 0: Before preprocessing (raw inputs):")
+            print(f"  observation.state: {policy_inputs['observation.state'][0, :7].cpu().numpy()}")
+            print(f"  observation.image range: [{policy_inputs['observation.image'].min():.4f}, {policy_inputs['observation.image'].max():.4f}]")
+        
         if preprocessor is not None:
             policy_inputs = preprocessor(policy_inputs)
+        
+        if t == 0 and preprocessor is not None:
+            print("[DEBUG] Step 0: After preprocessing (normalized):")
+            print(f"  observation.state: {policy_inputs['observation.state'][0, :7].cpu().numpy()}")
+            print(f"  observation.image range: [{policy_inputs['observation.image'].min():.4f}, {policy_inputs['observation.image'].max():.4f}]")
 
         with torch.no_grad():
             action = policy.select_action(policy_inputs)
             raw_actioin = action.clone()
+        
+        # DEBUG: Print raw action (in normalized space) on first step
+        if t == 0:
+            print(f"[DEBUG] Step 0: Raw action (normalized, from policy): {raw_actioin[0].cpu().numpy()}")
 
         # Postprocess action (unnormalizes from [-1, 1] to original range)
         # postprocessor expects a Tensor (PolicyAction) and returns a Tensor
         if postprocessor is not None:
             action = postprocessor(action)
+        
+        # DEBUG: Print after unnormalization on first step
+        if t == 0:
+            print(f"[DEBUG] Step 0: Unnormalized action: {action[0].cpu().numpy()}\n")
 
 
         action = action.to(device)

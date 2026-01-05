@@ -728,6 +728,17 @@ def train_with_lerobot_api(
         optimizer_lr=args.lr,
     )
     
+    # =========================================================================
+    # DEBUG: Print normalization settings for training
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("[DEBUG] TRAINING Normalization Settings")
+    print("=" * 60)
+    print(f"  policy_cfg.normalization_mapping:")
+    for feat_type, norm_mode in policy_cfg.normalization_mapping.items():
+        print(f"    {feat_type}: {norm_mode}")
+    print("=" * 60 + "\n")
+    
     # Create dataset configuration
     dataset_cfg = DatasetConfig(
         repo_id="local/rev2fwd_diffusion",
