@@ -743,33 +743,22 @@ def train_with_lerobot_api(
     # Create training pipeline configuration
     checkpoint_dir = out_dir / "checkpoints"
     
-    # When resuming, we need to provide the path to the saved train_config.json
-    config_path = None
+    # When resuming, check that checkpoints exist
     if args.resume:
-        # Find the latest checkpoint's train_config.json
         checkpoints_subdir = checkpoint_dir / "checkpoints"
-        if checkpoints_subdir.exists():
-            checkpoint_dirs = sorted(checkpoints_subdir.iterdir())
-            if checkpoint_dirs:
-                latest_checkpoint = checkpoint_dirs[-1]
-                config_path = latest_checkpoint / "pretrained_model" / "train_config.json"
-                if config_path.exists():
-                    print(f"Resuming from config: {config_path}")
-                else:
-                    raise FileNotFoundError(
-                        f"Cannot resume: train_config.json not found at {config_path}. "
-                        f"Make sure you have a valid checkpoint from a previous run."
-                    )
-            else:
-                raise FileNotFoundError(
-                    f"Cannot resume: no checkpoints found in {checkpoints_subdir}. "
-                    f"Please run training without --resume first."
-                )
-        else:
+        if not checkpoints_subdir.exists():
             raise FileNotFoundError(
                 f"Cannot resume: checkpoint directory {checkpoints_subdir} does not exist. "
                 f"Please run training without --resume first."
             )
+        checkpoint_dirs = sorted(checkpoints_subdir.iterdir())
+        if not checkpoint_dirs:
+            raise FileNotFoundError(
+                f"Cannot resume: no checkpoints found in {checkpoints_subdir}. "
+                f"Please run training without --resume first."
+            )
+        latest_checkpoint = checkpoint_dirs[-1]
+        print(f"Resuming from checkpoint: {latest_checkpoint}")
     
     train_cfg = TrainPipelineConfig(
         dataset=dataset_cfg,
@@ -784,7 +773,6 @@ def train_with_lerobot_api(
         save_checkpoint=True,
         wandb=wandb_cfg,
         resume=args.resume,
-        config_path=str(config_path) if config_path else None,
         eval_freq=0,  # Disable evaluation during training
     )
     

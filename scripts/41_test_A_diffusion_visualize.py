@@ -20,8 +20,8 @@ USAGE EXAMPLES
 =============================================================================
 # Basic evaluation (headless mode, 5 episodes, auto-saves ep0.mp4 to ep4.mp4)
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A_2cam/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_2cam/videos \
+    --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_2cam_3/videos \
     --num_episodes 5 \
     --headless
 
@@ -277,6 +277,14 @@ def _parse_args() -> argparse.Namespace:
         default=0.15,
         help="Minimum initial distance from goal to accept (reject if closer). Default: 0.15m.",
     )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=None,
+        help="Number of diffusion denoising steps at inference. Must be <= num_train_timesteps (default 100). "
+             "Higher = more stable but slower. Default: None (use all training timesteps, i.e., 100). "
+             "For faster inference, try 50. Cannot exceed training timesteps.",
+    )
 
     # Isaac Lab AppLauncher flags (headless, device, etc.)
     from isaaclab.app import AppLauncher
@@ -355,6 +363,7 @@ def load_diffusion_policy(
     device: str,
     image_height: int = 128,
     image_width: int = 128,
+    num_inference_steps: int | None = None,
 ) -> Tuple[Any, Any, Any]:
     """Load LeRobot diffusion policy from checkpoint directory.
     
@@ -363,6 +372,9 @@ def load_diffusion_policy(
         device: Device to load the model on.
         image_height: Image height (must match training data).
         image_width: Image width (must match training data).
+        num_inference_steps: Number of diffusion denoising steps at inference.
+            If None, uses the value from training config (typically num_train_timesteps).
+            Higher values = more stable predictions but slower inference.
         
     Returns:
         Tuple of (policy, preprocessor, postprocessor).
@@ -426,10 +438,21 @@ def load_diffusion_policy(
     if "down_dims" in config_dict and isinstance(config_dict["down_dims"], list):
         config_dict["down_dims"] = tuple(config_dict["down_dims"])
     
+    # Override num_inference_steps if specified
+    if num_inference_steps is not None:
+        # Validate: num_inference_steps cannot exceed num_train_timesteps
+        num_train_timesteps = config_dict.get("num_train_timesteps", 100)
+        if num_inference_steps > num_train_timesteps:
+            print(f"[load_policy] WARNING: num_inference_steps ({num_inference_steps}) cannot exceed "
+                  f"num_train_timesteps ({num_train_timesteps}). Clamping to {num_train_timesteps}.", flush=True)
+            num_inference_steps = num_train_timesteps
+        config_dict["num_inference_steps"] = num_inference_steps
+        print(f"[load_policy] Setting num_inference_steps to {num_inference_steps}", flush=True)
+    
     # Create DiffusionConfig
     print(f"[load_policy] Creating DiffusionConfig...", flush=True)
     cfg = DiffusionConfig(**config_dict)
-    print(f"[load_policy] DiffusionConfig created", flush=True)
+    print(f"[load_policy] DiffusionConfig created (num_inference_steps={cfg.num_inference_steps})", flush=True)
 
     # Create policy model
     print(f"[load_policy] Creating DiffusionPolicy model...", flush=True)
@@ -475,8 +498,14 @@ def load_diffusion_policy(
     )
     print(f"[load_policy] Processors loaded in {time.time()-t0:.2f}s", flush=True)
     
-    print(f"[load_policy] Policy loading complete!", flush=True)
-    return policy, preprocessor, postprocessor
+    # Get actual num_inference_steps used by the policy
+    # It may be stored in diffusion.num_inference_steps or we compute from config
+    actual_inference_steps = cfg.num_inference_steps
+    if actual_inference_steps is None:
+        actual_inference_steps = cfg.num_train_timesteps
+    
+    print(f"[load_policy] Policy loading complete! (num_inference_steps={actual_inference_steps})", flush=True)
+    return policy, preprocessor, postprocessor, actual_inference_steps
 
 
 def run_episode(
@@ -599,11 +628,13 @@ def run_episode(
 
         with torch.no_grad():
             action = policy.select_action(policy_inputs)
+            raw_actioin = action.clone()
 
         # Postprocess action (unnormalizes from [-1, 1] to original range)
         # postprocessor expects a Tensor (PolicyAction) and returns a Tensor
         if postprocessor is not None:
             action = postprocessor(action)
+
 
         action = action.to(device)
         last_action = action
@@ -619,7 +650,7 @@ def run_episode(
             ee_text = f"EE:  [{ee_pose_for_text[0]:.3f}, {ee_pose_for_text[1]:.3f}, {ee_pose_for_text[2]:.3f}]"
             obj_text = f"Obj: [{obj_pose_for_text[0]:.3f}, {obj_pose_for_text[1]:.3f}, {obj_pose_for_text[2]:.3f}]"
             act_text = f"Act: [{action_for_text[0]:.3f}, {action_for_text[1]:.3f}, {action_for_text[2]:.3f}] G:{action_for_text[-1]:.2f}"
-            
+            raw_actioin_for_text = f"RawAct: [{raw_actioin[0,0]:.3f}, {raw_actioin[0,1]:.3f}, {raw_actioin[0,2]:.3f}] G:{raw_actioin[0,-1]:.2f}"
             # Text parameters (smaller font)
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.3
@@ -643,6 +674,12 @@ def run_episode(
             (text_w3, text_h3), baseline3 = cv2.getTextSize(act_text, font, font_scale, thickness)
             cv2.rectangle(frame_with_text, (3, y_offset2), (6 + text_w3, y_offset2 + 3 + text_h3 + baseline3), bg_color, -1)
             cv2.putText(frame_with_text, act_text, (4, y_offset2 + 1 + text_h3), font, font_scale, color, thickness, cv2.LINE_AA)
+
+            # Draw RawAct text with background (below Act text)
+            y_offset3 = y_offset2 + 5 + text_h3 + baseline3
+            (text_w4, text_h4), baseline4 = cv2.getTextSize(raw_actioin_for_text, font, font_scale, thickness)
+            cv2.rectangle(frame_with_text, (3, y_offset3), (6 + text_w4, y_offset3 + 3 + text_h4 + baseline4), bg_color, -1)
+            cv2.putText(frame_with_text, raw_actioin_for_text, (4, y_offset3 + 1 + text_h4), font, font_scale, color, thickness, cv2.LINE_AA)
             
             writer.append_data(frame_with_text)
 
@@ -773,14 +810,15 @@ def main() -> None:
         # Step 3: Load full policy model
         # =====================================================================
         print("Loading diffusion policy weights...")
-        policy, preprocessor, postprocessor = load_diffusion_policy(
+        policy, preprocessor, postprocessor, num_inference_steps = load_diffusion_policy(
             args.checkpoint,
             device,
             image_height=args.image_height,
             image_width=args.image_width,
+            num_inference_steps=args.num_inference_steps,
         )
         policy.eval()
-        print("Policy loaded.")
+        print(f"Policy loaded. (num_inference_steps={num_inference_steps})")
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -797,6 +835,7 @@ def main() -> None:
         print(f"  Min initial distance: {min_init_dist}m")
         print(f"  Horizon: {args.horizon}")
         print(f"  Num episodes: {args.num_episodes}")
+        print(f"  Num inference steps: {num_inference_steps}")
         print(f"{'='*60}")
 
         stats = []
@@ -850,6 +889,14 @@ def main() -> None:
         print("Closing environment...", flush=True)
         env.close()
         print("Environment closed.", flush=True)
+
+    except Exception as e:
+        import traceback
+        print(f"\n{'='*60}")
+        print(f"ERROR: {e}")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        print(f"{'='*60}\n")
 
     finally:
         print("Closing simulation app...", flush=True)
