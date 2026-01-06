@@ -145,7 +145,8 @@ def update_policy(
 
 
 def extract_xyz_visualization_data(
-    batch: dict[str, torch.Tensor],
+    raw_batch: dict[str, torch.Tensor],
+    processed_batch: dict[str, torch.Tensor],
     preprocessor,
     postprocessor,
     policy: PreTrainedPolicy,
@@ -158,12 +159,13 @@ def extract_xyz_visualization_data(
     - Raw EE pose XYZ (before normalization)
     - Normalized EE pose XYZ (after normalization)
     - Normalized action XYZ (ground truth)
-    - Raw action XYZ (after unnormalization)
+    - Raw action XYZ (from raw batch)
     - Ground truth action XYZ
     - Camera images
     
     Args:
-        batch: Preprocessed batch from dataloader (already normalized)
+        raw_batch: Raw batch from dataloader (before preprocessing)
+        processed_batch: Preprocessed batch from dataloader (already normalized)
         preprocessor: The preprocessor used for normalization
         postprocessor: The postprocessor used for unnormalization
         policy: The policy model (for getting action predictions)
@@ -177,8 +179,8 @@ def extract_xyz_visualization_data(
     
     # Extract observation.state (already normalized by preprocessor)
     # Take the last observation step for visualization
-    if "observation.state" in batch:
-        state = batch["observation.state"]
+    if "observation.state" in processed_batch:
+        state = processed_batch["observation.state"]
         if state.dim() == 3:  # (B, n_obs_steps, state_dim)
             state_norm = state[0, -1].detach().cpu().numpy()  # Last obs step, first batch
         else:  # (B, state_dim)
@@ -204,8 +206,8 @@ def extract_xyz_visualization_data(
     
     # Extract camera images
     # observation.image: (B, n_obs_steps, C, H, W) normalized to [0, 1]
-    if "observation.image" in batch:
-        img = batch["observation.image"]
+    if "observation.image" in processed_batch:
+        img = processed_batch["observation.image"]
         if img.dim() == 5:  # (B, n_obs_steps, C, H, W)
             img_np = img[0, -1].detach().cpu().numpy()  # Last obs step
         else:  # (B, C, H, W)
@@ -216,8 +218,8 @@ def extract_xyz_visualization_data(
         viz_data["table_image"] = img_np
     
     # Extract wrist camera if available
-    if "observation.wrist_image" in batch:
-        wrist_img = batch["observation.wrist_image"]
+    if "observation.wrist_image" in processed_batch:
+        wrist_img = processed_batch["observation.wrist_image"]
         if wrist_img.dim() == 5:
             wrist_img_np = wrist_img[0, -1].detach().cpu().numpy()
         else:
@@ -226,33 +228,24 @@ def extract_xyz_visualization_data(
         wrist_img_np = (wrist_img_np * 255).clip(0, 255).astype(np.uint8)
         viz_data["wrist_image"] = wrist_img_np
     
-    # Extract ground truth action (normalized)
-    # action: (B, horizon, action_dim) or (B, action_dim)
-    if "action" in batch:
-        action_gt = batch["action"]
-        if action_gt.dim() == 3:  # (B, horizon, action_dim)
+    # Extract ground truth action (raw from raw_batch, norm from processed_batch)
+    if "action" in raw_batch:
+        action_raw = raw_batch["action"]
+        if action_raw.dim() == 3:  # (B, horizon, action_dim)
             # Take first action in horizon for the first sample
-            action_gt_norm = action_gt[0, 0].detach().cpu().numpy()
+            action_gt_raw = action_raw[0, 0].detach().cpu().numpy()
         else:  # (B, action_dim)
-            action_gt_norm = action_gt[0].detach().cpu().numpy()
+            action_gt_raw = action_raw[0].detach().cpu().numpy()
+        viz_data["action_gt_raw"] = action_gt_raw[:3].copy()  # XYZ only
+    
+    if "action" in processed_batch:
+        action_norm = processed_batch["action"]
+        if action_norm.dim() == 3:  # (B, horizon, action_dim)
+            # Take first action in horizon for the first sample
+            action_gt_norm = action_norm[0, 0].detach().cpu().numpy()
+        else:  # (B, action_dim)
+            action_gt_norm = action_norm[0].detach().cpu().numpy()
         viz_data["action_gt_norm"] = action_gt_norm[:3].copy()  # XYZ only
-        
-        # Unnormalize action using dataset stats if available
-        if dataset_stats is not None and "action" in dataset_stats:
-            stats = dataset_stats["action"]
-            if "mean" in stats and "std" in stats:
-                mean = np.array(stats["mean"])[:3]
-                std = np.array(stats["std"])[:3]
-                viz_data["action_gt_raw"] = action_gt_norm[:3] * std + mean
-            elif "min" in stats and "max" in stats:
-                min_val = np.array(stats["min"])[:3]
-                max_val = np.array(stats["max"])[:3]
-                # Unnormalize from [-1, 1] to [min, max]
-                viz_data["action_gt_raw"] = (action_gt_norm[:3] + 1) / 2 * (max_val - min_val) + min_val
-            else:
-                viz_data["action_gt_raw"] = action_gt_norm[:3].copy()
-        else:
-            viz_data["action_gt_raw"] = action_gt_norm[:3].copy()
     
     # For training visualization, we use ground truth as the "predicted" action
     # since we can't easily get the diffusion model's prediction during training
@@ -476,15 +469,16 @@ def train_with_xyz_visualization(
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
+        raw_batch = next(dl_iter)
+        processed_batch = preprocessor(raw_batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         # Extract visualization data before policy update (on main process only)
         if is_main_process and xyz_visualizer is not None:
             try:
                 viz_data = extract_xyz_visualization_data(
-                    batch=batch,
+                    raw_batch=raw_batch,
+                    processed_batch=processed_batch,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                     policy=policy,
@@ -509,7 +503,7 @@ def train_with_xyz_visualization(
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
-            batch,
+            processed_batch,
             optimizer,
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,

@@ -4,6 +4,7 @@
 This script provides utilities to inspect the data collected by script 12:
 1. Extract a single frame and save as PNG image + JSON metadata
 2. Compile an episode's image sequence into an MP4 video
+3. Generate XYZ curve visualization video (optional)
 
 The inspection data is saved in a timestamped folder under data/ for easy management.
 
@@ -37,6 +38,10 @@ python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
 python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
     --name my_inspection --fps 30
 
+# Enable XYZ curve visualization
+python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
+    --enable_xyz_viz --stats_json runs/diffusion_A_2cam_3/lerobot_dataset/meta/stats.json
+
 =============================================================================
 """
 
@@ -47,6 +52,9 @@ import json
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+
+# Add imports for XYZ visualization
+from rev2fwd_il.data.visualize_xyz_curve import XYZCurveVisualizer
 
 
 def _parse_args() -> argparse.Namespace:
@@ -85,6 +93,17 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Frames per second for the output video (default: 30).",
+    )
+    parser.add_argument(
+        "--enable_xyz_viz",
+        action="store_true",
+        help="Enable XYZ curve visualization video generation.",
+    )
+    parser.add_argument(
+        "--stats_json",
+        type=str,
+        default="runs/diffusion_A_2cam_3/lerobot_dataset/meta/stats.json",
+        help="Path to stats.json file for normalization parameters.",
     )
     
     return parser.parse_args()
@@ -126,6 +145,123 @@ def load_episode_data(npz_path: str, episode_idx: int) -> dict:
                         "Make sure the dataset was collected with script 12 or 22.")
     
     return episode_data
+
+
+def load_normalization_stats(stats_path: str) -> dict:
+    """Load normalization statistics from LeRobot dataset stats.json.
+    
+    Args:
+        stats_path: Path to the stats.json file.
+        
+    Returns:
+        Dictionary containing normalization stats for observation.state.
+    """
+    with open(stats_path, 'r') as f:
+        stats = json.load(f)
+    
+    if 'observation.state' not in stats:
+        raise ValueError(f"observation.state not found in stats file: {stats_path}")
+    
+    state_stats = stats['observation.state']
+    
+    # Extract mean and std for the first 3 dimensions (XYZ position)
+    # Note: ee_pose is stored as [x, y, z, qw, qx, qy, qz] in the dataset
+    mean = np.array(state_stats['mean'][:3])  # XYZ means
+    std = np.array(state_stats['std'][:3])   # XYZ stds
+    
+    return {
+        'mean': mean,
+        'std': std,
+        'min': np.array(state_stats.get('min', [0, 0, 0])[:3]),
+        'max': np.array(state_stats.get('max', [1, 1, 1])[:3]),
+    }
+
+
+def normalize_ee_pose_xyz(ee_pose_xyz: np.ndarray, stats: dict) -> np.ndarray:
+    """Normalize EE pose XYZ using the same method as training.
+    
+    Args:
+        ee_pose_xyz: Array of shape (T, 3) containing XYZ positions.
+        stats: Normalization statistics from load_normalization_stats.
+        
+    Returns:
+        Normalized XYZ array of shape (T, 3).
+    """
+    # Use mean and std normalization like in LeRobot
+    mean = stats['mean']
+    std = stats['std']
+    
+    # Normalize: (x - mean) / std
+    normalized = (ee_pose_xyz - mean) / std
+    return normalized
+
+
+def create_xyz_visualization_video(
+    episode_data: dict,
+    output_dir: Path,
+    episode_idx: int,
+    stats: dict,
+    fps: int = 30,
+) -> None:
+    """Create XYZ curve visualization video for the episode.
+    
+    Args:
+        episode_data: Episode data dictionary.
+        output_dir: Directory to save the video.
+        episode_idx: Episode index.
+        stats: Normalization statistics.
+        fps: Frames per second for the video.
+    """
+    # Extract EE pose data (T, 7) -> XYZ is first 3 dimensions
+    ee_poses = episode_data['ee_pose']  # (T, 7)
+    ee_xyz_raw = ee_poses[:, :3]  # (T, 3) - raw XYZ
+    
+    # Normalize XYZ
+    ee_xyz_norm = normalize_ee_pose_xyz(ee_xyz_raw, stats)  # (T, 3) - normalized XYZ
+    
+    # Extract camera images
+    table_images = episode_data['images']  # (T, H, W, 3)
+    wrist_images = episode_data.get('wrist_images', None)  # (T, H, W, 3) or None
+    
+    # Create visualizer
+    visualizer = XYZCurveVisualizer(
+        output_dir=output_dir,
+        episode_id=episode_idx,
+        fps=fps,
+    )
+    
+    # Add frames one by one
+    T = len(ee_xyz_raw)
+    for t in range(T):
+        # Raw EE pose XYZ
+        ee_raw_xyz = ee_xyz_raw[t]  # (3,)
+        
+        # Normalized EE pose XYZ  
+        ee_norm_xyz = ee_xyz_norm[t]  # (3,)
+        
+        # For output, we leave empty (no action data in inspection)
+        action_raw = np.zeros(3)  # Placeholder
+        action_norm = np.zeros(3)  # Placeholder
+        
+        # Camera images
+        table_img = table_images[t]  # (H, W, 3)
+        wrist_img = wrist_images[t] if wrist_images is not None else None  # (H, W, 3) or None
+        
+        # Add frame to visualizer
+        visualizer.add_frame(
+            ee_pose_raw=ee_raw_xyz,
+            ee_pose_norm=ee_norm_xyz,
+            action_raw=action_raw,
+            action_norm=action_norm,
+            action_gt=None,  # No ground truth in inspection
+            action_gt_raw=None,  # No ground truth in inspection
+            table_image=table_img,
+            wrist_image=wrist_img,
+        )
+    
+    # Generate video
+    video_path = visualizer.generate_video(filename_prefix=f"episode_{episode_idx}_xyz")
+    print(f"Created XYZ visualization video: {video_path}")
 
 
 def save_frame_as_png(images: np.ndarray, frame_idx: int, output_path: Path) -> None:
@@ -285,6 +421,26 @@ def main() -> None:
     # Create episode video (side-by-side if wrist camera available)
     video_path = output_dir / f"episode_{args.episode}_video.mp4"
     create_episode_video(images, video_path, args.fps, wrist_images=wrist_images)
+    
+    # Create XYZ visualization video if enabled
+    if args.enable_xyz_viz:
+        print("\nGenerating XYZ curve visualization...")
+        try:
+            # Load normalization stats
+            stats_path = Path(args.stats_json)
+            if not stats_path.exists():
+                print(f"Warning: Stats file not found at {stats_path}, skipping XYZ visualization")
+            else:
+                stats = load_normalization_stats(str(stats_path))
+                create_xyz_visualization_video(
+                    episode_data=episode_data,
+                    output_dir=output_dir,
+                    episode_idx=args.episode,
+                    stats=stats,
+                    fps=args.fps,
+                )
+        except Exception as e:
+            print(f"Error creating XYZ visualization: {e}")
     
     print(f"\nInspection complete! Files saved to {output_dir}")
 
