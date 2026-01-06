@@ -406,10 +406,10 @@ def train_with_xyz_visualization(
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
+            shuffle=False,  # 不shuffle
         )
     else:
-        shuffle = True
+        shuffle = False  # 不shuffle
         sampler = None
 
     dataloader = torch.utils.data.DataLoader(
