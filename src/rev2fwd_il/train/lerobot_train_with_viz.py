@@ -498,7 +498,8 @@ def train_with_xyz_visualization(
                     ee_pose_norm=viz_data.get("ee_pose_norm", np.zeros(3)),
                     action_raw=viz_data.get("action_gt_raw", np.zeros(3)),
                     action_norm=viz_data.get("action_gt_norm", np.zeros(3)),
-                    action_gt=viz_data.get("action_gt_norm", None),
+                    action_gt=viz_data.get("action_gt_norm", None),  # Normalized GT for subplot 3
+                    action_gt_raw=viz_data.get("action_gt_raw", None),  # Raw GT for subplot 4
                     table_image=viz_data.get("table_image", None),
                     wrist_image=viz_data.get("wrist_image", None),
                 )

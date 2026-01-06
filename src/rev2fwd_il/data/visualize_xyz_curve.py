@@ -58,7 +58,8 @@ class XYZCurveVisualizer:
         self.ee_pose_norm: List[np.ndarray] = []  # (3,) each
         self.action_raw: List[np.ndarray] = []  # (3,) each - output after unnormalization
         self.action_norm: List[np.ndarray] = []  # (3,) each - output before unnormalization
-        self.action_gt: List[np.ndarray] = []  # (3,) each - ground truth (training only)
+        self.action_gt_norm: List[np.ndarray] = []  # (3,) each - normalized ground truth (training only)
+        self.action_gt_raw: List[np.ndarray] = []  # (3,) each - raw ground truth (training only)
         
         # Camera images storage
         self.table_images: List[np.ndarray] = []  # (H, W, 3) uint8 each
@@ -74,6 +75,7 @@ class XYZCurveVisualizer:
         action_raw: np.ndarray,
         action_norm: np.ndarray,
         action_gt: Optional[np.ndarray] = None,
+        action_gt_raw: Optional[np.ndarray] = None,
         table_image: Optional[np.ndarray] = None,
         wrist_image: Optional[np.ndarray] = None,
     ) -> None:
@@ -84,7 +86,8 @@ class XYZCurveVisualizer:
             ee_pose_norm: Normalized EE pose XYZ (3,).
             action_raw: Raw action XYZ after unnormalization (3,).
             action_norm: Normalized action XYZ before unnormalization (3,).
-            action_gt: Ground truth action XYZ (3,), only for training.
+            action_gt: Normalized ground truth action XYZ (3,), for normalized plot.
+            action_gt_raw: Raw ground truth action XYZ (3,), for unnormalized plot.
             table_image: Table camera RGB image (H, W, 3) uint8.
             wrist_image: Wrist camera RGB image (H, W, 3) uint8 (optional).
         """
@@ -94,7 +97,11 @@ class XYZCurveVisualizer:
         self.action_norm.append(np.asarray(action_norm).flatten()[:3])
         
         if action_gt is not None:
-            self.action_gt.append(np.asarray(action_gt).flatten()[:3])
+            self.action_gt_norm.append(np.asarray(action_gt).flatten()[:3])
+            self._has_gt = True
+        
+        if action_gt_raw is not None:
+            self.action_gt_raw.append(np.asarray(action_gt_raw).flatten()[:3])
             self._has_gt = True
         
         # Store camera images
@@ -132,7 +139,10 @@ class XYZCurveVisualizer:
         ee_norm = np.array(self.ee_pose_norm)  # (T, 3)
         act_raw = np.array(self.action_raw)  # (T, 3)
         act_norm = np.array(self.action_norm)  # (T, 3)
-        act_gt = np.array(self.action_gt) if self._has_gt else None  # (T, 3) or None
+        
+        # GT arrays for normalized and raw plots
+        act_gt_norm = np.array(self.action_gt_norm) if len(self.action_gt_norm) > 0 else None  # (T, 3) or None
+        act_gt_raw = np.array(self.action_gt_raw) if len(self.action_gt_raw) > 0 else None  # (T, 3) or None
         
         T = len(ee_raw)
         timesteps = np.arange(T)
@@ -155,7 +165,7 @@ class XYZCurveVisualizer:
             )
         except ImportError:
             print("[XYZCurveVisualizer] imageio not available, saving static plot instead.")
-            return self._save_static_plot(ee_raw, ee_norm, act_raw, act_norm, act_gt, filename_prefix)
+            return self._save_static_plot(ee_raw, ee_norm, act_raw, act_norm, act_gt_norm, act_gt_raw, filename_prefix)
         
         print(f"[XYZCurveVisualizer] Generating video with {T} frames...")
         if has_camera_images:
@@ -207,31 +217,33 @@ class XYZCurveVisualizer:
             
             # Subplot 3: Output Action XYZ (normalized)
             ax = axes[1, 0]
-            ax.set_title("Output: Action XYZ (Normalized)" + (" + GT" if self._has_gt else ""))
+            has_gt_norm = act_gt_norm is not None and len(act_gt_norm) > t
+            ax.set_title("Output: Action XYZ (Normalized)" + (" + GT" if has_gt_norm else ""))
             for i, (label, color) in enumerate(zip(labels, colors.values())):
                 ax.plot(timesteps[:t+1], act_norm[:t+1, i], color=color, label=f"{label} pred", linewidth=1.5)
-                if self._has_gt:
-                    ax.plot(timesteps[:t+1], act_gt[:t+1, i], color=color, label=f"{label} GT", 
+                if has_gt_norm:
+                    ax.plot(timesteps[:t+1], act_gt_norm[:t+1, i], color=color, label=f"{label} GT", 
                            linestyle='--', alpha=0.7, linewidth=1.5)
             ax.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
             ax.set_xlabel("Timestep")
             ax.set_ylabel("Normalized Value")
-            ax.legend(loc='upper right', ncol=2 if self._has_gt else 1, fontsize=8)
+            ax.legend(loc='upper right', ncol=2 if has_gt_norm else 1, fontsize=8)
             ax.set_xlim(0, T)
             ax.grid(True, alpha=0.3)
             
             # Subplot 4: Output Action XYZ (raw/unnormalized)
             ax = axes[1, 1]
-            ax.set_title("Output: Action XYZ (Unnormalized)" + (" + GT" if self._has_gt else ""))
+            has_gt_raw = act_gt_raw is not None and len(act_gt_raw) > t
+            ax.set_title("Output: Action XYZ (Unnormalized)" + (" + GT" if has_gt_raw else ""))
             for i, (label, color) in enumerate(zip(labels, colors.values())):
                 ax.plot(timesteps[:t+1], act_raw[:t+1, i], color=color, label=f"{label} pred", linewidth=1.5)
-                if self._has_gt:
-                    ax.plot(timesteps[:t+1], act_gt[:t+1, i], color=color, label=f"{label} GT", 
+                if has_gt_raw:
+                    ax.plot(timesteps[:t+1], act_gt_raw[:t+1, i], color=color, label=f"{label} GT", 
                            linestyle='--', alpha=0.7, linewidth=1.5)
             ax.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
             ax.set_xlabel("Timestep")
             ax.set_ylabel("Position (m)")
-            ax.legend(loc='upper right', ncol=2 if self._has_gt else 1, fontsize=8)
+            ax.legend(loc='upper right', ncol=2 if has_gt_raw else 1, fontsize=8)
             ax.set_xlim(0, T)
             ax.grid(True, alpha=0.3)
             
@@ -275,7 +287,8 @@ class XYZCurveVisualizer:
         ee_norm: np.ndarray,
         act_raw: np.ndarray,
         act_norm: np.ndarray,
-        act_gt: Optional[np.ndarray],
+        act_gt_norm: Optional[np.ndarray],
+        act_gt_raw: Optional[np.ndarray],
         filename_prefix: str,
     ) -> str:
         """Save a static plot showing all curves (fallback when imageio not available)."""
@@ -310,28 +323,28 @@ class XYZCurveVisualizer:
         
         # Subplot 3: Output Action XYZ (normalized)
         ax = axes[1, 0]
-        ax.set_title("Output: Action XYZ (Normalized)" + (" + GT" if act_gt is not None else ""))
+        ax.set_title("Output: Action XYZ (Normalized)" + (" + GT" if act_gt_norm is not None else ""))
         for i, (label, color) in enumerate(zip(labels, colors.values())):
             ax.plot(timesteps, act_norm[:, i], color=color, label=f"{label} pred", linewidth=1.5)
-            if act_gt is not None:
-                ax.plot(timesteps, act_gt[:, i], color=color, label=f"{label} GT", 
+            if act_gt_norm is not None:
+                ax.plot(timesteps, act_gt_norm[:, i], color=color, label=f"{label} GT", 
                        linestyle='--', alpha=0.7, linewidth=1.5)
         ax.set_xlabel("Timestep")
         ax.set_ylabel("Normalized Value")
-        ax.legend(loc='upper right', ncol=2 if act_gt is not None else 1, fontsize=8)
+        ax.legend(loc='upper right', ncol=2 if act_gt_norm is not None else 1, fontsize=8)
         ax.grid(True, alpha=0.3)
         
         # Subplot 4: Output Action XYZ (raw/unnormalized)
         ax = axes[1, 1]
-        ax.set_title("Output: Action XYZ (Unnormalized)" + (" + GT" if act_gt is not None else ""))
+        ax.set_title("Output: Action XYZ (Unnormalized)" + (" + GT" if act_gt_raw is not None else ""))
         for i, (label, color) in enumerate(zip(labels, colors.values())):
             ax.plot(timesteps, act_raw[:, i], color=color, label=f"{label} pred", linewidth=1.5)
-            if act_gt is not None:
-                ax.plot(timesteps, act_gt[:, i], color=color, label=f"{label} GT", 
+            if act_gt_raw is not None:
+                ax.plot(timesteps, act_gt_raw[:, i], color=color, label=f"{label} GT", 
                        linestyle='--', alpha=0.7, linewidth=1.5)
         ax.set_xlabel("Timestep")
         ax.set_ylabel("Position (m)")
-        ax.legend(loc='upper right', ncol=2 if act_gt is not None else 1, fontsize=8)
+        ax.legend(loc='upper right', ncol=2 if act_gt_raw is not None else 1, fontsize=8)
         ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -352,7 +365,8 @@ class XYZCurveVisualizer:
         self.ee_pose_norm = []
         self.action_raw = []
         self.action_norm = []
-        self.action_gt = []
+        self.action_gt_norm = []
+        self.action_gt_raw = []
         self.table_images = []
         self.wrist_images = []
         self._has_gt = False
