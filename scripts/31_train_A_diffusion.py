@@ -44,7 +44,8 @@ CUDA_VISIBLE_DEVICES=2
 python scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_images.npz \
     --out runs/diffusion_A \
-    --convert_only
+    --convert_only\
+    --include_obj_pose
 
 # Step 2: Train with converted data
 python scripts/31_train_A_diffusion.py \
@@ -76,9 +77,24 @@ CUDA_VISIBLE_DEVICES=1,4,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diff
     --lr 0.0005
 
 CUDA_VISIBLE_DEVICES=2 python scripts/31_train_A_diffusion.py --dataset data/A_forward_with_2images.npz --out runs/diffusion_A_2cam_3 --num_episodes 500 -
--batch_size 1024 --steps 3000 --lr 0.0005 --include_obj_pose 
+-batch_size 1024 --steps 3000 --lr 0.0005 --include_obj_pose --wandb
+
+CUDA_VISIBLE_DEVICES=1,2,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diffusion.py     --dataset data/B_2images_latest.npz\
+              --out runs/diffusion_B_2cam     --num_episodes 500     --batch_size 1024     --steps 2000     --lr 0.0005     --include_obj_pose\
+              --wandb
+
+CUDA_VISIBLE_DEVICES=1 python scripts/31_train_A_diffusion.py \
+    --dataset data/B_2images_latest.npz \
+    --out runs/diffusion_B_2cam \
+    --convert_only
+
+CUDA_VISIBLE_DEVICES=1,2,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diffusion.py\
+    --dataset data/A_forward_with_2images.npz     --out runs/diffusion_A_2cam_3\
+     --num_episodes 500     --batch_size 2048     --steps 800     --lr 0.0005   --enable_xyz_viz  --include_obj_pose --wandb
 =============================================================================
 """
+
+
 
 from __future__ import annotations
 
@@ -273,6 +289,17 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Overwrite existing checkpoints directory if it exists. Default: True. Use --no-overwrite to disable.",
+    )
+    parser.add_argument(
+        "--viz_save_freq",
+        type=int,
+        default=200,
+        help="Save checkpoint and XYZ visualization every N steps. Default: 200.",
+    )
+    parser.add_argument(
+        "--enable_xyz_viz",
+        action="store_true",
+        help="Enable XYZ curve visualization during training.",
     )
 
     # =========================================================================
@@ -658,6 +685,7 @@ def train_with_lerobot_api(
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
     from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.scripts.lerobot_train import train
+    from rev2fwd_il.train.lerobot_train_with_viz import train_with_xyz_visualization
     
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -808,10 +836,20 @@ def train_with_lerobot_api(
     print(f"  Vision backbone: {args.vision_backbone}")
     print(f"  Device: {device}")
     print(f"  WandB: {args.wandb}")
+    print(f"  XYZ visualization: {args.enable_xyz_viz}")
+    print(f"  Viz save frequency: {args.viz_save_freq} steps")
     print("=" * 60 + "\n")
     
-    # Run training
-    train(train_cfg)
+    # Run training with or without XYZ visualization
+    if args.enable_xyz_viz:
+        xyz_viz_dir = out_dir / "xyz_viz"
+        train_with_xyz_visualization(
+            train_cfg,
+            viz_save_freq=args.viz_save_freq,
+            xyz_viz_dir=xyz_viz_dir,
+        )
+    else:
+        train(train_cfg)
     
     return {
         "output_dir": str(checkpoint_dir),

@@ -43,7 +43,7 @@ def setup_environment(
         A sorted list of task IDs matching the selected filters.
     """
     # disable interactive mode for wandb for automate environments
-    os.environ["WANDB_DISABLED"] = "true"
+    os.environ["WANDB_DISABLED"] = ""
 
     # acquire all Isaac environment names
     registered_tasks = []

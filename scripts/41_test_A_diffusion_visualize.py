@@ -285,6 +285,12 @@ def _parse_args() -> argparse.Namespace:
              "Higher = more stable but slower. Default: None (use all training timesteps, i.e., 100). "
              "For faster inference, try 50. Cannot exceed training timesteps.",
     )
+    parser.add_argument(
+        "--visualize_xyz",
+        action="store_true",
+        help="Generate XYZ curve visualization videos for debugging. "
+             "Saves to {out_dir}/xyz_curves/ with camera images side by side.",
+    )
 
     # Isaac Lab AppLauncher flags (headless, device, etc.)
     from isaaclab.app import AppLauncher
@@ -550,6 +556,7 @@ def run_episode(
     max_reset_attempts: int = 20,
     has_wrist: bool = False,
     include_obj_pose: bool = False,
+    xyz_visualizer=None,
 ) -> dict:
     """Run one episode, write frames to writer if provided, return summary.
     
@@ -566,6 +573,7 @@ def run_episode(
         max_reset_attempts: Max attempts to find valid initial position.
         has_wrist: Whether the policy expects wrist camera input.
         include_obj_pose: Whether the policy expects object pose in state.
+        xyz_visualizer: Optional XYZCurveVisualizer for debugging.
         
     Returns:
         Dictionary with episode statistics.
@@ -658,8 +666,14 @@ def run_episode(
             print(f"  observation.state: {policy_inputs['observation.state'][0, :7].cpu().numpy()}")
             print(f"  observation.image range: [{policy_inputs['observation.image'].min():.4f}, {policy_inputs['observation.image'].max():.4f}]")
         
+        # Store raw EE pose before normalization for XYZ visualization
+        ee_pose_raw_np = ee_pose[0].cpu().numpy()[:7]
+        
         if preprocessor is not None:
             policy_inputs = preprocessor(policy_inputs)
+        
+        # Store normalized EE pose for XYZ visualization
+        ee_pose_norm_np = policy_inputs['observation.state'][0, :7].cpu().numpy()
         
         if t == 0 and preprocessor is not None:
             print("[DEBUG] Step 0: After preprocessing (normalized):")
@@ -670,6 +684,9 @@ def run_episode(
             action = policy.select_action(policy_inputs)
             raw_actioin = action.clone()
         
+        # Store normalized action for XYZ visualization
+        action_norm_np = raw_actioin[0].cpu().numpy()
+        
         # DEBUG: Print raw action (in normalized space) on first step
         if t == 0:
             print(f"[DEBUG] Step 0: Raw action (normalized, from policy): {raw_actioin[0].cpu().numpy()}")
@@ -679,10 +696,26 @@ def run_episode(
         if postprocessor is not None:
             action = postprocessor(action)
         
+        # Store unnormalized action for XYZ visualization
+        action_raw_np = action[0].cpu().numpy()
+        
         # DEBUG: Print after unnormalization on first step
         if t == 0:
             print(f"[DEBUG] Step 0: Unnormalized action: {action[0].cpu().numpy()}\n")
 
+        # Add frame to XYZ visualizer if provided
+        if xyz_visualizer is not None:
+            # Get wrist image if available
+            wrist_img = wrist_rgb_frame if wrist_camera is not None else None
+            xyz_visualizer.add_frame(
+                ee_pose_raw=ee_pose_raw_np[:3],  # XYZ only
+                ee_pose_norm=ee_pose_norm_np[:3],  # XYZ only
+                action_raw=action_raw_np[:3],  # XYZ only
+                action_norm=action_norm_np[:3],  # XYZ only
+                action_gt=None,  # No ground truth during evaluation
+                table_image=table_rgb_frame,  # Camera image for visualization
+                wrist_image=wrist_img,  # Wrist camera image if available
+            )
 
         action = action.to(device)
         last_action = action
@@ -870,6 +903,11 @@ def main() -> None:
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create XYZ curves output directory if visualization is enabled
+        xyz_curves_dir = out_dir / "xyz_curves" if args.visualize_xyz else None
+        if xyz_curves_dir is not None:
+            xyz_curves_dir.mkdir(parents=True, exist_ok=True)
 
         # Goal position: plate center
         goal_xy = (0.5, 0.0)
@@ -884,16 +922,28 @@ def main() -> None:
         print(f"  Horizon: {args.horizon}")
         print(f"  Num episodes: {args.num_episodes}")
         print(f"  Num inference steps: {num_inference_steps}")
+        print(f"  Visualize XYZ: {args.visualize_xyz}")
         print(f"{'='*60}")
 
         stats = []
         video_paths = []
+        xyz_video_paths = []
         for ep in range(args.num_episodes):
             print(f"\nEpisode {ep+1}/{args.num_episodes}")
             
             # Create a separate video writer for each episode
             video_path = out_dir / f"ep{ep}.mp4"
             writer = imageio.get_writer(video_path, fps=args.fps)
+            
+            # Create XYZ visualizer for this episode if enabled
+            xyz_visualizer = None
+            if args.visualize_xyz:
+                from rev2fwd_il.data import create_eval_xyz_visualizer
+                xyz_visualizer = create_eval_xyz_visualizer(
+                    output_dir=xyz_curves_dir,
+                    episode_id=ep,
+                    fps=args.fps,
+                )
             
             result = run_episode(
                 env=env,
@@ -907,17 +957,27 @@ def main() -> None:
                 min_init_dist=min_init_dist,
                 has_wrist=has_wrist,
                 include_obj_pose=include_obj_pose,
+                xyz_visualizer=xyz_visualizer,
             )
             
             writer.close()
             video_paths.append(video_path)
             
+            # Generate XYZ curves video if enabled
+            if xyz_visualizer is not None:
+                xyz_video_path = xyz_visualizer.generate_video(filename_prefix="eval_xyz_curves")
+                xyz_video_paths.append(xyz_video_path)
+            
             stats.append(result)
             status = "SUCCESS" if result['success'] else "FAILED"
             print(f"  Result: {status} | steps={result['steps']} | final_dist={result['final_dist']:.4f}m")
             print(f"  Video saved: {video_path}")
+            if xyz_visualizer is not None:
+                print(f"  XYZ curves saved: {xyz_video_path}")
 
         print(f"\nSaved {len(video_paths)} videos to {out_dir}/")
+        if xyz_video_paths:
+            print(f"Saved {len(xyz_video_paths)} XYZ curve videos to {xyz_curves_dir}/")
 
         # Print summary statistics
         num_success = sum(1 for s in stats if s["success"])
