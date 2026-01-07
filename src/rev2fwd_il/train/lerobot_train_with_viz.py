@@ -71,6 +71,7 @@ from lerobot.utils.utils import (
 )
 
 from rev2fwd_il.data.visualize_xyz_curve import XYZCurveVisualizer
+from rev2fwd_il.data.visualize_action_chunk import ActionChunkVisualizer
 
 
 def update_policy(
@@ -251,6 +252,137 @@ def extract_xyz_visualization_data(
     # since we can't easily get the diffusion model's prediction during training
     viz_data["action_pred_norm"] = viz_data.get("action_gt_norm", np.zeros(3))
     viz_data["action_pred_raw"] = viz_data.get("action_gt_raw", np.zeros(3))
+    
+    return viz_data
+
+
+def extract_action_chunk_data(
+    raw_batch: dict[str, torch.Tensor],
+    processed_batch: dict[str, torch.Tensor],
+    policy: PreTrainedPolicy,
+    accelerator: Accelerator,
+    dataset_stats: dict = None,
+) -> dict:
+    """Extract data for action chunk visualization from a training batch.
+    
+    Gets the model's predicted action chunk (full horizon) and input observations.
+    
+    Args:
+        raw_batch: Raw batch from dataloader (before preprocessing)
+        processed_batch: Preprocessed batch from dataloader (already normalized)
+        policy: The policy model (for getting action predictions)
+        accelerator: The accelerator instance
+        dataset_stats: Dataset statistics for manual unnormalization
+        
+    Returns:
+        Dictionary containing action chunk visualization data for first sample
+    """
+    viz_data = {}
+    
+    # Extract observation.state (already normalized by preprocessor)
+    # Take the last observation step for visualization
+    if "observation.state" in processed_batch:
+        state = processed_batch["observation.state"]
+        if state.dim() == 3:  # (B, n_obs_steps, state_dim)
+            state_norm = state[0, -1].detach().cpu().numpy()  # Last obs step, first batch
+        else:  # (B, state_dim)
+            state_norm = state[0].detach().cpu().numpy()
+        viz_data["ee_pose_norm"] = state_norm[:3].copy()  # XYZ only
+        
+        # Unnormalize state using dataset stats if available
+        if dataset_stats is not None and "observation.state" in dataset_stats:
+            stats = dataset_stats["observation.state"]
+            if "mean" in stats and "std" in stats:
+                mean = np.array(stats["mean"])[:3]
+                std = np.array(stats["std"])[:3]
+                viz_data["ee_pose_raw"] = state_norm[:3] * std + mean
+            elif "min" in stats and "max" in stats:
+                min_val = np.array(stats["min"])[:3]
+                max_val = np.array(stats["max"])[:3]
+                # Unnormalize from [-1, 1] to [min, max]
+                viz_data["ee_pose_raw"] = (state_norm[:3] + 1) / 2 * (max_val - min_val) + min_val
+            else:
+                viz_data["ee_pose_raw"] = state_norm[:3].copy()
+        else:
+            viz_data["ee_pose_raw"] = state_norm[:3].copy()
+    
+    # Extract camera images
+    if "observation.image" in processed_batch:
+        img = processed_batch["observation.image"]
+        if img.dim() == 5:  # (B, n_obs_steps, C, H, W)
+            img_np = img[0, -1].detach().cpu().numpy()  # Last obs step
+        else:  # (B, C, H, W)
+            img_np = img[0].detach().cpu().numpy()
+        # Convert from CHW to HWC and [0,1] to [0,255]
+        img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
+        img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+        viz_data["table_image"] = img_np
+    
+    # Extract wrist camera if available
+    if "observation.wrist_image" in processed_batch:
+        wrist_img = processed_batch["observation.wrist_image"]
+        if wrist_img.dim() == 5:
+            wrist_img_np = wrist_img[0, -1].detach().cpu().numpy()
+        else:
+            wrist_img_np = wrist_img[0].detach().cpu().numpy()
+        wrist_img_np = np.transpose(wrist_img_np, (1, 2, 0))
+        wrist_img_np = (wrist_img_np * 255).clip(0, 255).astype(np.uint8)
+        viz_data["wrist_image"] = wrist_img_np
+    
+    # Get model's predicted action chunk
+    # Run inference to get the full action chunk prediction
+    policy.eval()
+    with torch.no_grad():
+        # For diffusion policy, we need to call select_action to get the full chunk
+        # The policy's forward() returns loss, but select_action() returns actions
+        try:
+            # Create a single-sample batch for inference
+            inference_batch = {k: v[0:1] for k, v in processed_batch.items()}
+            
+            # Get action prediction (this should return the full horizon)
+            # For diffusion policy, this returns (1, horizon, action_dim)
+            action_chunk = policy.select_action(inference_batch)
+            
+            if action_chunk.dim() == 3:  # (1, horizon, action_dim)
+                action_chunk_norm = action_chunk[0].detach().cpu().numpy()  # (horizon, action_dim)
+            elif action_chunk.dim() == 2:  # (horizon, action_dim)
+                action_chunk_norm = action_chunk.detach().cpu().numpy()
+            else:  # (action_dim,) - single action
+                action_chunk_norm = action_chunk.detach().cpu().numpy()[np.newaxis, :]  # (1, action_dim)
+            
+            # Extract XYZ only (first 3 dimensions)
+            viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()  # (horizon, 3)
+            
+            # Unnormalize action chunk if stats available
+            if dataset_stats is not None and "action" in dataset_stats:
+                stats = dataset_stats["action"]
+                if "mean" in stats and "std" in stats:
+                    mean = np.array(stats["mean"])[:3]
+                    std = np.array(stats["std"])[:3]
+                    viz_data["action_chunk_raw"] = action_chunk_norm[:, :3] * std + mean
+                elif "min" in stats and "max" in stats:
+                    min_val = np.array(stats["min"])[:3]
+                    max_val = np.array(stats["max"])[:3]
+                    # Unnormalize from [-1, 1] to [min, max]
+                    viz_data["action_chunk_raw"] = (action_chunk_norm[:, :3] + 1) / 2 * (max_val - min_val) + min_val
+                else:
+                    viz_data["action_chunk_raw"] = action_chunk_norm[:, :3].copy()
+            else:
+                viz_data["action_chunk_raw"] = action_chunk_norm[:, :3].copy()
+                
+        except Exception as e:
+            logging.debug(f"Failed to get action chunk prediction: {e}")
+            # Fallback: use ground truth action as placeholder
+            if "action" in processed_batch:
+                action = processed_batch["action"]
+                if action.dim() == 3:  # (B, horizon, action_dim)
+                    action_chunk_norm = action[0].detach().cpu().numpy()
+                else:
+                    action_chunk_norm = action[0].detach().cpu().numpy()[np.newaxis, :]
+                viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()
+                viz_data["action_chunk_raw"] = action_chunk_norm[:, :3].copy()
+    
+    policy.train()
     
     return viz_data
 
@@ -454,10 +586,17 @@ def train_with_xyz_visualization(
 
     # XYZ visualizer for accumulating data
     xyz_visualizer = None
+    action_chunk_visualizer = None
     if is_main_process:
         xyz_visualizer = XYZCurveVisualizer(
             output_dir=xyz_viz_dir,
             episode_id=step,
+            fps=20,
+        )
+        # Action chunk visualizer for showing model predictions
+        action_chunk_visualizer = ActionChunkVisualizer(
+            output_dir=xyz_viz_dir,
+            step_id=step,
             fps=20,
         )
 
@@ -499,6 +638,9 @@ def train_with_xyz_visualization(
                 )
             except Exception as e:
                 logging.debug(f"Failed to extract visualization data: {e}")
+        
+        # Extract action chunk visualization data (after policy update to get predictions)
+        # We'll do this after the update_policy call below
 
         train_tracker, output_dict = update_policy(
             train_tracker,
@@ -509,6 +651,31 @@ def train_with_xyz_visualization(
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
         )
+        
+        # Extract action chunk visualization data after policy update (on main process only)
+        # Limit to 200 frames per visualization interval to avoid memory issues
+        if is_main_process and action_chunk_visualizer is not None:
+            if len(action_chunk_visualizer.frames) < 200:  # Limit to 200 frames
+                try:
+                    chunk_data = extract_action_chunk_data(
+                        raw_batch=raw_batch,
+                        processed_batch=processed_batch,
+                        policy=policy,
+                        accelerator=accelerator,
+                        dataset_stats=dataset_stats,
+                    )
+                    
+                    # Add frame to action chunk visualizer
+                    action_chunk_visualizer.add_frame(
+                        ee_pose_raw=chunk_data.get("ee_pose_raw", np.zeros(3)),
+                        ee_pose_norm=chunk_data.get("ee_pose_norm", np.zeros(3)),
+                        action_chunk_norm=chunk_data.get("action_chunk_norm", np.zeros((16, 3))),
+                        action_chunk_raw=chunk_data.get("action_chunk_raw", None),
+                        table_image=chunk_data.get("table_image", None),
+                        wrist_image=chunk_data.get("wrist_image", None),
+                    )
+                except Exception as e:
+                    logging.debug(f"Failed to extract action chunk data: {e}")
 
         step += 1
         train_tracker.step()
@@ -558,6 +725,19 @@ def train_with_xyz_visualization(
                     
                     # Reset visualizer for next interval
                     xyz_visualizer.reset(episode_id=step)
+                
+                # Generate action chunk visualization video
+                if action_chunk_visualizer is not None and len(action_chunk_visualizer.frames) > 0:
+                    try:
+                        video_path = action_chunk_visualizer.generate_video(
+                            filename_prefix=f"train_action_chunk"
+                        )
+                        logging.info(f"Saved action chunk visualization: {video_path}")
+                    except Exception as e:
+                        logging.warning(f"Failed to generate action chunk visualization: {e}")
+                    
+                    # Reset visualizer for next interval
+                    action_chunk_visualizer.reset(step_id=step)
 
             accelerator.wait_for_everyone()
 
