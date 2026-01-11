@@ -97,9 +97,12 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 torchrun --nproc_per_node=6 \
     --dataset data/A_forward_with_2images.npz \
     --out runs/diffusion_A_2cam_3 \
     --batch_size 2048 \
-    --steps 2000 \
-    --lr 0.0005 \
+    --steps 2000000 \
+    --lr 0.001 \
     --enable_xyz_viz \
+    --viz_save_freq 50000 \
+    --n_action_steps 16 \
+    --log_freq 200 \
     --include_obj_pose \
     --wandb
 
