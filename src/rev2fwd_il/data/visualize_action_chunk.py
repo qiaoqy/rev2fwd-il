@@ -139,14 +139,24 @@ class ActionChunkVisualizer:
             table_img = frame_data["table_image"]  # (H, W, 3) or None
             wrist_img = frame_data["wrist_image"]  # (H, W, 3) or None
             
-            horizon = len(chunk_norm)
-            chunk_steps = np.arange(horizon)
+            # Get the length of predicted action chunk (n_action_steps)
+            pred_len = len(chunk_norm)
+            pred_steps = np.arange(pred_len)
+            
+            # Get the length of GT action chunk (horizon, may be different from pred_len)
+            gt_len_norm = len(gt_chunk_norm) if gt_chunk_norm is not None else 0
+            gt_len_raw = len(gt_chunk_raw) if gt_chunk_raw is not None else 0
+            gt_steps_norm = np.arange(gt_len_norm) if gt_len_norm > 0 else None
+            gt_steps_raw = np.arange(gt_len_raw) if gt_len_raw > 0 else None
+            
+            # Maximum length for x-axis scaling
+            max_len = max(pred_len, gt_len_norm, gt_len_raw) if gt_len_norm > 0 or gt_len_raw > 0 else pred_len
             
             has_camera = table_img is not None
             has_wrist = wrist_img is not None
             has_raw_chunk = chunk_raw is not None
-            has_gt_norm = gt_chunk_norm is not None
-            has_gt_raw = gt_chunk_raw is not None
+            has_gt_norm = gt_chunk_norm is not None and gt_len_norm > 0
+            has_gt_raw = gt_chunk_raw is not None and gt_len_raw > 0
             
             # Create figure layout
             if has_camera:
@@ -205,37 +215,37 @@ class ActionChunkVisualizer:
             
             # Plot 3: Predicted Action Chunk XYZ (normalized) - line plot with GT comparison
             title_suffix = " + GT" if has_gt_norm else ""
-            ax_chunk_norm.set_title(f"Output: Action Chunk XYZ (Normalized, horizon={horizon}){title_suffix}")
+            ax_chunk_norm.set_title(f"Output: Action Chunk XYZ (Normalized, pred={pred_len}, gt={gt_len_norm}){title_suffix}")
             for i, (label, color) in enumerate(zip(labels, colors.values())):
                 # Plot predicted action chunk (solid line)
-                ax_chunk_norm.plot(chunk_steps, chunk_norm[:, i], color=color, label=f"{label} pred", 
+                ax_chunk_norm.plot(pred_steps, chunk_norm[:, i], color=color, label=f"{label} pred", 
                                   linewidth=2, marker='o', markersize=4)
                 # Plot GT action chunk (dashed line) if available
                 if has_gt_norm:
-                    ax_chunk_norm.plot(chunk_steps, gt_chunk_norm[:, i], color=color, label=f"{label} GT", 
+                    ax_chunk_norm.plot(gt_steps_norm, gt_chunk_norm[:, i], color=color, label=f"{label} GT", 
                                       linewidth=2, linestyle='--', alpha=0.7, marker='s', markersize=3)
             ax_chunk_norm.set_xlabel("Chunk Step")
             ax_chunk_norm.set_ylabel("Normalized Value")
             ax_chunk_norm.legend(loc='upper right', fontsize=8, ncol=2)
-            ax_chunk_norm.set_xlim(-0.5, horizon - 0.5)
+            ax_chunk_norm.set_xlim(-0.5, max_len - 0.5)
             ax_chunk_norm.grid(True, alpha=0.3)
             
             # Plot 4: Predicted Action Chunk XYZ (raw) - line plot with GT comparison
             if has_raw_chunk:
                 title_suffix = " + GT" if has_gt_raw else ""
-                ax_chunk_raw.set_title(f"Output: Action Chunk XYZ (Raw, horizon={horizon}){title_suffix}")
+                ax_chunk_raw.set_title(f"Output: Action Chunk XYZ (Raw, pred={pred_len}, gt={gt_len_raw}){title_suffix}")
                 for i, (label, color) in enumerate(zip(labels, colors.values())):
                     # Plot predicted action chunk (solid line)
-                    ax_chunk_raw.plot(chunk_steps, chunk_raw[:, i], color=color, label=f"{label} pred", 
+                    ax_chunk_raw.plot(pred_steps, chunk_raw[:, i], color=color, label=f"{label} pred", 
                                      linewidth=2, marker='o', markersize=4)
                     # Plot GT action chunk (dashed line) if available
                     if has_gt_raw:
-                        ax_chunk_raw.plot(chunk_steps, gt_chunk_raw[:, i], color=color, label=f"{label} GT", 
+                        ax_chunk_raw.plot(gt_steps_raw, gt_chunk_raw[:, i], color=color, label=f"{label} GT", 
                                          linewidth=2, linestyle='--', alpha=0.7, marker='s', markersize=3)
                 ax_chunk_raw.set_xlabel("Chunk Step")
                 ax_chunk_raw.set_ylabel("Position (m)")
                 ax_chunk_raw.legend(loc='upper right', fontsize=8, ncol=2)
-                ax_chunk_raw.set_xlim(-0.5, horizon - 0.5)
+                ax_chunk_raw.set_xlim(-0.5, max_len - 0.5)
                 ax_chunk_raw.grid(True, alpha=0.3)
             else:
                 ax_chunk_raw.text(0.5, 0.5, "Raw action chunk\nnot available", 

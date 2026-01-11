@@ -153,10 +153,11 @@ def extract_xyz_visualization_data(
     policy: PreTrainedPolicy,
     accelerator: Accelerator,
     dataset_stats: dict = None,
+    sample_idx: int = 0,
 ) -> dict:
     """Extract data for XYZ curve visualization from a training batch.
     
-    Extracts the first sample from the batch and computes:
+    Extracts the specified sample from the batch and computes:
     - Raw EE pose XYZ (before normalization)
     - Normalized EE pose XYZ (after normalization)
     - Normalized action XYZ (ground truth)
@@ -172,11 +173,16 @@ def extract_xyz_visualization_data(
         policy: The policy model (for getting action predictions)
         accelerator: The accelerator instance
         dataset_stats: Dataset statistics for manual unnormalization
+        sample_idx: Index of the sample to extract from the batch (default: 0)
         
     Returns:
-        Dictionary containing visualization data for first sample
+        Dictionary containing visualization data for the specified sample
     """
     viz_data = {}
+    
+    # Get batch size and clamp sample_idx to valid range
+    batch_size = processed_batch["observation.state"].shape[0] if "observation.state" in processed_batch else 1
+    sample_idx = sample_idx % batch_size  # Wrap around if needed
     
     # Extract observation.state (already normalized by preprocessor)
     # Take the last observation step for visualization
@@ -210,9 +216,9 @@ def extract_xyz_visualization_data(
     if "observation.image" in processed_batch:
         img = processed_batch["observation.image"]
         if img.dim() == 5:  # (B, n_obs_steps, C, H, W)
-            img_np = img[0, -1].detach().cpu().numpy()  # Last obs step
+            img_np = img[sample_idx, -1].detach().cpu().numpy()  # Last obs step
         else:  # (B, C, H, W)
-            img_np = img[0].detach().cpu().numpy()
+            img_np = img[sample_idx].detach().cpu().numpy()
         
         # IMPORTANT: Reverse ImageNet normalization before visualization
         # Images are normalized with: (img - mean) / std
@@ -230,9 +236,9 @@ def extract_xyz_visualization_data(
     if "observation.wrist_image" in processed_batch:
         wrist_img = processed_batch["observation.wrist_image"]
         if wrist_img.dim() == 5:
-            wrist_img_np = wrist_img[0, -1].detach().cpu().numpy()
+            wrist_img_np = wrist_img[sample_idx, -1].detach().cpu().numpy()
         else:
-            wrist_img_np = wrist_img[0].detach().cpu().numpy()
+            wrist_img_np = wrist_img[sample_idx].detach().cpu().numpy()
         
         # IMPORTANT: Reverse ImageNet normalization before visualization
         imagenet_mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
@@ -247,19 +253,19 @@ def extract_xyz_visualization_data(
     if "action" in raw_batch:
         action_raw = raw_batch["action"]
         if action_raw.dim() == 3:  # (B, horizon, action_dim)
-            # Take first action in horizon for the first sample
-            action_gt_raw = action_raw[0, 0].detach().cpu().numpy()
+            # Take first action in horizon for the specified sample
+            action_gt_raw = action_raw[sample_idx, 0].detach().cpu().numpy()
         else:  # (B, action_dim)
-            action_gt_raw = action_raw[0].detach().cpu().numpy()
+            action_gt_raw = action_raw[sample_idx].detach().cpu().numpy()
         viz_data["action_gt_raw"] = action_gt_raw[:3].copy()  # XYZ only
     
     if "action" in processed_batch:
         action_norm = processed_batch["action"]
         if action_norm.dim() == 3:  # (B, horizon, action_dim)
-            # Take first action in horizon for the first sample
-            action_gt_norm = action_norm[0, 0].detach().cpu().numpy()
+            # Take first action in horizon for the specified sample
+            action_gt_norm = action_norm[sample_idx, 0].detach().cpu().numpy()
         else:  # (B, action_dim)
-            action_gt_norm = action_norm[0].detach().cpu().numpy()
+            action_gt_norm = action_norm[sample_idx].detach().cpu().numpy()
         viz_data["action_gt_norm"] = action_gt_norm[:3].copy()  # XYZ only
     
     # For training visualization, we use ground truth as the "predicted" action
@@ -275,7 +281,9 @@ def extract_action_chunk_data(
     processed_batch: dict[str, torch.Tensor],
     policy: PreTrainedPolicy,
     accelerator: Accelerator,
+    postprocessor = None,
     dataset_stats: dict = None,
+    sample_idx: int = 0,
 ) -> dict:
     """Extract data for action chunk visualization from a training batch.
     
@@ -287,22 +295,28 @@ def extract_action_chunk_data(
         processed_batch: Preprocessed batch from dataloader (already normalized)
         policy: The policy model (for getting action predictions)
         accelerator: The accelerator instance
-        dataset_stats: Dataset statistics for manual unnormalization
+        postprocessor: LeRobot postprocessor for action unnormalization (preferred)
+        dataset_stats: Dataset statistics for manual unnormalization (fallback)
+        sample_idx: Index of the sample to extract from the batch (default: 0)
         
     Returns:
-        Dictionary containing action chunk visualization data for first sample,
+        Dictionary containing action chunk visualization data for the specified sample,
         including GT action chunk for comparison.
     """
     viz_data = {}
+    
+    # Get batch size and clamp sample_idx to valid range
+    batch_size = processed_batch["observation.state"].shape[0] if "observation.state" in processed_batch else 1
+    sample_idx = sample_idx % batch_size  # Wrap around if needed
     
     # Extract observation.state (already normalized by preprocessor)
     # Take the last observation step for visualization
     if "observation.state" in processed_batch:
         state = processed_batch["observation.state"]
         if state.dim() == 3:  # (B, n_obs_steps, state_dim)
-            state_norm = state[0, -1].detach().cpu().numpy()  # Last obs step, first batch
+            state_norm = state[sample_idx, -1].detach().cpu().numpy()  # Last obs step, specified sample
         else:  # (B, state_dim)
-            state_norm = state[0].detach().cpu().numpy()
+            state_norm = state[sample_idx].detach().cpu().numpy()
         viz_data["ee_pose_norm"] = state_norm[:3].copy()  # XYZ only
         
         # Unnormalize state using dataset stats if available
@@ -326,9 +340,9 @@ def extract_action_chunk_data(
     if "observation.image" in processed_batch:
         img = processed_batch["observation.image"]
         if img.dim() == 5:  # (B, n_obs_steps, C, H, W)
-            img_np = img[0, -1].detach().cpu().numpy()  # Last obs step
+            img_np = img[sample_idx, -1].detach().cpu().numpy()  # Last obs step
         else:  # (B, C, H, W)
-            img_np = img[0].detach().cpu().numpy()
+            img_np = img[sample_idx].detach().cpu().numpy()
         
         # IMPORTANT: Reverse ImageNet normalization before visualization
         # Images are normalized with: (img - mean) / std
@@ -346,9 +360,9 @@ def extract_action_chunk_data(
     if "observation.wrist_image" in processed_batch:
         wrist_img = processed_batch["observation.wrist_image"]
         if wrist_img.dim() == 5:
-            wrist_img_np = wrist_img[0, -1].detach().cpu().numpy()
+            wrist_img_np = wrist_img[sample_idx, -1].detach().cpu().numpy()
         else:
-            wrist_img_np = wrist_img[0].detach().cpu().numpy()
+            wrist_img_np = wrist_img[sample_idx].detach().cpu().numpy()
         
         # IMPORTANT: Reverse ImageNet normalization before visualization
         imagenet_mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
@@ -359,83 +373,138 @@ def extract_action_chunk_data(
         wrist_img_np = (wrist_img_np * 255).clip(0, 255).astype(np.uint8)
         viz_data["wrist_image"] = wrist_img_np
     
-    # Helper function to unnormalize action chunk
-    def unnormalize_action_chunk(action_chunk_norm_xyz: np.ndarray) -> np.ndarray:
-        """Unnormalize action chunk XYZ using dataset stats."""
-        if dataset_stats is not None and "action" in dataset_stats:
-            stats = dataset_stats["action"]
-            if "mean" in stats and "std" in stats:
-                mean = np.array(stats["mean"])[:3]
-                std = np.array(stats["std"])[:3]
-                return action_chunk_norm_xyz * std + mean
-            elif "min" in stats and "max" in stats:
-                min_val = np.array(stats["min"])[:3]
-                max_val = np.array(stats["max"])[:3]
-                # Unnormalize from [-1, 1] to [min, max]
-                return (action_chunk_norm_xyz + 1) / 2 * (max_val - min_val) + min_val
-        return action_chunk_norm_xyz.copy()
+    # Helper function to unnormalize action chunk using postprocessor
+    def unnormalize_action_chunk(action_chunk_norm: np.ndarray) -> np.ndarray:
+        """Unnormalize action chunk using LeRobot postprocessor.
+        
+        The postprocessor is designed for single actions (action_dim,) or batched 
+        actions (batch, action_dim). For action chunks (horizon, action_dim), we 
+        process each action row individually to maintain compatibility.
+        
+        Args:
+            action_chunk_norm: Normalized action chunk (horizon, action_dim)
+            
+        Returns:
+            Unnormalized action chunk XYZ (horizon, 3)
+        """
+        if postprocessor is not None:
+            try:
+                # Convert to tensor
+                action_tensor = torch.from_numpy(action_chunk_norm).float()  # (horizon, action_dim)
+                
+                # LeRobot's postprocessor expects single actions (action_dim,) 
+                # Process each action in the chunk individually
+                horizon = action_tensor.shape[0]
+                unnorm_actions = []
+                for i in range(horizon):
+                    single_action = action_tensor[i]  # (action_dim,)
+                    unnorm_action = postprocessor(single_action)  # Returns torch.Tensor (action_dim,)
+                    unnorm_actions.append(unnorm_action)
+                
+                # Stack back to (horizon, action_dim)
+                unnorm_chunk = torch.stack(unnorm_actions, dim=0)
+                
+                # Extract XYZ only (first 3 dimensions)
+                return unnorm_chunk[:, :3].cpu().numpy()  # (horizon, 3)
+                
+            except Exception as e:
+                logging.warning(f"Postprocessor failed: {e}, returning normalized action chunk")
+                return action_chunk_norm[:, :3].copy()
+        
+        # No postprocessor available - return normalized values with warning
+        logging.warning("No postprocessor available, returning normalized action chunk")
+        return action_chunk_norm[:, :3].copy()
     
     # Extract GT action chunk from processed_batch (normalized) and raw_batch (raw)
     if "action" in processed_batch:
         action_gt = processed_batch["action"]
         if action_gt.dim() == 3:  # (B, horizon, action_dim)
-            gt_chunk_norm = action_gt[0].detach().cpu().numpy()  # (horizon, action_dim)
+            gt_chunk_norm = action_gt[sample_idx].detach().cpu().numpy()  # (horizon, action_dim)
         else:  # (B, action_dim)
-            gt_chunk_norm = action_gt[0].detach().cpu().numpy()[np.newaxis, :]  # (1, action_dim)
+            gt_chunk_norm = action_gt[sample_idx].detach().cpu().numpy()[np.newaxis, :]  # (1, action_dim)
         viz_data["gt_chunk_norm"] = gt_chunk_norm[:, :3].copy()  # (horizon, 3)
-        # Unnormalize GT action chunk
-        viz_data["gt_chunk_raw"] = unnormalize_action_chunk(gt_chunk_norm[:, :3])
+        # Note: gt_chunk_raw will be overwritten by raw_batch below if available
     
     # Also get raw GT from raw_batch for verification
     if "action" in raw_batch:
         action_raw = raw_batch["action"]
         if action_raw.dim() == 3:  # (B, horizon, action_dim)
-            gt_chunk_raw_direct = action_raw[0].detach().cpu().numpy()  # (horizon, action_dim)
+            gt_chunk_raw_direct = action_raw[sample_idx].detach().cpu().numpy()  # (horizon, action_dim)
         else:  # (B, action_dim)
-            gt_chunk_raw_direct = action_raw[0].detach().cpu().numpy()[np.newaxis, :]
+            gt_chunk_raw_direct = action_raw[sample_idx].detach().cpu().numpy()[np.newaxis, :]
         # Use raw_batch directly as the ground truth raw values
         viz_data["gt_chunk_raw"] = gt_chunk_raw_direct[:, :3].copy()  # (horizon, 3)
     
     # Get model's predicted action chunk
     # Run inference to get the full action chunk prediction
-    policy.eval()
+    # Need to unwrap policy from DDP wrapper to call generate_actions
+    unwrapped_policy = accelerator.unwrap_model(policy)
+    unwrapped_policy.eval()
     with torch.no_grad():
-        # For diffusion policy, we need to call select_action to get the full chunk
-        # The policy's forward() returns loss, but select_action() returns actions
+        # For diffusion policy, call diffusion.generate_actions directly
+        # This expects the batch format from training: (B, n_obs_steps, ...)
         try:
-            # Create a single-sample batch for inference
-            inference_batch = {k: v[0:1] for k, v in processed_batch.items()}
+            # Create a single-sample batch for inference using the specified sample_idx
+            # Only include tensor values (skip float/int metadata like 'reward', 'done', etc.)
+            inference_batch = {
+                k: v[sample_idx:sample_idx+1] for k, v in processed_batch.items() 
+                if isinstance(v, torch.Tensor)
+            }
             
-            # Get action prediction (this should return the full horizon)
-            # For diffusion policy, this returns (1, horizon, action_dim)
-            action_chunk = policy.select_action(inference_batch)
+            # For diffusion policy, we need to:
+            # 1. Stack images into observation.images key
+            # 2. Call diffusion.generate_actions directly
             
-            if action_chunk.dim() == 3:  # (1, horizon, action_dim)
-                action_chunk_norm = action_chunk[0].detach().cpu().numpy()  # (horizon, action_dim)
-            elif action_chunk.dim() == 2:  # (horizon, action_dim)
+            # Check if this is a diffusion policy with image features
+            if hasattr(unwrapped_policy, 'diffusion') and hasattr(unwrapped_policy, 'config'):
+                config = unwrapped_policy.config
+                
+                # Stack image features into the expected format
+                if hasattr(config, 'image_features') and config.image_features:
+                    # image_features contains keys like ['observation.image', 'observation.wrist_image']
+                    images_list = []
+                    for key in config.image_features:
+                        if key in inference_batch:
+                            images_list.append(inference_batch[key])
+                    if images_list:
+                        # Stack along camera dimension: (B, n_obs_steps, num_cams, C, H, W)
+                        inference_batch['observation.images'] = torch.stack(images_list, dim=-4)
+                
+                # Call generate_actions directly
+                # Returns (B, n_action_steps, action_dim)
+                action_chunk = unwrapped_policy.diffusion.generate_actions(inference_batch)
+            else:
+                # Fallback to select_action for other policy types
+                action_chunk = unwrapped_policy.select_action(inference_batch)
+            
+            if action_chunk.dim() == 3:  # (B, n_action_steps, action_dim)
+                action_chunk_norm = action_chunk[0].detach().cpu().numpy()  # (n_action_steps, action_dim)
+            elif action_chunk.dim() == 2:  # (n_action_steps, action_dim)
                 action_chunk_norm = action_chunk.detach().cpu().numpy()
             else:  # (action_dim,) - single action
                 action_chunk_norm = action_chunk.detach().cpu().numpy()[np.newaxis, :]  # (1, action_dim)
             
             # Extract XYZ only (first 3 dimensions)
-            viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()  # (horizon, 3)
+            viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()  # (n_action_steps, 3)
             
-            # Unnormalize action chunk using the helper function
-            viz_data["action_chunk_raw"] = unnormalize_action_chunk(action_chunk_norm[:, :3])
+            # Unnormalize action chunk using the postprocessor (pass full action for correct unnorm)
+            viz_data["action_chunk_raw"] = unnormalize_action_chunk(action_chunk_norm)
                 
         except Exception as e:
-            logging.debug(f"Failed to get action chunk prediction: {e}")
+            import traceback
+            logging.warning(f"Failed to get action chunk prediction: {e}")
+            logging.warning(f"Traceback: {traceback.format_exc()}")
             # Fallback: use ground truth action as placeholder
             if "action" in processed_batch:
                 action = processed_batch["action"]
                 if action.dim() == 3:  # (B, horizon, action_dim)
-                    action_chunk_norm = action[0].detach().cpu().numpy()
+                    action_chunk_norm = action[sample_idx].detach().cpu().numpy()
                 else:
-                    action_chunk_norm = action[0].detach().cpu().numpy()[np.newaxis, :]
+                    action_chunk_norm = action[sample_idx].detach().cpu().numpy()[np.newaxis, :]
                 viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()
-                viz_data["action_chunk_raw"] = unnormalize_action_chunk(action_chunk_norm[:, :3])
+                viz_data["action_chunk_raw"] = unnormalize_action_chunk(action_chunk_norm)
     
-    policy.train()
+    unwrapped_policy.train()
     
     return viz_data
 
@@ -658,12 +727,19 @@ def train_with_xyz_visualization(
     
     # Get dataset stats for unnormalization in visualization
     dataset_stats = dataset.meta.stats if hasattr(dataset.meta, 'stats') else None
+    
+    # Counter for visualization sample index - cycles through batch to show different samples
+    viz_sample_counter = 0
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         raw_batch = next(dl_iter)
         processed_batch = preprocessor(raw_batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
+        
+        # Get batch size for cycling sample index
+        batch_size = processed_batch["observation.state"].shape[0] if "observation.state" in processed_batch else 1
+        viz_sample_idx = viz_sample_counter % batch_size
 
         # Extract visualization data before policy update (on main process only)
         if is_main_process and xyz_visualizer is not None:
@@ -676,6 +752,7 @@ def train_with_xyz_visualization(
                     policy=policy,
                     accelerator=accelerator,
                     dataset_stats=dataset_stats,
+                    sample_idx=viz_sample_idx,  # Use cycling sample index
                 )
                 
                 # Add frame to visualizer
@@ -715,7 +792,9 @@ def train_with_xyz_visualization(
                         processed_batch=processed_batch,
                         policy=policy,
                         accelerator=accelerator,
+                        postprocessor=postprocessor,
                         dataset_stats=dataset_stats,
+                        sample_idx=viz_sample_idx,  # Use cycling sample index
                     )
                     
                     # Add frame to action chunk visualizer
@@ -730,7 +809,10 @@ def train_with_xyz_visualization(
                         wrist_image=chunk_data.get("wrist_image", None),
                     )
                 except Exception as e:
-                    logging.debug(f"Failed to extract action chunk data: {e}")
+                    logging.warning(f"Failed to extract action chunk data: {e}")
+        
+        # Increment visualization sample counter to cycle through different samples
+        viz_sample_counter += 1
 
         step += 1
         train_tracker.step()

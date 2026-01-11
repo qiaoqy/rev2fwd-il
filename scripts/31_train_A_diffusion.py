@@ -92,12 +92,12 @@ CUDA_VISIBLE_DEVICES=1,2,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diff
     --dataset data/A_forward_with_2images.npz     --out runs/diffusion_A_2cam_3\
      --num_episodes 500     --batch_size 2048     --steps 800     --lr 0.0005   --enable_xyz_viz  --include_obj_pose --wandb
 
-CUDA_VISIBLE_DEVICES=1,2,3,5 torchrun --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 torchrun --nproc_per_node=6 \
     scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_2images.npz \
     --out runs/diffusion_A_2cam_3 \
     --batch_size 2048 \
-    --steps 1000 \
+    --steps 2000 \
     --lr 0.0005 \
     --enable_xyz_viz \
     --include_obj_pose \
@@ -114,17 +114,15 @@ CUDA_VISIBLE_DEVICES=6 python scripts/31_train_A_diffusion.py \
     --include_obj_pose \
     --wandb
 
-CUDA_VISIBLE_DEVICES=6 python scripts/31_train_A_diffusion.py \
-    --dataset data/A_forward_with_2images.npz \
-    --out runs/diffusion_A_2cam_2 \
-    --overfit \
-    --batch_size 32 \
-    --steps 1000 \
-    --lr 0.0001 \
-    --enable_xyz_viz \
-    --viz_save_freq 100 \
-    --include_obj_pose \
-    --wandb
+CUDA_VISIBLE_DEVICES=3 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_2images.npz     --out runs/diffusion_A_2cam_overfit_3     --overfit \
+    --batch_size 8192     --steps 1000     --lr 0.001     --enable_xyz_viz     --viz_save_freq 500  \
+    --include_obj_pose     --wandb
+
+CUDA_VISIBLE_DEVICES=3 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_2images.npz     --out runs/diffusion_A_2cam_overfit_2     --overfit \
+    --batch_size 64     --steps 20     --lr 0.0005     --enable_xyz_viz     --viz_save_freq 5  \
+    --include_obj_pose     --wandb --n_action_steps 16
 
 =============================================================================
 """
@@ -338,6 +336,16 @@ def _parse_args() -> argparse.Namespace:
     )
 
     # =========================================================================
+    # Overfit Mode
+    # =========================================================================
+    parser.add_argument(
+        "--overfit",
+        action="store_true",
+        help="Enable overfit mode: use only 1 episode and save initial env params "
+             "for reproducible testing. Automatically sets num_episodes=1.",
+    )
+
+    # =========================================================================
     # Device Selection
     # =========================================================================
     parser.add_argument(
@@ -402,7 +410,8 @@ def convert_npz_to_lerobot_format(
     force: bool = False,
     num_episodes: int = -1,
     include_obj_pose: bool = False,
-) -> tuple[int, int, bool]:
+    overfit: bool = False,
+) -> tuple[int, int, bool, dict | None]:
     """Convert NPZ dataset to LeRobot v3.0 format.
     
     Args:
@@ -413,9 +422,11 @@ def convert_npz_to_lerobot_format(
         force: Force re-conversion even if dataset exists.
         num_episodes: Number of episodes to use. -1 means use all.
         include_obj_pose: Whether to include object pose in observation.state.
+        overfit: Whether to extract overfit env init params from first episode.
         
     Returns:
-        Tuple of (image_height, image_width, has_wrist_camera).
+        Tuple of (image_height, image_width, has_wrist_camera, overfit_env_init).
+        overfit_env_init is None if overfit=False, otherwise a dict with initial poses.
     """
     # Suppress verbose logging from video encoding libraries
     import logging
@@ -445,7 +456,37 @@ def convert_npz_to_lerobot_format(
                 image_height, image_width = 128, 128  # default
             has_wrist = "observation.wrist_image" in features
             print(f"  Loaded metadata: image=({image_height}, {image_width}), has_wrist={has_wrist}")
-            return image_height, image_width, has_wrist
+            
+            # Try to load overfit_env_init from existing JSON file first
+            overfit_env_init = None
+            if overfit:
+                # Check if overfit_env_init.json exists in parent directory (out_dir)
+                # output_dir is lerobot_dataset, parent is out_dir
+                out_dir_parent = output_dir.parent
+                overfit_init_path = out_dir_parent / "overfit_env_init.json"
+                if overfit_init_path.exists():
+                    with open(overfit_init_path, "r") as f:
+                        overfit_env_init = json.load(f)
+                    print(f"  Overfit mode: loaded from {overfit_init_path}")
+                    print(f"    initial_obj_pose={overfit_env_init['initial_obj_pose'][:3]}")
+                else:
+                    # Fallback: load NPZ to get overfit params
+                    print(f"  Overfit mode: {overfit_init_path} not found, loading from NPZ...")
+                    episodes = load_episodes_from_npz(npz_path, num_episodes=1)
+                    ep0 = episodes[0]
+                    overfit_env_init = {
+                        "initial_obj_pose": ep0["obj_pose"][0].tolist(),  # (7,) [x, y, z, qw, qx, qy, qz]
+                        "initial_ee_pose": ep0["ee_pose"][0].tolist(),    # (7,) [x, y, z, qw, qx, qy, qz]
+                        "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                        "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                    }
+                    if isinstance(overfit_env_init["place_pose"], np.ndarray):
+                        overfit_env_init["place_pose"] = overfit_env_init["place_pose"].tolist()
+                    if isinstance(overfit_env_init["goal_pose"], np.ndarray):
+                        overfit_env_init["goal_pose"] = overfit_env_init["goal_pose"].tolist()
+                    print(f"  Overfit mode: extracted initial obj_pose={overfit_env_init['initial_obj_pose'][:3]}")
+            
+            return image_height, image_width, has_wrist, overfit_env_init
         else:
             # Fallback if meta file doesn't exist - need to load NPZ
             print("  Warning: meta/info.json not found, loading NPZ to get metadata...")
@@ -455,9 +496,27 @@ def convert_npz_to_lerobot_format(
     image_shape = episodes[0]["images"].shape[1:]  # (H, W, 3)
     has_wrist = "wrist_images" in episodes[0]
     
+    # Extract overfit env init params if requested
+    overfit_env_init = None
+    if overfit and len(episodes) > 0:
+        ep0 = episodes[0]
+        overfit_env_init = {
+            "initial_obj_pose": ep0["obj_pose"][0].tolist(),  # (7,) [x, y, z, qw, qx, qy, qz]
+            "initial_ee_pose": ep0["ee_pose"][0].tolist(),    # (7,) [x, y, z, qw, qx, qy, qz]
+            "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        }
+        if isinstance(overfit_env_init["place_pose"], np.ndarray):
+            overfit_env_init["place_pose"] = overfit_env_init["place_pose"].tolist()
+        if isinstance(overfit_env_init["goal_pose"], np.ndarray):
+            overfit_env_init["goal_pose"] = overfit_env_init["goal_pose"].tolist()
+        print(f"\n[Overfit Mode] Extracted initial env params:")
+        print(f"  initial_obj_pose: {overfit_env_init['initial_obj_pose']}")
+        print(f"  initial_ee_pose: {overfit_env_init['initial_ee_pose']}")
+    
     # If dataset exists and we already loaded NPZ just for metadata, return early
     if output_dir.exists() and not force:
-        return image_shape[0], image_shape[1], has_wrist
+        return image_shape[0], image_shape[1], has_wrist, overfit_env_init
     
     # Remove existing dataset if force conversion
     if output_dir.exists() and force:
@@ -608,9 +667,11 @@ def convert_npz_to_lerobot_format(
     print(f"  Has wrist camera: {has_wrist}")
     print(f"  Time: {elapsed:.1f}s")
     print(f"  Dataset saved to: {output_dir}")
+    if overfit_env_init is not None:
+        print(f"  Overfit mode: initial_obj_pose={overfit_env_init['initial_obj_pose'][:3]}")
     print(f"{'='*60}\n")
     
-    return image_shape[0], image_shape[1], has_wrist
+    return image_shape[0], image_shape[1], has_wrist, overfit_env_init
 
 
 def create_train_config_json(
@@ -701,6 +762,7 @@ def train_with_lerobot_api(
     image_width: int,
     has_wrist: bool = False,
     include_obj_pose: bool = False,
+    overfit_env_init: dict | None = None,
 ) -> dict:
     """Train using LeRobot's Python API.
     
@@ -711,6 +773,7 @@ def train_with_lerobot_api(
         image_width: Image width.
         has_wrist: Whether the dataset has wrist camera images.
         include_obj_pose: Whether object pose is included in observation.state.
+        overfit_env_init: Optional dict with initial env params for overfit mode.
         
     Returns:
         Dictionary with training results.
@@ -736,6 +799,14 @@ def train_with_lerobot_api(
     if is_main_process and args.overwrite and checkpoint_dir.exists() and not args.resume:
         print(f"Removing existing checkpoints directory: {checkpoint_dir}")
         shutil.rmtree(checkpoint_dir)
+    
+    # Save overfit_env_init.json to out_dir (NOT checkpoints) to avoid creating
+    # the checkpoints directory before LeRobot's validation check
+    if is_main_process and args.overfit and overfit_env_init is not None:
+        overfit_init_path = out_dir / "overfit_env_init.json"
+        with open(overfit_init_path, "w") as f:
+            json.dump(overfit_env_init, f, indent=2)
+        print(f"[Overfit Mode] Saved env init params to: {overfit_init_path}")
     
     # Sync all processes before continuing
     if torch.distributed.is_initialized():
@@ -896,6 +967,26 @@ def main() -> None:
     """Main entry point."""
     args = _parse_args()
     
+    # Handle overfit mode: force num_episodes=1
+    if args.overfit:
+        if args.num_episodes != 1:
+            print(f"\n[Overfit Mode] Setting num_episodes=1 (was {args.num_episodes})")
+            args.num_episodes = 1
+        # Check if overfit_env_init.json already exists - if so, no need to force re-conversion
+        out_dir_temp = Path(args.out)
+        overfit_init_path = out_dir_temp / "overfit_env_init.json"
+        lerobot_dataset_dir_temp = args.lerobot_dataset_dir
+        if lerobot_dataset_dir_temp is None:
+            lerobot_dataset_dir_temp = out_dir_temp / "lerobot_dataset"
+        lerobot_dataset_dir_temp = Path(lerobot_dataset_dir_temp)
+        
+        if overfit_init_path.exists() and lerobot_dataset_dir_temp.exists():
+            print(f"[Overfit Mode] Found existing overfit_env_init.json and dataset, skipping re-conversion")
+            # Don't force re-conversion if both files exist
+        elif not args.force_convert:
+            print("[Overfit Mode] Enabling force_convert to extract env init params")
+            args.force_convert = True
+    
     # Set random seed
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -920,11 +1011,14 @@ def main() -> None:
         lerobot_dataset_dir = out_dir / "lerobot_dataset"
     lerobot_dataset_dir = Path(lerobot_dataset_dir)
     
+    # Variable to store overfit env init params
+    overfit_env_init = None
+    
     # Step 1: Convert data to LeRobot format (only on main process)
     # Other processes wait at the barrier until conversion is done
     if not args.skip_convert:
         if is_main_process:
-            image_height, image_width, has_wrist = convert_npz_to_lerobot_format(
+            image_height, image_width, has_wrist, overfit_env_init = convert_npz_to_lerobot_format(
                 npz_path=args.dataset,
                 output_dir=lerobot_dataset_dir,
                 fps=args.fps,
@@ -932,12 +1026,27 @@ def main() -> None:
                 force=args.force_convert,
                 num_episodes=args.num_episodes,
                 include_obj_pose=args.include_obj_pose,
+                overfit=args.overfit,
             )
             # Write metadata to a temp file so other processes can read it
-            import json
             meta_file = out_dir / ".conversion_meta.json"
+            meta_data = {
+                "image_height": image_height, 
+                "image_width": image_width, 
+                "has_wrist": has_wrist, 
+                "include_obj_pose": args.include_obj_pose,
+                "overfit_env_init": overfit_env_init,
+            }
             with open(meta_file, "w") as f:
-                json.dump({"image_height": image_height, "image_width": image_width, "has_wrist": has_wrist, "include_obj_pose": args.include_obj_pose}, f)
+                json.dump(meta_data, f, indent=2)
+            
+            # Save overfit_env_init.json to out_dir (NOT checkpoints) to avoid creating
+            # the checkpoints directory before LeRobot's validation check
+            if args.overfit and overfit_env_init is not None:
+                overfit_init_path = out_dir / "overfit_env_init.json"
+                with open(overfit_init_path, "w") as f:
+                    json.dump(overfit_env_init, f, indent=2)
+                print(f"\n[Overfit Mode] Saved env init params to: {overfit_init_path}")
         
         # Synchronize all processes - wait for conversion to complete
         if torch.distributed.is_initialized():
@@ -945,13 +1054,13 @@ def main() -> None:
         
         # Non-main processes read metadata from file
         if not is_main_process:
-            import json
             meta_file = out_dir / ".conversion_meta.json"
             with open(meta_file, "r") as f:
                 meta = json.load(f)
             image_height = meta["image_height"]
             image_width = meta["image_width"]
             has_wrist = meta["has_wrist"]
+            overfit_env_init = meta.get("overfit_env_init", None)
             # Note: include_obj_pose comes from args, not meta file
     else:
         # Load episodes to get image shape and check for wrist camera
@@ -959,6 +1068,27 @@ def main() -> None:
         image_shape = episodes[0]["images"].shape[1:]  # (H, W, 3)
         image_height, image_width = image_shape[0], image_shape[1]
         has_wrist = "wrist_images" in episodes[0]
+        
+        # Extract overfit env init params if in overfit mode
+        if args.overfit and len(episodes) > 0:
+            ep0 = episodes[0]
+            overfit_env_init = {
+                "initial_obj_pose": ep0["obj_pose"][0].tolist(),
+                "initial_ee_pose": ep0["ee_pose"][0].tolist(),
+                "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            }
+            if isinstance(overfit_env_init["place_pose"], np.ndarray):
+                overfit_env_init["place_pose"] = overfit_env_init["place_pose"].tolist()
+            if isinstance(overfit_env_init["goal_pose"], np.ndarray):
+                overfit_env_init["goal_pose"] = overfit_env_init["goal_pose"].tolist()
+            
+            # Save to out_dir (NOT checkpoints) to avoid creating the checkpoints
+            # directory before LeRobot's validation check
+            overfit_init_path = out_dir / "overfit_env_init.json"
+            with open(overfit_init_path, "w") as f:
+                json.dump(overfit_env_init, f, indent=2)
+            print(f"\n[Overfit Mode] Saved env init params to: {overfit_init_path}")
     
     if args.convert_only:
         if is_main_process:
@@ -973,6 +1103,7 @@ def main() -> None:
         image_width=image_width,
         has_wrist=has_wrist,
         include_obj_pose=args.include_obj_pose,
+        overfit_env_init=overfit_env_init,
     )
     
     print("\n" + "=" * 60)

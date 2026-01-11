@@ -40,7 +40,15 @@ CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --image_height 128 \
     --headless
 
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A_2cam_overfit_2/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_2cam_overfit_2/videos     --num_episodes 3     --overfit \
+    --visualize_xyz     --headless
 
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_2cam_3/videos     --num_episodes 3 \
+    --visualize_xyz     --headless --horizon 2000 --n_action_steps 16
     
 =============================================================================
 CHECKPOINT STRUCTURE
@@ -282,10 +290,25 @@ def _parse_args() -> argparse.Namespace:
              "For faster inference, try 50. Cannot exceed training timesteps.",
     )
     parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=None,
+        help="Number of action steps to execute before re-inferring. "
+             "If None, uses the value from training config. "
+             "Higher = execute more steps from each inference (smoother but less reactive). "
+             "Must be <= horizon. Default: None (use training config, typically 8).",
+    )
+    parser.add_argument(
         "--visualize_xyz",
         action="store_true",
         help="Generate XYZ curve visualization videos for debugging. "
              "Saves to {out_dir}/xyz_curves/ with camera images side by side.",
+    )
+    parser.add_argument(
+        "--overfit",
+        action="store_true",
+        help="Enable overfit testing mode: initialize environment with saved initial poses "
+             "from training. Reads overfit_env_init.json from checkpoint directory.",
     )
 
     # Isaac Lab AppLauncher flags (headless, device, etc.)
@@ -295,6 +318,47 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.enable_cameras = True  # required for headless camera rendering
     return args
+
+
+# ---------------------------------------------------------------------------
+# Overfit env init loading
+# ---------------------------------------------------------------------------
+def load_overfit_env_init(checkpoint_dir: str) -> Dict[str, Any] | None:
+    """Load overfit environment initialization parameters from checkpoint directory.
+    
+    Args:
+        checkpoint_dir: Path to the checkpoint directory (e.g., runs/diffusion_A/checkpoints).
+        
+    Returns:
+        Dictionary with initial poses, or None if not found.
+        Keys: initial_obj_pose, initial_ee_pose, place_pose, goal_pose
+    """
+    import json
+    from pathlib import Path
+    
+    checkpoint_path = Path(checkpoint_dir)
+    
+    # Try multiple possible locations for overfit_env_init.json
+    possible_paths = [
+        checkpoint_path / "overfit_env_init.json",  # Direct in checkpoint dir
+        checkpoint_path.parent / "overfit_env_init.json",  # Parent dir
+        checkpoint_path.parent.parent  / "overfit_env_init.json",  # runs/xxx/checkpoints/
+        checkpoint_path.parent.parent.parent  / "overfit_env_init.json", 
+        checkpoint_path.parent.parent.parent.parent  / "overfit_env_init.json",
+    ]
+    
+    for init_path in possible_paths:
+        if init_path.exists():
+            print(f"[Overfit Mode] Loading env init params from: {init_path}")
+            with open(init_path, "r") as f:
+                overfit_env_init = json.load(f)
+            print(f"  initial_obj_pose: {overfit_env_init['initial_obj_pose']}")
+            print(f"  initial_ee_pose: {overfit_env_init['initial_ee_pose']}")
+            return overfit_env_init
+    
+    print(f"[Overfit Mode] WARNING: overfit_env_init.json not found in checkpoint directory!")
+    print(f"  Searched paths: {[str(p) for p in possible_paths]}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +430,7 @@ def load_diffusion_policy(
     image_height: int = 128,
     image_width: int = 128,
     num_inference_steps: int | None = None,
+    n_action_steps: int | None = None,
 ) -> Tuple[Any, Any, Any]:
     """Load LeRobot diffusion policy from checkpoint directory.
     
@@ -451,6 +516,16 @@ def load_diffusion_policy(
         config_dict["num_inference_steps"] = num_inference_steps
         print(f"[load_policy] Setting num_inference_steps to {num_inference_steps}", flush=True)
     
+    # Override n_action_steps if specified
+    if n_action_steps is not None:
+        horizon = config_dict.get("horizon", 16)
+        if n_action_steps > horizon:
+            print(f"[load_policy] WARNING: n_action_steps ({n_action_steps}) cannot exceed "
+                  f"horizon ({horizon}). Clamping to {horizon}.", flush=True)
+            n_action_steps = horizon
+        config_dict["n_action_steps"] = n_action_steps
+        print(f"[load_policy] Setting n_action_steps to {n_action_steps}", flush=True)
+    
     # Create DiffusionConfig
     print(f"[load_policy] Creating DiffusionConfig...", flush=True)
     cfg = DiffusionConfig(**config_dict)
@@ -535,8 +610,11 @@ def load_diffusion_policy(
             print(f"        features: {list(step.features.keys())}")
     print("=" * 60 + "\n")
     
-    print(f"[load_policy] Policy loading complete! (num_inference_steps={actual_inference_steps})", flush=True)
-    return policy, preprocessor, postprocessor, actual_inference_steps
+    # Get actual n_action_steps used by the policy
+    actual_n_action_steps = cfg.n_action_steps
+    
+    print(f"[load_policy] Policy loading complete! (num_inference_steps={actual_inference_steps}, n_action_steps={actual_n_action_steps})", flush=True)
+    return policy, preprocessor, postprocessor, actual_inference_steps, actual_n_action_steps
 
 
 def run_episode(
@@ -553,6 +631,7 @@ def run_episode(
     has_wrist: bool = False,
     include_obj_pose: bool = False,
     xyz_visualizer=None,
+    overfit_env_init: dict | None = None,
 ) -> dict:
     """Run one episode, write frames to writer if provided, return summary.
     
@@ -570,31 +649,60 @@ def run_episode(
         has_wrist: Whether the policy expects wrist camera input.
         include_obj_pose: Whether the policy expects object pose in state.
         xyz_visualizer: Optional XYZCurveVisualizer for debugging.
+        overfit_env_init: Optional dict with initial poses for overfit testing.
+            If provided, teleports object to saved initial pose after reset.
         
     Returns:
         Dictionary with episode statistics.
     """
 
-    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w
+    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w, teleport_object_to_pose
 
     table_camera = env.unwrapped.scene.sensors["table_cam"]
     wrist_camera = env.unwrapped.scene.sensors.get("wrist_cam", None) if has_wrist else None
     device = env.unwrapped.device
 
-    # Reset until object is far enough from goal
-    goal_xy_arr = np.array(goal_xy)
-    for attempt in range(max_reset_attempts):
-        obs_dict, _ = env.reset()
+    # Reset policy action queue for new episode
+    # This is CRITICAL for proper action chunking behavior!
+    # Without this, the action queue may contain stale actions from previous episodes.
+    policy.reset()
+
+    # Reset environment
+    obs_dict, _ = env.reset()
+    
+    # If overfit mode, teleport object to saved initial pose
+    if overfit_env_init is not None:
+        print(f"  [Overfit Mode] Teleporting object to saved initial pose...")
+        initial_obj_pose = torch.tensor(
+            overfit_env_init["initial_obj_pose"], 
+            dtype=torch.float32, 
+            device=device
+        ).unsqueeze(0)  # (1, 7)
+        teleport_object_to_pose(env, initial_obj_pose, name="object")
+        
+        # Step simulation a few times to let physics settle
+        for _ in range(5):
+            env.unwrapped.sim.step()
+        
         init_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
-        init_obj_xy = init_obj_pose[:2]
-        init_dist = np.linalg.norm(init_obj_xy - goal_xy_arr)
-        
-        if init_dist >= min_init_dist:
-            break
-        
-        if attempt < max_reset_attempts - 1:
-            print(f"  Reset attempt {attempt+1}: object too close to goal "
-                  f"(dist={init_dist:.3f}m < {min_init_dist}m), retrying...")
+        init_dist = np.linalg.norm(init_obj_pose[:2] - np.array(goal_xy))
+        print(f"  [Overfit Mode] Object teleported to: [{init_obj_pose[0]:.3f}, {init_obj_pose[1]:.3f}, {init_obj_pose[2]:.3f}]")
+    else:
+        # Normal mode: Reset until object is far enough from goal
+        goal_xy_arr = np.array(goal_xy)
+        for attempt in range(max_reset_attempts):
+            if attempt > 0:
+                obs_dict, _ = env.reset()
+            init_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
+            init_obj_xy = init_obj_pose[:2]
+            init_dist = np.linalg.norm(init_obj_xy - goal_xy_arr)
+            
+            if init_dist >= min_init_dist:
+                break
+            
+            if attempt < max_reset_attempts - 1:
+                print(f"  Reset attempt {attempt+1}: object too close to goal "
+                      f"(dist={init_dist:.3f}m < {min_init_dist}m), retrying...")
     
     print(f"  Initial object XY: [{init_obj_pose[0]:.3f}, {init_obj_pose[1]:.3f}]")
     print(f"  Goal XY: [{goal_xy[0]:.3f}, {goal_xy[1]:.3f}]")
@@ -784,10 +892,10 @@ def run_episode(
         dist_to_goal = np.linalg.norm(obj_xy - np.array(goal_xy))
         final_dist = dist_to_goal
         
-        if dist_to_goal < success_radius:
-            success = True
-            print(f"  SUCCESS at step {t+1}! Distance: {dist_to_goal:.4f}m")
-            break
+        # if dist_to_goal < success_radius:
+        #     success = True
+        #     print(f"  SUCCESS at step {t+1}! Distance: {dist_to_goal:.4f}m")
+        #     break
             
         # Early termination (but not success)
         if terminated[0] or truncated[0]:
@@ -896,15 +1004,16 @@ def main() -> None:
         # Step 3: Load full policy model
         # =====================================================================
         print("Loading diffusion policy weights...")
-        policy, preprocessor, postprocessor, num_inference_steps = load_diffusion_policy(
+        policy, preprocessor, postprocessor, num_inference_steps, n_action_steps = load_diffusion_policy(
             args.checkpoint,
             device,
             image_height=args.image_height,
             image_width=args.image_width,
             num_inference_steps=args.num_inference_steps,
+            n_action_steps=args.n_action_steps,
         )
         policy.eval()
-        print(f"Policy loaded. (num_inference_steps={num_inference_steps})")
+        print(f"Policy loaded. (num_inference_steps={num_inference_steps}, n_action_steps={n_action_steps})")
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -913,6 +1022,16 @@ def main() -> None:
         xyz_curves_dir = out_dir / "xyz_curves" if args.visualize_xyz else None
         if xyz_curves_dir is not None:
             xyz_curves_dir.mkdir(parents=True, exist_ok=True)
+
+        # =====================================================================
+        # Step 4: Load overfit env init params if in overfit mode
+        # =====================================================================
+        overfit_env_init = None
+        if args.overfit:
+            overfit_env_init = load_overfit_env_init(args.checkpoint)
+            if overfit_env_init is None:
+                print("\n⚠️  WARNING: --overfit flag set but overfit_env_init.json not found!")
+                print("    Will use random initialization instead.")
 
         # Goal position: plate center
         goal_xy = (0.5, 0.0)
@@ -927,7 +1046,11 @@ def main() -> None:
         print(f"  Horizon: {args.horizon}")
         print(f"  Num episodes: {args.num_episodes}")
         print(f"  Num inference steps: {num_inference_steps}")
+        print(f"  N action steps: {n_action_steps} (execute this many steps before re-inferring)")
         print(f"  Visualize XYZ: {args.visualize_xyz}")
+        print(f"  Overfit mode: {args.overfit}")
+        if overfit_env_init is not None:
+            print(f"  Overfit initial obj pose: {overfit_env_init['initial_obj_pose'][:3]}")
         print(f"{'='*60}")
 
         stats = []
@@ -963,6 +1086,7 @@ def main() -> None:
                 has_wrist=has_wrist,
                 include_obj_pose=include_obj_pose,
                 xyz_visualizer=xyz_visualizer,
+                overfit_env_init=overfit_env_init,
             )
             
             writer.close()
