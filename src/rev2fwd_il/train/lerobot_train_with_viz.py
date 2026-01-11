@@ -206,13 +206,21 @@ def extract_xyz_visualization_data(
             viz_data["ee_pose_raw"] = state_norm[:3].copy()
     
     # Extract camera images
-    # observation.image: (B, n_obs_steps, C, H, W) normalized to [0, 1]
+    # observation.image: (B, n_obs_steps, C, H, W) normalized with ImageNet mean/std
     if "observation.image" in processed_batch:
         img = processed_batch["observation.image"]
         if img.dim() == 5:  # (B, n_obs_steps, C, H, W)
             img_np = img[0, -1].detach().cpu().numpy()  # Last obs step
         else:  # (B, C, H, W)
             img_np = img[0].detach().cpu().numpy()
+        
+        # IMPORTANT: Reverse ImageNet normalization before visualization
+        # Images are normalized with: (img - mean) / std
+        # We need to reverse: img = normalized * std + mean
+        imagenet_mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        imagenet_std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        img_np = img_np * imagenet_std + imagenet_mean  # Reverse normalization
+        
         # Convert from CHW to HWC and [0,1] to [0,255]
         img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
         img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
@@ -225,6 +233,12 @@ def extract_xyz_visualization_data(
             wrist_img_np = wrist_img[0, -1].detach().cpu().numpy()
         else:
             wrist_img_np = wrist_img[0].detach().cpu().numpy()
+        
+        # IMPORTANT: Reverse ImageNet normalization before visualization
+        imagenet_mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        imagenet_std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        wrist_img_np = wrist_img_np * imagenet_std + imagenet_mean  # Reverse normalization
+        
         wrist_img_np = np.transpose(wrist_img_np, (1, 2, 0))
         wrist_img_np = (wrist_img_np * 255).clip(0, 255).astype(np.uint8)
         viz_data["wrist_image"] = wrist_img_np
@@ -313,6 +327,14 @@ def extract_action_chunk_data(
             img_np = img[0, -1].detach().cpu().numpy()  # Last obs step
         else:  # (B, C, H, W)
             img_np = img[0].detach().cpu().numpy()
+        
+        # IMPORTANT: Reverse ImageNet normalization before visualization
+        # Images are normalized with: (img - mean) / std
+        # We need to reverse: img = normalized * std + mean
+        imagenet_mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        imagenet_std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        img_np = img_np * imagenet_std + imagenet_mean  # Reverse normalization
+        
         # Convert from CHW to HWC and [0,1] to [0,255]
         img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
         img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
@@ -325,6 +347,12 @@ def extract_action_chunk_data(
             wrist_img_np = wrist_img[0, -1].detach().cpu().numpy()
         else:
             wrist_img_np = wrist_img[0].detach().cpu().numpy()
+        
+        # IMPORTANT: Reverse ImageNet normalization before visualization
+        imagenet_mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        imagenet_std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        wrist_img_np = wrist_img_np * imagenet_std + imagenet_mean  # Reverse normalization
+        
         wrist_img_np = np.transpose(wrist_img_np, (1, 2, 0))
         wrist_img_np = (wrist_img_np * 255).clip(0, 255).astype(np.uint8)
         viz_data["wrist_image"] = wrist_img_np
@@ -687,6 +715,10 @@ def train_with_xyz_visualization(
 
         if is_log_step:
             logging.info(train_tracker)
+            # 保存loss等信息到文件
+            log_file = Path(cfg.output_dir) / "training_log.txt"
+            with open(log_file, "a") as f:
+                f.write(f"Step {step}: {train_tracker}\n")
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:

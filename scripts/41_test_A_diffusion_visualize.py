@@ -22,7 +22,8 @@ USAGE EXAMPLES
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
     --out_dir runs/diffusion_A_2cam_3/videos \
-    --num_episodes 5 \
+    --num_episodes 3 \
+    --visualize_xyz \
     --headless
 
 # With GUI visualization (for debugging)
@@ -39,12 +40,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --image_height 128 \
     --headless
 
-# CUDA_VISIBLE_DEVICES=1,2,6 torchrun --nproc_per_node=3 scripts/31_train_A_diffusion.py \
-#     --dataset data/A_forward_with_2images.npz \
-#     --out runs/diffusion_A_2cam \
-#     --batch_size 2048 \
-#     --steps 200 \
-#     --lr 0.0005
+
     
 =============================================================================
 CHECKPOINT STRUCTURE
@@ -637,6 +633,12 @@ def run_episode(
         # Convert table image to float32 [0, 1] and BCHW format for policy
         table_rgb_chw = torch.from_numpy(table_rgb_frame).float() / 255.0  # uint8 -> float [0,1]
         table_rgb_chw = table_rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)  # (1, C, H, W)
+        
+        # DEBUG: Print image stats before preprocessing (first step only)
+        if t == 0:
+            print(f"[DEBUG] Step 0: Image BEFORE preprocessing:")
+            print(f"  Range: [{table_rgb_chw.min():.4f}, {table_rgb_chw.max():.4f}]")
+            print(f"  Mean per channel: R={table_rgb_chw[0,0].mean():.4f}, G={table_rgb_chw[0,1].mean():.4f}, B={table_rgb_chw[0,2].mean():.4f}")
 
         # EE state
         ee_pose = get_ee_pose_w(env)[0:1]
@@ -659,12 +661,13 @@ def run_episode(
             wrist_rgb_chw = wrist_rgb_chw.permute(2, 0, 1).unsqueeze(0).to(device)
             policy_inputs["observation.wrist_image"] = wrist_rgb_chw
 
-        # Preprocess inputs (normalizes state and images)
+        # Preprocess inputs (normalizes state and images with ImageNet mean/std)
         # DEBUG: Print before/after normalization on first step
         if t == 0 and preprocessor is not None:
             print("\n[DEBUG] Step 0: Before preprocessing (raw inputs):")
             print(f"  observation.state: {policy_inputs['observation.state'][0, :7].cpu().numpy()}")
             print(f"  observation.image range: [{policy_inputs['observation.image'].min():.4f}, {policy_inputs['observation.image'].max():.4f}]")
+            print(f"  observation.image mean per channel: R={policy_inputs['observation.image'][0,0].mean():.4f}, G={policy_inputs['observation.image'][0,1].mean():.4f}, B={policy_inputs['observation.image'][0,2].mean():.4f}")
         
         # Store raw EE pose before normalization for XYZ visualization
         ee_pose_raw_np = ee_pose[0].cpu().numpy()[:7]
@@ -676,9 +679,11 @@ def run_episode(
         ee_pose_norm_np = policy_inputs['observation.state'][0, :7].cpu().numpy()
         
         if t == 0 and preprocessor is not None:
-            print("[DEBUG] Step 0: After preprocessing (normalized):")
+            print("[DEBUG] Step 0: After preprocessing (ImageNet normalized):")
             print(f"  observation.state: {policy_inputs['observation.state'][0, :7].cpu().numpy()}")
             print(f"  observation.image range: [{policy_inputs['observation.image'].min():.4f}, {policy_inputs['observation.image'].max():.4f}]")
+            print(f"  observation.image mean per channel: R={policy_inputs['observation.image'][0,0].mean():.4f}, G={policy_inputs['observation.image'][0,1].mean():.4f}, B={policy_inputs['observation.image'][0,2].mean():.4f}")
+            print(f"  Expected after ImageNet norm: mean~0, std~1 per channel")
 
         with torch.no_grad():
             action = policy.select_action(policy_inputs)

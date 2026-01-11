@@ -91,6 +91,18 @@ CUDA_VISIBLE_DEVICES=1 python scripts/31_train_A_diffusion.py \
 CUDA_VISIBLE_DEVICES=1,2,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diffusion.py\
     --dataset data/A_forward_with_2images.npz     --out runs/diffusion_A_2cam_3\
      --num_episodes 500     --batch_size 2048     --steps 800     --lr 0.0005   --enable_xyz_viz  --include_obj_pose --wandb
+
+CUDA_VISIBLE_DEVICES=1,2,3,5 torchrun --nproc_per_node=4 \
+    scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_2images.npz \
+    --out runs/diffusion_A_2cam_3 \
+    --batch_size 2048 \
+    --steps 1000 \
+    --lr 0.0005 \
+    --enable_xyz_viz \
+    --include_obj_pose \
+    --wandb
+
 =============================================================================
 """
 
@@ -276,8 +288,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_freq",
         type=int,
-        default=10000,
-        help="Save checkpoint every N steps. Default: 10000.",
+        default=500,
+        help="Save checkpoint every N steps. Default: 500.",
     )
     parser.add_argument(
         "--resume",
