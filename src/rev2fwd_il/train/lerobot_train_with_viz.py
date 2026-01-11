@@ -280,6 +280,7 @@ def extract_action_chunk_data(
     """Extract data for action chunk visualization from a training batch.
     
     Gets the model's predicted action chunk (full horizon) and input observations.
+    Also extracts GT action chunk for comparison visualization.
     
     Args:
         raw_batch: Raw batch from dataloader (before preprocessing)
@@ -289,7 +290,8 @@ def extract_action_chunk_data(
         dataset_stats: Dataset statistics for manual unnormalization
         
     Returns:
-        Dictionary containing action chunk visualization data for first sample
+        Dictionary containing action chunk visualization data for first sample,
+        including GT action chunk for comparison.
     """
     viz_data = {}
     
@@ -357,6 +359,43 @@ def extract_action_chunk_data(
         wrist_img_np = (wrist_img_np * 255).clip(0, 255).astype(np.uint8)
         viz_data["wrist_image"] = wrist_img_np
     
+    # Helper function to unnormalize action chunk
+    def unnormalize_action_chunk(action_chunk_norm_xyz: np.ndarray) -> np.ndarray:
+        """Unnormalize action chunk XYZ using dataset stats."""
+        if dataset_stats is not None and "action" in dataset_stats:
+            stats = dataset_stats["action"]
+            if "mean" in stats and "std" in stats:
+                mean = np.array(stats["mean"])[:3]
+                std = np.array(stats["std"])[:3]
+                return action_chunk_norm_xyz * std + mean
+            elif "min" in stats and "max" in stats:
+                min_val = np.array(stats["min"])[:3]
+                max_val = np.array(stats["max"])[:3]
+                # Unnormalize from [-1, 1] to [min, max]
+                return (action_chunk_norm_xyz + 1) / 2 * (max_val - min_val) + min_val
+        return action_chunk_norm_xyz.copy()
+    
+    # Extract GT action chunk from processed_batch (normalized) and raw_batch (raw)
+    if "action" in processed_batch:
+        action_gt = processed_batch["action"]
+        if action_gt.dim() == 3:  # (B, horizon, action_dim)
+            gt_chunk_norm = action_gt[0].detach().cpu().numpy()  # (horizon, action_dim)
+        else:  # (B, action_dim)
+            gt_chunk_norm = action_gt[0].detach().cpu().numpy()[np.newaxis, :]  # (1, action_dim)
+        viz_data["gt_chunk_norm"] = gt_chunk_norm[:, :3].copy()  # (horizon, 3)
+        # Unnormalize GT action chunk
+        viz_data["gt_chunk_raw"] = unnormalize_action_chunk(gt_chunk_norm[:, :3])
+    
+    # Also get raw GT from raw_batch for verification
+    if "action" in raw_batch:
+        action_raw = raw_batch["action"]
+        if action_raw.dim() == 3:  # (B, horizon, action_dim)
+            gt_chunk_raw_direct = action_raw[0].detach().cpu().numpy()  # (horizon, action_dim)
+        else:  # (B, action_dim)
+            gt_chunk_raw_direct = action_raw[0].detach().cpu().numpy()[np.newaxis, :]
+        # Use raw_batch directly as the ground truth raw values
+        viz_data["gt_chunk_raw"] = gt_chunk_raw_direct[:, :3].copy()  # (horizon, 3)
+    
     # Get model's predicted action chunk
     # Run inference to get the full action chunk prediction
     policy.eval()
@@ -381,22 +420,8 @@ def extract_action_chunk_data(
             # Extract XYZ only (first 3 dimensions)
             viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()  # (horizon, 3)
             
-            # Unnormalize action chunk if stats available
-            if dataset_stats is not None and "action" in dataset_stats:
-                stats = dataset_stats["action"]
-                if "mean" in stats and "std" in stats:
-                    mean = np.array(stats["mean"])[:3]
-                    std = np.array(stats["std"])[:3]
-                    viz_data["action_chunk_raw"] = action_chunk_norm[:, :3] * std + mean
-                elif "min" in stats and "max" in stats:
-                    min_val = np.array(stats["min"])[:3]
-                    max_val = np.array(stats["max"])[:3]
-                    # Unnormalize from [-1, 1] to [min, max]
-                    viz_data["action_chunk_raw"] = (action_chunk_norm[:, :3] + 1) / 2 * (max_val - min_val) + min_val
-                else:
-                    viz_data["action_chunk_raw"] = action_chunk_norm[:, :3].copy()
-            else:
-                viz_data["action_chunk_raw"] = action_chunk_norm[:, :3].copy()
+            # Unnormalize action chunk using the helper function
+            viz_data["action_chunk_raw"] = unnormalize_action_chunk(action_chunk_norm[:, :3])
                 
         except Exception as e:
             logging.debug(f"Failed to get action chunk prediction: {e}")
@@ -408,7 +433,7 @@ def extract_action_chunk_data(
                 else:
                     action_chunk_norm = action[0].detach().cpu().numpy()[np.newaxis, :]
                 viz_data["action_chunk_norm"] = action_chunk_norm[:, :3].copy()
-                viz_data["action_chunk_raw"] = action_chunk_norm[:, :3].copy()
+                viz_data["action_chunk_raw"] = unnormalize_action_chunk(action_chunk_norm[:, :3])
     
     policy.train()
     
@@ -699,6 +724,8 @@ def train_with_xyz_visualization(
                         ee_pose_norm=chunk_data.get("ee_pose_norm", np.zeros(3)),
                         action_chunk_norm=chunk_data.get("action_chunk_norm", np.zeros((16, 3))),
                         action_chunk_raw=chunk_data.get("action_chunk_raw", None),
+                        gt_chunk_norm=chunk_data.get("gt_chunk_norm", None),
+                        gt_chunk_raw=chunk_data.get("gt_chunk_raw", None),
                         table_image=chunk_data.get("table_image", None),
                         wrist_image=chunk_data.get("wrist_image", None),
                     )

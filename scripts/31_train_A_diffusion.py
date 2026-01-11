@@ -103,6 +103,29 @@ CUDA_VISIBLE_DEVICES=1,2,3,5 torchrun --nproc_per_node=4 \
     --include_obj_pose \
     --wandb
 
+CUDA_VISIBLE_DEVICES=6 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_2images.npz \
+    --out runs/diffusion_A_2cam_2 \
+    --batch_size 1024 \
+    --steps 300 \
+    --lr 0.0005 \
+    --enable_xyz_viz \
+    --viz_save_freq 100 \
+    --include_obj_pose \
+    --wandb
+
+CUDA_VISIBLE_DEVICES=6 python scripts/31_train_A_diffusion.py \
+    --dataset data/A_forward_with_2images.npz \
+    --out runs/diffusion_A_2cam_2 \
+    --overfit \
+    --batch_size 32 \
+    --steps 1000 \
+    --lr 0.0001 \
+    --enable_xyz_viz \
+    --viz_save_freq 100 \
+    --include_obj_pose \
+    --wandb
+
 =============================================================================
 """
 

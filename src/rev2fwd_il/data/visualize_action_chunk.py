@@ -58,6 +58,8 @@ class ActionChunkVisualizer:
         ee_pose_norm: np.ndarray,
         action_chunk_norm: np.ndarray,
         action_chunk_raw: Optional[np.ndarray] = None,
+        gt_chunk_norm: Optional[np.ndarray] = None,
+        gt_chunk_raw: Optional[np.ndarray] = None,
         table_image: Optional[np.ndarray] = None,
         wrist_image: Optional[np.ndarray] = None,
     ) -> None:
@@ -68,6 +70,8 @@ class ActionChunkVisualizer:
             ee_pose_norm: Normalized EE pose XYZ (3,).
             action_chunk_norm: Predicted action chunk XYZ normalized (horizon, 3).
             action_chunk_raw: Predicted action chunk XYZ raw (horizon, 3), optional.
+            gt_chunk_norm: Ground truth action chunk XYZ normalized (horizon, 3), optional.
+            gt_chunk_raw: Ground truth action chunk XYZ raw (horizon, 3), optional.
             table_image: Table camera RGB image (H, W, 3) uint8.
             wrist_image: Wrist camera RGB image (H, W, 3) uint8 (optional).
         """
@@ -76,6 +80,8 @@ class ActionChunkVisualizer:
             "ee_pose_norm": np.asarray(ee_pose_norm).flatten()[:3].copy(),
             "action_chunk_norm": np.asarray(action_chunk_norm).copy(),  # (horizon, 3)
             "action_chunk_raw": np.asarray(action_chunk_raw).copy() if action_chunk_raw is not None else None,
+            "gt_chunk_norm": np.asarray(gt_chunk_norm).copy() if gt_chunk_norm is not None else None,
+            "gt_chunk_raw": np.asarray(gt_chunk_raw).copy() if gt_chunk_raw is not None else None,
             "table_image": np.asarray(table_image).astype(np.uint8).copy() if table_image is not None else None,
             "wrist_image": np.asarray(wrist_image).astype(np.uint8).copy() if wrist_image is not None else None,
         }
@@ -128,6 +134,8 @@ class ActionChunkVisualizer:
             ee_norm = frame_data["ee_pose_norm"]  # (3,)
             chunk_norm = frame_data["action_chunk_norm"]  # (horizon, 3)
             chunk_raw = frame_data["action_chunk_raw"]  # (horizon, 3) or None
+            gt_chunk_norm = frame_data["gt_chunk_norm"]  # (horizon, 3) or None
+            gt_chunk_raw = frame_data["gt_chunk_raw"]  # (horizon, 3) or None
             table_img = frame_data["table_image"]  # (H, W, 3) or None
             wrist_img = frame_data["wrist_image"]  # (H, W, 3) or None
             
@@ -137,6 +145,8 @@ class ActionChunkVisualizer:
             has_camera = table_img is not None
             has_wrist = wrist_img is not None
             has_raw_chunk = chunk_raw is not None
+            has_gt_norm = gt_chunk_norm is not None
+            has_gt_raw = gt_chunk_raw is not None
             
             # Create figure layout
             if has_camera:
@@ -193,26 +203,38 @@ class ActionChunkVisualizer:
                 ax_ee_norm.text(bar.get_x() + bar.get_width()/2., height,
                               f'{val:.3f}', ha='center', va='bottom', fontsize=9)
             
-            # Plot 3: Predicted Action Chunk XYZ (normalized) - line plot
-            ax_chunk_norm.set_title(f"Output: Action Chunk XYZ (Normalized, horizon={horizon})")
+            # Plot 3: Predicted Action Chunk XYZ (normalized) - line plot with GT comparison
+            title_suffix = " + GT" if has_gt_norm else ""
+            ax_chunk_norm.set_title(f"Output: Action Chunk XYZ (Normalized, horizon={horizon}){title_suffix}")
             for i, (label, color) in enumerate(zip(labels, colors.values())):
-                ax_chunk_norm.plot(chunk_steps, chunk_norm[:, i], color=color, label=label, 
+                # Plot predicted action chunk (solid line)
+                ax_chunk_norm.plot(chunk_steps, chunk_norm[:, i], color=color, label=f"{label} pred", 
                                   linewidth=2, marker='o', markersize=4)
+                # Plot GT action chunk (dashed line) if available
+                if has_gt_norm:
+                    ax_chunk_norm.plot(chunk_steps, gt_chunk_norm[:, i], color=color, label=f"{label} GT", 
+                                      linewidth=2, linestyle='--', alpha=0.7, marker='s', markersize=3)
             ax_chunk_norm.set_xlabel("Chunk Step")
             ax_chunk_norm.set_ylabel("Normalized Value")
-            ax_chunk_norm.legend(loc='upper right')
+            ax_chunk_norm.legend(loc='upper right', fontsize=8, ncol=2)
             ax_chunk_norm.set_xlim(-0.5, horizon - 0.5)
             ax_chunk_norm.grid(True, alpha=0.3)
             
-            # Plot 4: Predicted Action Chunk XYZ (raw) - line plot
+            # Plot 4: Predicted Action Chunk XYZ (raw) - line plot with GT comparison
             if has_raw_chunk:
-                ax_chunk_raw.set_title(f"Output: Action Chunk XYZ (Raw, horizon={horizon})")
+                title_suffix = " + GT" if has_gt_raw else ""
+                ax_chunk_raw.set_title(f"Output: Action Chunk XYZ (Raw, horizon={horizon}){title_suffix}")
                 for i, (label, color) in enumerate(zip(labels, colors.values())):
-                    ax_chunk_raw.plot(chunk_steps, chunk_raw[:, i], color=color, label=label, 
+                    # Plot predicted action chunk (solid line)
+                    ax_chunk_raw.plot(chunk_steps, chunk_raw[:, i], color=color, label=f"{label} pred", 
                                      linewidth=2, marker='o', markersize=4)
+                    # Plot GT action chunk (dashed line) if available
+                    if has_gt_raw:
+                        ax_chunk_raw.plot(chunk_steps, gt_chunk_raw[:, i], color=color, label=f"{label} GT", 
+                                         linewidth=2, linestyle='--', alpha=0.7, marker='s', markersize=3)
                 ax_chunk_raw.set_xlabel("Chunk Step")
                 ax_chunk_raw.set_ylabel("Position (m)")
-                ax_chunk_raw.legend(loc='upper right')
+                ax_chunk_raw.legend(loc='upper right', fontsize=8, ncol=2)
                 ax_chunk_raw.set_xlim(-0.5, horizon - 0.5)
                 ax_chunk_raw.grid(True, alpha=0.3)
             else:
