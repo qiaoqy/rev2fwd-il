@@ -92,19 +92,23 @@ CUDA_VISIBLE_DEVICES=1,2,5,6 torchrun --nproc_per_node=4 scripts/31_train_A_diff
     --dataset data/A_forward_with_2images.npz     --out runs/diffusion_A_2cam_3\
      --num_episodes 500     --batch_size 2048     --steps 800     --lr 0.0005   --enable_xyz_viz  --include_obj_pose --wandb
 
+tmux new -s 2m
+
 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 torchrun --nproc_per_node=6 \
     scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_2images.npz \
     --out runs/diffusion_A_2cam_3 \
-    --batch_size 2048 \
-    --steps 2000000 \
-    --lr 0.001 \
+    --batch_size 64 \
+    --steps 800000 \
+    --lr 0.0001 \
     --enable_xyz_viz \
     --viz_save_freq 50000 \
     --n_action_steps 16 \
-    --log_freq 200 \
+    --log_freq 10 \
     --include_obj_pose \
     --wandb
+
+tmux attach -t 2m
 
 CUDA_VISIBLE_DEVICES=6 python scripts/31_train_A_diffusion.py \
     --dataset data/A_forward_with_2images.npz \

@@ -65,6 +65,9 @@ class XYZCurveVisualizer:
         self.table_images: List[np.ndarray] = []  # (H, W, 3) uint8 each
         self.wrist_images: List[np.ndarray] = []  # (H, W, 3) uint8 each (optional)
         
+        # Action chunk boundary tracking (timesteps where new inference occurs)
+        self.inference_steps: List[int] = []  # List of timesteps where inference happened
+        
         self._has_gt = False
         self._has_wrist = False
     
@@ -78,6 +81,7 @@ class XYZCurveVisualizer:
         action_gt_raw: Optional[np.ndarray] = None,
         table_image: Optional[np.ndarray] = None,
         wrist_image: Optional[np.ndarray] = None,
+        is_inference_step: bool = False,
     ) -> None:
         """Add a single frame of data.
         
@@ -90,6 +94,8 @@ class XYZCurveVisualizer:
             action_gt_raw: Raw ground truth action XYZ (3,), for unnormalized plot.
             table_image: Table camera RGB image (H, W, 3) uint8.
             wrist_image: Wrist camera RGB image (H, W, 3) uint8 (optional).
+            is_inference_step: Whether this timestep triggered a new policy inference
+                (start of a new action chunk). Used to draw vertical lines.
         """
         self.ee_pose_raw.append(np.asarray(ee_pose_raw).flatten()[:3])
         self.ee_pose_norm.append(np.asarray(ee_pose_norm).flatten()[:3])
@@ -103,6 +109,11 @@ class XYZCurveVisualizer:
         if action_gt_raw is not None:
             self.action_gt_raw.append(np.asarray(action_gt_raw).flatten()[:3])
             self._has_gt = True
+        
+        # Track inference steps (action chunk boundaries)
+        current_step = len(self.ee_pose_raw) - 1  # 0-indexed
+        if is_inference_step:
+            self.inference_steps.append(current_step)
         
         # Store camera images
         if table_image is not None:
@@ -170,6 +181,14 @@ class XYZCurveVisualizer:
         print(f"[XYZCurveVisualizer] Generating video with {T} frames...")
         if has_camera_images:
             print(f"  - Including camera images: table={len(self.table_images)}, wrist={len(self.wrist_images)}")
+        if self.inference_steps:
+            print(f"  - Action chunk boundaries at steps: {self.inference_steps[:10]}{'...' if len(self.inference_steps) > 10 else ''}")
+        
+        def draw_inference_lines(ax, current_t: int):
+            """Draw vertical dashed gray lines at inference steps (action chunk boundaries)."""
+            for inf_step in self.inference_steps:
+                if inf_step <= current_t:
+                    ax.axvline(x=inf_step, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
         
         colors = {'x': 'r', 'y': 'g', 'z': 'b'}
         labels = ['X', 'Y', 'Z']
@@ -196,7 +215,8 @@ class XYZCurveVisualizer:
             ax.set_title("Input: EE Pose XYZ (Raw)")
             for i, (label, color) in enumerate(zip(labels, colors.values())):
                 ax.plot(timesteps[:t+1], ee_raw[:t+1, i], color=color, label=label, linewidth=1.5)
-            ax.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
+            draw_inference_lines(ax, t)  # Draw action chunk boundaries
+            ax.axvline(x=t, color='black', linestyle='-', alpha=0.7, linewidth=1.0)  # Current timestep
             ax.set_xlabel("Timestep")
             ax.set_ylabel("Position (m)")
             ax.legend(loc='upper right')
@@ -208,7 +228,8 @@ class XYZCurveVisualizer:
             ax.set_title("Input: EE Pose XYZ (Normalized)")
             for i, (label, color) in enumerate(zip(labels, colors.values())):
                 ax.plot(timesteps[:t+1], ee_norm[:t+1, i], color=color, label=label, linewidth=1.5)
-            ax.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
+            draw_inference_lines(ax, t)  # Draw action chunk boundaries
+            ax.axvline(x=t, color='black', linestyle='-', alpha=0.7, linewidth=1.0)  # Current timestep
             ax.set_xlabel("Timestep")
             ax.set_ylabel("Normalized Value")
             ax.legend(loc='upper right')
@@ -224,7 +245,8 @@ class XYZCurveVisualizer:
                 if has_gt_norm:
                     ax.plot(timesteps[:t+1], act_gt_norm[:t+1, i], color=color, label=f"{label} GT", 
                            linestyle='--', alpha=0.7, linewidth=1.5)
-            ax.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
+            draw_inference_lines(ax, t)  # Draw action chunk boundaries
+            ax.axvline(x=t, color='black', linestyle='-', alpha=0.7, linewidth=1.0)  # Current timestep
             ax.set_xlabel("Timestep")
             ax.set_ylabel("Normalized Value")
             ax.legend(loc='upper right', ncol=2 if has_gt_norm else 1, fontsize=8)
@@ -240,7 +262,8 @@ class XYZCurveVisualizer:
                 if has_gt_raw:
                     ax.plot(timesteps[:t+1], act_gt_raw[:t+1, i], color=color, label=f"{label} GT", 
                            linestyle='--', alpha=0.7, linewidth=1.5)
-            ax.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
+            draw_inference_lines(ax, t)  # Draw action chunk boundaries
+            ax.axvline(x=t, color='black', linestyle='-', alpha=0.7, linewidth=1.0)  # Current timestep
             ax.set_xlabel("Timestep")
             ax.set_ylabel("Position (m)")
             ax.legend(loc='upper right', ncol=2 if has_gt_raw else 1, fontsize=8)
@@ -369,6 +392,7 @@ class XYZCurveVisualizer:
         self.action_gt_raw = []
         self.table_images = []
         self.wrist_images = []
+        self.inference_steps = []
         self._has_gt = False
         self._has_wrist = False
         

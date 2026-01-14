@@ -48,7 +48,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
     --out_dir runs/diffusion_A_2cam_3/videos     --num_episodes 3 \
-    --visualize_xyz     --headless --horizon 2000 --n_action_steps 16
+    --visualize_xyz     --headless --horizon 1000 --n_action_steps 16
     
 =============================================================================
 CHECKPOINT STRUCTURE
@@ -632,6 +632,7 @@ def run_episode(
     include_obj_pose: bool = False,
     xyz_visualizer=None,
     overfit_env_init: dict | None = None,
+    n_action_steps: int = 8,
 ) -> dict:
     """Run one episode, write frames to writer if provided, return summary.
     
@@ -651,6 +652,8 @@ def run_episode(
         xyz_visualizer: Optional XYZCurveVisualizer for debugging.
         overfit_env_init: Optional dict with initial poses for overfit testing.
             If provided, teleports object to saved initial pose after reset.
+        n_action_steps: Number of action steps per inference. Used to mark
+            action chunk boundaries in XYZ visualization.
         
     Returns:
         Dictionary with episode statistics.
@@ -820,6 +823,9 @@ def run_episode(
         if xyz_visualizer is not None:
             # Get wrist image if available
             wrist_img = wrist_rgb_frame if wrist_camera is not None else None
+            # Determine if this is an inference step (start of new action chunk)
+            # New inference happens at t=0, n_action_steps, 2*n_action_steps, etc.
+            is_inference_step = (t % n_action_steps == 0)
             xyz_visualizer.add_frame(
                 ee_pose_raw=ee_pose_raw_np[:3],  # XYZ only
                 ee_pose_norm=ee_pose_norm_np[:3],  # XYZ only
@@ -828,6 +834,7 @@ def run_episode(
                 action_gt=None,  # No ground truth during evaluation
                 table_image=table_rgb_frame,  # Camera image for visualization
                 wrist_image=wrist_img,  # Wrist camera image if available
+                is_inference_step=is_inference_step,  # Mark action chunk boundaries
             )
 
         action = action.to(device)
@@ -1087,6 +1094,7 @@ def main() -> None:
                 include_obj_pose=include_obj_pose,
                 xyz_visualizer=xyz_visualizer,
                 overfit_env_init=overfit_env_init,
+                n_action_steps=n_action_steps,
             )
             
             writer.close()
