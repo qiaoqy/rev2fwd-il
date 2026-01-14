@@ -42,6 +42,10 @@ python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
 python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
     --enable_xyz_viz --stats_json runs/diffusion_A_2cam_3/lerobot_dataset/meta/stats.json
 
+python scripts/13_inspect_B_images.py --dataset data/B_2images_latest.npz \
+    --enable_xyz_viz --stats_json runs/diffusion_A_2cam_3/lerobot_dataset/meta/stats.json \
+    --name B_2images_xyz_viz --episode 2
+
 =============================================================================
 """
 

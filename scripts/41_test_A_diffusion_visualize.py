@@ -47,8 +47,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
 
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_2cam_3/videos     --num_episodes 3 \
-    --visualize_xyz     --headless --horizon 1000 --n_action_steps 16
+    --out_dir runs/diffusion_A_2cam_3/videos_train_set     --num_episodes 1 \
+    --visualize_xyz     --headless --horizon 2000 --n_action_steps 16 --init_obj_xy 0.5942 0.2070
     
 =============================================================================
 CHECKPOINT STRUCTURE
@@ -309,6 +309,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable overfit testing mode: initialize environment with saved initial poses "
              "from training. Reads overfit_env_init.json from checkpoint directory.",
+    )
+    parser.add_argument(
+        "--init_obj_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("X", "Y"),
+        help="Custom initial XY position for the object (e.g., --init_obj_xy 0.3 0.1). "
+             "If not specified, object position is randomized. Z is automatically set to table height.",
     )
 
     # Isaac Lab AppLauncher flags (headless, device, etc.)
@@ -633,6 +642,7 @@ def run_episode(
     xyz_visualizer=None,
     overfit_env_init: dict | None = None,
     n_action_steps: int = 8,
+    init_obj_xy: tuple | None = None,
 ) -> dict:
     """Run one episode, write frames to writer if provided, return summary.
     
@@ -654,6 +664,9 @@ def run_episode(
             If provided, teleports object to saved initial pose after reset.
         n_action_steps: Number of action steps per inference. Used to mark
             action chunk boundaries in XYZ visualization.
+        init_obj_xy: Optional tuple (x, y) for custom initial object position.
+            If provided, teleports object to this XY position after reset.
+            Takes precedence over random initialization but not over overfit_env_init.
         
     Returns:
         Dictionary with episode statistics.
@@ -690,6 +703,28 @@ def run_episode(
         init_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
         init_dist = np.linalg.norm(init_obj_pose[:2] - np.array(goal_xy))
         print(f"  [Overfit Mode] Object teleported to: [{init_obj_pose[0]:.3f}, {init_obj_pose[1]:.3f}, {init_obj_pose[2]:.3f}]")
+    elif init_obj_xy is not None:
+        # Custom initial XY position specified by user
+        print(f"  [Custom Init] Teleporting object to user-specified XY: [{init_obj_xy[0]:.3f}, {init_obj_xy[1]:.3f}]...")
+        # Get current object pose to preserve orientation
+        current_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
+        # Build new pose: user XY, fixed Z slightly above table, keep quaternion from current pose
+        init_obj_z = 0.0022  # Slightly above table surface
+        new_obj_pose = torch.tensor(
+            [init_obj_xy[0], init_obj_xy[1], init_obj_z,  # XYZ
+             current_obj_pose[3], current_obj_pose[4], current_obj_pose[5], current_obj_pose[6]],  # quaternion
+            dtype=torch.float32,
+            device=device
+        ).unsqueeze(0)  # (1, 7)
+        teleport_object_to_pose(env, new_obj_pose, name="object")
+        
+        # Step simulation a few times to let physics settle
+        for _ in range(5):
+            env.unwrapped.sim.step()
+        
+        init_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
+        init_dist = np.linalg.norm(init_obj_pose[:2] - np.array(goal_xy))
+        print(f"  [Custom Init] Object teleported to: [{init_obj_pose[0]:.3f}, {init_obj_pose[1]:.3f}, {init_obj_pose[2]:.3f}]")
     else:
         # Normal mode: Reset until object is far enough from goal
         goal_xy_arr = np.array(goal_xy)
@@ -1058,6 +1093,8 @@ def main() -> None:
         print(f"  Overfit mode: {args.overfit}")
         if overfit_env_init is not None:
             print(f"  Overfit initial obj pose: {overfit_env_init['initial_obj_pose'][:3]}")
+        if args.init_obj_xy is not None:
+            print(f"  Custom init obj XY: [{args.init_obj_xy[0]:.3f}, {args.init_obj_xy[1]:.3f}]")
         print(f"{'='*60}")
 
         stats = []
@@ -1095,6 +1132,7 @@ def main() -> None:
                 xyz_visualizer=xyz_visualizer,
                 overfit_env_init=overfit_env_init,
                 n_action_steps=n_action_steps,
+                init_obj_xy=tuple(args.init_obj_xy) if args.init_obj_xy is not None else None,
             )
             
             writer.close()
