@@ -26,6 +26,21 @@ CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --visualize_xyz \
     --headless
 
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A_mark/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_mark/videos \
+    --num_episodes 3 \
+    --visualize_xyz \
+    --headless --horizon 2000 --n_action_steps 16
+
+# With action chunk visualization (shows model input and predicted 16-step chunk)
+CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
+    --checkpoint runs/diffusion_A_mark/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_mark/videos \
+    --num_episodes 2 \
+    --visualize_action_chunk \
+    --headless --horizon 1000 --n_action_steps 16
+
 # With GUI visualization (for debugging)
 CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
     --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
@@ -59,6 +74,17 @@ The checkpoint directory should contain:
     - policy_preprocessor.json (optional) Preprocessor config
     - policy_postprocessor.json (optional) Postprocessor config
     - *_normalizer_*.safetensors (optional) Normalization stats
+
+=============================================================================
+VISUALIZATION OPTIONS
+=============================================================================
+--visualize_xyz:           Generates per-timestep XYZ curves showing EE pose and 
+                           single action over time. Saved to {out_dir}/xyz_curves/
+
+--visualize_action_chunk:  Generates per-inference-step visualization showing:
+                           - Input: EE pose XYZ (raw and normalized), camera images
+                           - Output: Full predicted action chunk (16 steps) XYZ curves
+                           One frame per inference step. Saved to {out_dir}/action_chunks/
 
 =============================================================================
 NOTES
@@ -109,6 +135,120 @@ def compute_camera_quat_from_lookat(eye: Tuple[float, float, float], target: Tup
     q_xyzw = rot.as_quat()  # [x, y, z, w]
     qw, qx, qy, qz = q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]
     return (qw, qx, qy, qz)
+
+
+def create_target_markers(num_envs: int, device: str):
+    """Create visualization markers for start and goal positions.
+    
+    Creates two sets of flat cylinder markers on the table surface:
+    - Red markers: Start positions (where cube initially is)
+    - Green markers: Goal positions (fixed at plate center)
+    
+    These are visual-only markers with no physics interaction.
+    
+    Args:
+        num_envs: Number of parallel environments.
+        device: Torch device string.
+        
+    Returns:
+        Tuple of (start_markers, goal_markers, marker_z) VisualizationMarkers objects.
+    """
+    import isaaclab.sim as sim_utils
+    from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+    
+    # Marker parameters
+    marker_radius = 0.05  # 5cm radius
+    marker_height = 0.002  # 2mm height (flat disk)
+    table_z = 0.0  # Table surface height
+    marker_z = table_z + marker_height / 2 + 0.001  # Slightly above table
+    
+    # Red marker for start positions
+    start_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/StartMarkers",
+        markers={
+            "start": sim_utils.CylinderCfg(
+                radius=marker_radius,
+                height=marker_height,
+                axis="Z",
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.0, 0.0),  # Red
+                ),
+            ),
+        },
+    )
+    start_markers = VisualizationMarkers(start_marker_cfg)
+    
+    # Green marker for goal positions
+    goal_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/GoalMarkers",
+        markers={
+            "goal": sim_utils.CylinderCfg(
+                radius=marker_radius,
+                height=marker_height,
+                axis="Z",
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.0, 1.0, 0.0),  # Green
+                ),
+            ),
+        },
+    )
+    goal_markers = VisualizationMarkers(goal_marker_cfg)
+    
+    return start_markers, goal_markers, marker_z
+
+
+def update_target_markers(
+    start_markers,
+    goal_markers,
+    start_xy: tuple,
+    goal_xy: tuple,
+    marker_z: float,
+    env,
+):
+    """Update the positions of start and goal markers.
+    
+    Args:
+        start_markers: VisualizationMarkers for start positions.
+        goal_markers: VisualizationMarkers for goal positions.
+        start_xy: Tuple (x, y) for the start position (initial object position).
+        goal_xy: Tuple (x, y) for the goal position (plate center).
+        marker_z: Z height for markers.
+        env: Isaac Lab environment (for env_origins).
+    """
+    import torch
+    
+    device = env.unwrapped.device
+    num_envs = env.unwrapped.num_envs
+    env_origins = env.unwrapped.scene.env_origins  # (num_envs, 3)
+    
+    # Convert to Python float to handle numpy.float32 types
+    start_x = float(start_xy[0])
+    start_y = float(start_xy[1])
+    goal_x = float(goal_xy[0])
+    goal_y = float(goal_xy[1])
+    
+    # Build start marker positions (same for all envs in this case)
+    start_positions = torch.zeros((num_envs, 3), device=device)
+    start_positions[:, 0] = start_x
+    start_positions[:, 1] = start_y
+    start_positions[:, 2] = marker_z
+    # Add env origins for world positions
+    start_positions_w = start_positions + env_origins
+    
+    # Build goal marker positions (same XY for all envs)
+    goal_positions = torch.zeros((num_envs, 3), device=device)
+    goal_positions[:, 0] = goal_x
+    goal_positions[:, 1] = goal_y
+    goal_positions[:, 2] = marker_z
+    # Add env origins for world positions
+    goal_positions_w = goal_positions + env_origins
+    
+    # Identity quaternion (w, x, y, z) = (1, 0, 0, 0)
+    identity_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device).repeat(num_envs, 1)
+    
+    # Update marker visualizations
+    start_markers.visualize(start_positions_w, identity_quat)
+    goal_markers.visualize(goal_positions_w, identity_quat)
 
 
 def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int) -> None:
@@ -303,6 +443,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate XYZ curve visualization videos for debugging. "
              "Saves to {out_dir}/xyz_curves/ with camera images side by side.",
+    )
+    parser.add_argument(
+        "--visualize_action_chunk",
+        action="store_true",
+        help="Generate action chunk visualization videos showing model input and predicted 16-step chunk. "
+             "Saves to {out_dir}/action_chunks/ with one frame per inference step.",
     )
     parser.add_argument(
         "--overfit",
@@ -643,6 +789,10 @@ def run_episode(
     overfit_env_init: dict | None = None,
     n_action_steps: int = 8,
     init_obj_xy: tuple | None = None,
+    start_markers=None,
+    goal_markers=None,
+    marker_z: float = 0.002,
+    action_chunk_visualizer=None,
 ) -> dict:
     """Run one episode, write frames to writer if provided, return summary.
     
@@ -667,6 +817,11 @@ def run_episode(
         init_obj_xy: Optional tuple (x, y) for custom initial object position.
             If provided, teleports object to this XY position after reset.
             Takes precedence over random initialization but not over overfit_env_init.
+        start_markers: Optional VisualizationMarkers for start position (red circle).
+        goal_markers: Optional VisualizationMarkers for goal position (green circle).
+        marker_z: Z height for markers.
+        action_chunk_visualizer: Optional ActionChunkVisualizer for visualizing
+            model input and predicted action chunks at each inference step.
         
     Returns:
         Dictionary with episode statistics.
@@ -745,6 +900,16 @@ def run_episode(
     print(f"  Initial object XY: [{init_obj_pose[0]:.3f}, {init_obj_pose[1]:.3f}]")
     print(f"  Goal XY: [{goal_xy[0]:.3f}, {goal_xy[1]:.3f}]")
     print(f"  Initial distance to goal: {init_dist:.3f}m")
+    
+    # Update visual markers for start and goal positions
+    if start_markers is not None and goal_markers is not None:
+        update_target_markers(
+            start_markers, goal_markers,
+            start_xy=(init_obj_pose[0], init_obj_pose[1]),
+            goal_xy=goal_xy,
+            marker_z=marker_z,
+            env=env,
+        )
     
     steps = 0
     success = False
@@ -834,6 +999,90 @@ def run_episode(
         with torch.no_grad():
             action = policy.select_action(policy_inputs)
             raw_actioin = action.clone()
+            
+            # Get full action chunk for visualization at inference steps
+            # This is when t % n_action_steps == 0, meaning policy does new inference
+            is_inference_step = (t % n_action_steps == 0)
+            action_chunk_norm = None
+            action_chunk_raw = None
+            
+            if is_inference_step and action_chunk_visualizer is not None:
+                # Get full action chunk by calling diffusion.generate_actions directly
+                # This bypasses the action queue and gives us all predicted actions
+                try:
+                    # For diffusion policy, we need to prepare the batch correctly
+                    # The diffusion module expects:
+                    # - observation.state: (B, n_obs_steps, state_dim)
+                    # - observation.images: (B, n_obs_steps, num_cams, C, H, W)
+                    
+                    # Get the required n_obs_steps from policy config
+                    n_obs_steps_required = policy.config.n_obs_steps if hasattr(policy, 'config') else 2
+                    
+                    if t == 0:
+                        print(f"[DEBUG] Action chunk viz: n_obs_steps_required={n_obs_steps_required}")
+                    
+                    inference_batch = {}
+                    
+                    # Copy state - replicate to fill n_obs_steps dimension
+                    if 'observation.state' in policy_inputs:
+                        state = policy_inputs['observation.state']  # (B, state_dim)
+                        # (B, state_dim) -> (B, n_obs_steps, state_dim)
+                        if state.dim() == 2:
+                            state = state.unsqueeze(1).repeat(1, n_obs_steps_required, 1)
+                        inference_batch['observation.state'] = state
+                    
+                    # Stack image features into observation.images
+                    if hasattr(policy, 'config') and hasattr(policy.config, 'image_features'):
+                        images_list = []
+                        for key in policy.config.image_features:
+                            if key in policy_inputs:
+                                img = policy_inputs[key]  # (B, C, H, W)
+                                # (B, C, H, W) -> (B, n_obs_steps, C, H, W)
+                                if img.dim() == 4:
+                                    img = img.unsqueeze(1).repeat(1, n_obs_steps_required, 1, 1, 1)
+                                images_list.append(img)
+                        if images_list:
+                            # Stack along camera dimension (dim=2)
+                            # Result: (B, n_obs_steps, num_cams, C, H, W)
+                            inference_batch['observation.images'] = torch.stack(images_list, dim=2)
+                            
+                            if t == 0:
+                                print(f"[DEBUG] Action chunk viz: observation.images shape={inference_batch['observation.images'].shape}")
+                                print(f"[DEBUG] Action chunk viz: observation.state shape={inference_batch['observation.state'].shape}")
+                    
+                    # Call diffusion.generate_actions to get full chunk
+                    if hasattr(policy, 'diffusion'):
+                        full_chunk = policy.diffusion.generate_actions(inference_batch)
+                        # full_chunk shape: (B, horizon, action_dim)
+                        if full_chunk.dim() == 3:
+                            action_chunk_norm = full_chunk[0].cpu().numpy()  # (horizon, action_dim)
+                        elif full_chunk.dim() == 2:
+                            action_chunk_norm = full_chunk.cpu().numpy()
+                        else:
+                            action_chunk_norm = full_chunk.cpu().numpy()[np.newaxis, :]
+                        
+                        if t == 0:
+                            print(f"[DEBUG] Action chunk viz: got action_chunk_norm shape={action_chunk_norm.shape}")
+                        
+                        # Unnormalize each action in the chunk
+                        if postprocessor is not None:
+                            unnorm_actions = []
+                            for i in range(action_chunk_norm.shape[0]):
+                                single_action = torch.from_numpy(action_chunk_norm[i]).float().to(device)
+                                unnorm_action = postprocessor(single_action)
+                                unnorm_actions.append(unnorm_action.cpu().numpy())
+                            action_chunk_raw = np.array(unnorm_actions)  # (horizon, action_dim)
+                        else:
+                            action_chunk_raw = action_chunk_norm.copy()
+                    else:
+                        if t == 0:
+                            print(f"[WARNING] Policy does not have 'diffusion' attribute, cannot get action chunk")
+                            
+                except Exception as e:
+                    import traceback
+                    print(f"[WARNING] Failed to get action chunk for visualization: {e}")
+                    if t == 0:
+                        traceback.print_exc()
         
         # Store normalized action for XYZ visualization
         action_norm_np = raw_actioin[0].cpu().numpy()
@@ -860,7 +1109,6 @@ def run_episode(
             wrist_img = wrist_rgb_frame if wrist_camera is not None else None
             # Determine if this is an inference step (start of new action chunk)
             # New inference happens at t=0, n_action_steps, 2*n_action_steps, etc.
-            is_inference_step = (t % n_action_steps == 0)
             xyz_visualizer.add_frame(
                 ee_pose_raw=ee_pose_raw_np[:3],  # XYZ only
                 ee_pose_norm=ee_pose_norm_np[:3],  # XYZ only
@@ -870,6 +1118,20 @@ def run_episode(
                 table_image=table_rgb_frame,  # Camera image for visualization
                 wrist_image=wrist_img,  # Wrist camera image if available
                 is_inference_step=is_inference_step,  # Mark action chunk boundaries
+            )
+        
+        # Add frame to action chunk visualizer at inference steps
+        if action_chunk_visualizer is not None and is_inference_step and action_chunk_norm is not None:
+            wrist_img = wrist_rgb_frame if wrist_camera is not None else None
+            action_chunk_visualizer.add_frame(
+                ee_pose_raw=ee_pose_raw_np[:3],  # XYZ only
+                ee_pose_norm=ee_pose_norm_np[:3],  # XYZ only
+                action_chunk_norm=action_chunk_norm[:, :3],  # XYZ only (horizon, 3)
+                action_chunk_raw=action_chunk_raw[:, :3] if action_chunk_raw is not None else None,
+                gt_chunk_norm=None,  # No ground truth during evaluation
+                gt_chunk_raw=None,
+                table_image=table_rgb_frame,
+                wrist_image=wrist_img,
             )
 
         action = action.to(device)
@@ -1041,6 +1303,15 @@ def main() -> None:
                 "Policy expects wrist camera input (observation.wrist_image) "
                 "but wrist_cam sensor not found in environment!"
             )
+        
+        # =====================================================================
+        # Create visual markers for start and goal positions
+        # =====================================================================
+        print("[DEBUG] Creating target markers...")
+        start_markers, goal_markers, marker_z = create_target_markers(
+            num_envs=1, device=device
+        )
+        print("[DEBUG] Target markers created")
 
         # =====================================================================
         # Step 3: Load full policy model
@@ -1090,6 +1361,7 @@ def main() -> None:
         print(f"  Num inference steps: {num_inference_steps}")
         print(f"  N action steps: {n_action_steps} (execute this many steps before re-inferring)")
         print(f"  Visualize XYZ: {args.visualize_xyz}")
+        print(f"  Visualize action chunk: {args.visualize_action_chunk}")
         print(f"  Overfit mode: {args.overfit}")
         if overfit_env_init is not None:
             print(f"  Overfit initial obj pose: {overfit_env_init['initial_obj_pose'][:3]}")
@@ -1100,6 +1372,13 @@ def main() -> None:
         stats = []
         video_paths = []
         xyz_video_paths = []
+        action_chunk_video_paths = []
+        
+        # Create action chunks output directory if visualization is enabled
+        action_chunks_dir = out_dir / "action_chunks" if args.visualize_action_chunk else None
+        if action_chunks_dir is not None:
+            action_chunks_dir.mkdir(parents=True, exist_ok=True)
+        
         for ep in range(args.num_episodes):
             print(f"\nEpisode {ep+1}/{args.num_episodes}")
             
@@ -1114,6 +1393,16 @@ def main() -> None:
                 xyz_visualizer = create_eval_xyz_visualizer(
                     output_dir=xyz_curves_dir,
                     episode_id=ep,
+                    fps=args.fps,
+                )
+            
+            # Create action chunk visualizer for this episode if enabled
+            action_chunk_visualizer = None
+            if args.visualize_action_chunk:
+                from rev2fwd_il.data.visualize_action_chunk import ActionChunkVisualizer
+                action_chunk_visualizer = ActionChunkVisualizer(
+                    output_dir=action_chunks_dir,
+                    step_id=ep,  # Use episode id as step_id
                     fps=args.fps,
                 )
             
@@ -1133,6 +1422,10 @@ def main() -> None:
                 overfit_env_init=overfit_env_init,
                 n_action_steps=n_action_steps,
                 init_obj_xy=tuple(args.init_obj_xy) if args.init_obj_xy is not None else None,
+                start_markers=start_markers,
+                goal_markers=goal_markers,
+                marker_z=marker_z,
+                action_chunk_visualizer=action_chunk_visualizer,
             )
             
             writer.close()
@@ -1143,16 +1436,25 @@ def main() -> None:
                 xyz_video_path = xyz_visualizer.generate_video(filename_prefix="eval_xyz_curves")
                 xyz_video_paths.append(xyz_video_path)
             
+            # Generate action chunk video if enabled
+            if action_chunk_visualizer is not None:
+                action_chunk_video_path = action_chunk_visualizer.generate_video(filename_prefix="eval_action_chunk")
+                action_chunk_video_paths.append(action_chunk_video_path)
+            
             stats.append(result)
             status = "SUCCESS" if result['success'] else "FAILED"
             print(f"  Result: {status} | steps={result['steps']} | final_dist={result['final_dist']:.4f}m")
             print(f"  Video saved: {video_path}")
             if xyz_visualizer is not None:
                 print(f"  XYZ curves saved: {xyz_video_path}")
+            if action_chunk_visualizer is not None:
+                print(f"  Action chunk video saved: {action_chunk_video_path}")
 
         print(f"\nSaved {len(video_paths)} videos to {out_dir}/")
         if xyz_video_paths:
             print(f"Saved {len(xyz_video_paths)} XYZ curve videos to {xyz_curves_dir}/")
+        if action_chunk_video_paths:
+            print(f"Saved {len(action_chunk_video_paths)} action chunk videos to {action_chunks_dir}/")
 
         # Print summary statistics
         num_success = sum(1 for s in stats if s["success"])

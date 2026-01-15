@@ -44,7 +44,8 @@ python scripts/12_collect_B_with_images.py --num_episodes 10
 
 CUDA_VISIBLE_DEVICES=2 python scripts/12_collect_B_with_images.py --headless --num_episodes 500 --num_envs 256
 
-CUDA_VISIBLE_DEVICES=3 python scripts/12_collect_B_with_images.py --headless --num_episodes 10 --num_envs 4 --out data/B_2images_test.npz
+CUDA_VISIBLE_DEVICES=3 python scripts/12_collect_B_with_images.py \
+    --headless --num_episodes 30 --num_envs 8 --out data/B_2images_mark.npz
 
 =============================================================================
 """
@@ -221,6 +222,115 @@ def compute_camera_quat_from_lookat(eye: tuple, target: tuple, up: tuple = (0, 0
     return (qw, qx, qy, qz)
 
 
+def create_target_markers(num_envs: int, device: str):
+    """Create visualization markers for start and goal positions.
+    
+    Creates two sets of flat cylinder markers on the table surface:
+    - Red markers: Start/place positions (where cube should be placed)
+    - Green markers: Goal positions (fixed at plate center)
+    
+    These are visual-only markers with no physics interaction.
+    
+    Args:
+        num_envs: Number of parallel environments.
+        device: Torch device string.
+        
+    Returns:
+        Tuple of (start_markers, goal_markers) VisualizationMarkers objects.
+    """
+    import isaaclab.sim as sim_utils
+    from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+    
+    # Marker parameters
+    marker_radius = 0.05  # 5cm radius
+    marker_height = 0.002  # 2mm height (flat disk)
+    table_z = 0.0  # Table surface height
+    marker_z = table_z + marker_height / 2 + 0.001  # Slightly above table
+    
+    # Red marker for start/place positions
+    start_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/StartMarkers",
+        markers={
+            "start": sim_utils.CylinderCfg(
+                radius=marker_radius,
+                height=marker_height,
+                axis="Z",
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.0, 0.0),  # Red
+                ),
+            ),
+        },
+    )
+    start_markers = VisualizationMarkers(start_marker_cfg)
+    
+    # Green marker for goal positions
+    goal_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/GoalMarkers",
+        markers={
+            "goal": sim_utils.CylinderCfg(
+                radius=marker_radius,
+                height=marker_height,
+                axis="Z",
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.0, 1.0, 0.0),  # Green
+                ),
+            ),
+        },
+    )
+    goal_markers = VisualizationMarkers(goal_marker_cfg)
+    
+    return start_markers, goal_markers, marker_z
+
+
+def update_target_markers(
+    start_markers,
+    goal_markers,
+    start_xys: list,
+    goal_xy: tuple,
+    marker_z: float,
+    env,
+):
+    """Update the positions of start and goal markers.
+    
+    Args:
+        start_markers: VisualizationMarkers for start positions.
+        goal_markers: VisualizationMarkers for goal positions.
+        start_xys: List of (x, y) tuples for start positions, one per env.
+        goal_xy: Tuple (x, y) for the goal position (same for all envs).
+        marker_z: Z height for markers.
+        env: Isaac Lab environment (for env_origins).
+    """
+    import torch
+    
+    device = env.unwrapped.device
+    num_envs = env.unwrapped.num_envs
+    env_origins = env.unwrapped.scene.env_origins  # (num_envs, 3)
+    
+    # Build start marker positions (one per env)
+    start_positions = torch.zeros((num_envs, 3), device=device)
+    for i, xy in enumerate(start_xys):
+        start_positions[i, 0] = xy[0]
+        start_positions[i, 1] = xy[1]
+        start_positions[i, 2] = marker_z
+    # Add env origins for world positions
+    start_positions_w = start_positions + env_origins
+    
+    # Build goal marker positions (same XY for all envs)
+    goal_positions = torch.zeros((num_envs, 3), device=device)
+    goal_positions[:, 0] = goal_xy[0]
+    goal_positions[:, 1] = goal_xy[1]
+    goal_positions[:, 2] = marker_z
+    # Add env origins for world positions
+    goal_positions_w = goal_positions + env_origins
+    
+    # Identity quaternion (w, x, y, z) = (1, 0, 0, 0)
+    identity_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device).repeat(num_envs, 1)
+    
+    # Update marker visualizations
+    start_markers.visualize(start_positions_w, identity_quat)
+    goal_markers.visualize(goal_positions_w, identity_quat)
+
+
 def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     """Dynamically add camera sensors to the environment configuration.
     
@@ -392,6 +502,7 @@ def rollout_expert_B_with_images(
     rng,
     horizon: int,
     settle_steps: int = 30,
+    markers: tuple = None,
 ):
     """Run parallel reverse rollouts with Expert B and record trajectories including images.
     
@@ -402,10 +513,13 @@ def rollout_expert_B_with_images(
         rng: NumPy random generator.
         horizon: Maximum steps for each episode.
         settle_steps: Extra steps after expert finishes to let cube settle.
+        markers: Tuple of (start_markers, goal_markers, marker_z) for visualization.
+                 If None, markers will be created (for first call).
     
     Returns:
-        List of (episode_dict, expert_completed) tuples, one per environment.
-        Each episode_dict contains obs, images, wrist_images, ee_pose, obj_pose, gripper, etc.
+        Tuple of (results, markers) where:
+        - results: List of (episode_dict, expert_completed) tuples, one per environment.
+        - markers: The markers tuple (for reuse in subsequent calls).
     """
     import numpy as np
     import torch
@@ -462,7 +576,16 @@ def rollout_expert_B_with_images(
     # =========================================================================
     # Step 3: Sample random place targets for each env
     # =========================================================================
-    place_xys = [task_spec.sample_table_xy(rng) for _ in range(num_envs)]
+    # Sample place targets that are at least 0.1 away from the goal position
+    min_dist_from_goal = 0.1
+    place_xys = []
+    for _ in range(num_envs):
+        while True:
+            xy = task_spec.sample_table_xy(rng)
+            dist = np.sqrt((xy[0] - task_spec.goal_xy[0])**2 + (xy[1] - task_spec.goal_xy[1])**2)
+            if dist >= min_dist_from_goal:
+                place_xys.append(xy)
+                break
     place_poses_np = np.array([
         [xy[0], xy[1], 0.055, 1.0, 0.0, 0.0, 0.0] for xy in place_xys
     ], dtype=np.float32)
@@ -479,6 +602,25 @@ def rollout_expert_B_with_images(
     for i, xy in enumerate(place_xys):
         expert.place_pose[i, 0] = xy[0]
         expert.place_pose[i, 1] = xy[1]
+    
+    # =========================================================================
+    # Step 4.5: Create (if needed) and update visual markers for start/goal positions
+    # =========================================================================
+    if markers is None:
+        print("[DEBUG] rollout: Creating target markers (first time)...")
+        start_markers, goal_markers, marker_z = create_target_markers(num_envs, device)
+        markers = (start_markers, goal_markers, marker_z)
+    else:
+        print("[DEBUG] rollout: Reusing existing markers...")
+        start_markers, goal_markers, marker_z = markers
+    update_target_markers(
+        start_markers, goal_markers,
+        start_xys=place_xys,
+        goal_xy=task_spec.goal_xy,
+        marker_z=marker_z,
+        env=env,
+    )
+    print("[DEBUG] rollout: Target markers created and positioned")
     
     # =========================================================================
     # Step 5: Initialize per-env recording buffers
@@ -631,7 +773,7 @@ def rollout_expert_B_with_images(
         results.append((episode_dict, expert_completed[i].item()))
     
     print(f"[DEBUG] rollout: Done. Returning {len(results)} episodes")
-    return results
+    return results, markers
 
 
 def save_episodes_with_images(path: str, episodes: list[dict]) -> None:
@@ -773,18 +915,20 @@ def main() -> None:
         start_time = time.time()
         batch_count = 0
         max_batches = (args.num_episodes // num_envs + 1) * 3
+        markers = None  # Will be created on first rollout and reused
         
         while len(episodes) < args.num_episodes and batch_count < max_batches:
             batch_count += 1
             
             # Run parallel episodes with Expert B and image capture
-            results = rollout_expert_B_with_images(
+            results, markers = rollout_expert_B_with_images(
                 env=env,
                 expert=expert,
                 task_spec=task_spec,
                 rng=rng,
                 horizon=args.horizon,
                 settle_steps=args.settle_steps,
+                markers=markers,
             )
             
             # Process results from all parallel envs

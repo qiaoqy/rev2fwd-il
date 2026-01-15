@@ -509,11 +509,58 @@ def extract_action_chunk_data(
     return viz_data
 
 
+def compute_validation_loss(
+    policy: PreTrainedPolicy,
+    val_dataloader,
+    preprocessor,
+    accelerator: Accelerator,
+    max_batches: int = 50,
+) -> float:
+    """
+    Compute validation loss over the validation dataset.
+    
+    Args:
+        policy: The policy model.
+        val_dataloader: DataLoader for validation data.
+        preprocessor: The preprocessor for normalizing batches.
+        accelerator: The accelerator instance.
+        max_batches: Maximum number of batches to evaluate (to limit time).
+        
+    Returns:
+        Average validation loss.
+    """
+    policy.eval()
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch_idx, raw_batch in enumerate(val_dataloader):
+            if batch_idx >= max_batches:
+                break
+            
+            processed_batch = preprocessor(raw_batch)
+            
+            with accelerator.autocast():
+                loss, _ = policy.forward(processed_batch)
+            
+            # Gather loss across processes
+            gathered_loss = accelerator.gather(loss)
+            total_loss += gathered_loss.mean().item()
+            num_batches += 1
+    
+    policy.train()
+    
+    avg_loss = total_loss / max(num_batches, 1)
+    return avg_loss
+
+
 def train_with_xyz_visualization(
     cfg: TrainPipelineConfig,
     accelerator: Accelerator | None = None,
     viz_save_freq: int = 200,
     xyz_viz_dir: str | Path | None = None,
+    val_dataset_cfg=None,
+    val_freq: int = 500,
 ):
     """
     Train a policy with XYZ curve visualization.
@@ -521,12 +568,15 @@ def train_with_xyz_visualization(
     This is a modified version of LeRobot's train() function that adds:
     1. Checkpoint saving every viz_save_freq steps (default 200)
     2. XYZ curve visualization for debugging
+    3. Validation loss computation and logging
     
     Args:
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
         viz_save_freq: Frequency (in steps) to save checkpoints and generate visualization.
         xyz_viz_dir: Directory to save XYZ visualization videos. If None, uses output_dir/xyz_viz.
+        val_dataset_cfg: Optional DatasetConfig for validation dataset.
+        val_freq: Frequency (in steps) to compute validation loss.
     """
     cfg.validate()
 
@@ -645,7 +695,7 @@ def train_with_xyz_visualization(
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
         logging.info(f"XYZ visualization save frequency: {viz_save_freq} steps")
 
-    # Create dataloader
+    # Create dataloader - let accelerator handle distributed sampling
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -653,20 +703,20 @@ def train_with_xyz_visualization(
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=False,  # 不shuffle
+            shuffle=False,
         )
     else:
-        shuffle = False  # 不shuffle
+        shuffle = True
         sampler = None
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
+        shuffle=shuffle,
         sampler=sampler,
         pin_memory=device.type == "cuda",
-        drop_last=False,
+        drop_last=True,  # Drop last incomplete batch
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
@@ -675,6 +725,38 @@ def train_with_xyz_visualization(
         policy, optimizer, dataloader, lr_scheduler
     )
     dl_iter = cycle(dataloader)
+
+    # Create validation dataset and dataloader if configured
+    val_dataloader = None
+    if val_dataset_cfg is not None:
+        if is_main_process:
+            logging.info("Creating validation dataset")
+        
+        # Create a temporary config for validation dataset
+        from copy import deepcopy
+        val_cfg = deepcopy(cfg)
+        val_cfg.dataset = val_dataset_cfg
+        
+        val_dataset = make_dataset(val_cfg)
+        
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=min(cfg.num_workers, 2),  # Use fewer workers for validation
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+        
+        # Prepare validation dataloader with accelerator
+        val_dataloader = accelerator.prepare(val_dataloader)
+        
+        if is_main_process:
+            logging.info(f"Validation dataset: {val_dataset.num_frames} frames, {val_dataset.num_episodes} episodes")
+            logging.info(f"Validation frequency: every {val_freq} steps")
+        
+        accelerator.wait_for_everyone()
 
     policy.train()
 
@@ -725,6 +807,17 @@ def train_with_xyz_visualization(
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
     
+    # DEBUG: Print dataloader info
+    if is_main_process:
+        logging.info(f"[DEBUG] Training dataloader: batch_size={cfg.batch_size}, len(dataset)={len(dataset)}")
+        if val_dataloader is not None:
+            logging.info(f"[DEBUG] Validation dataloader ready")
+    
+    # Synchronize before starting training loop
+    accelerator.wait_for_everyone()
+    if is_main_process:
+        logging.info("[DEBUG] All processes synchronized, starting training loop...")
+    
     # Get dataset stats for unnormalization in visualization
     dataset_stats = dataset.meta.stats if hasattr(dataset.meta, 'stats') else None
     
@@ -732,8 +825,19 @@ def train_with_xyz_visualization(
     viz_sample_counter = 0
 
     for _ in range(step, cfg.steps):
+        # if is_main_process and _ == step:
+        #     logging.info(f"[DEBUG] Entering first iteration (step={step})")
+        
         start_time = time.perf_counter()
+        
+        # if is_main_process and _ == step:
+        #     logging.info("[DEBUG] Calling next(dl_iter)...")
+        
         raw_batch = next(dl_iter)
+        
+        # if is_main_process and _ == step:
+        #     logging.info(f"[DEBUG] Got batch, keys={list(raw_batch.keys())}")
+        
         processed_batch = preprocessor(raw_batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
         
@@ -742,32 +846,34 @@ def train_with_xyz_visualization(
         viz_sample_idx = viz_sample_counter % batch_size
 
         # Extract visualization data before policy update (on main process only)
+        # Limit to 1000 frames per visualization interval to avoid memory issues and slow video generation
         if is_main_process and xyz_visualizer is not None:
-            try:
-                viz_data = extract_xyz_visualization_data(
-                    raw_batch=raw_batch,
-                    processed_batch=processed_batch,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    policy=policy,
-                    accelerator=accelerator,
-                    dataset_stats=dataset_stats,
-                    sample_idx=viz_sample_idx,  # Use cycling sample index
-                )
-                
-                # Add frame to visualizer
-                xyz_visualizer.add_frame(
-                    ee_pose_raw=viz_data.get("ee_pose_raw", np.zeros(3)),
-                    ee_pose_norm=viz_data.get("ee_pose_norm", np.zeros(3)),
-                    action_raw=viz_data.get("action_gt_raw", np.zeros(3)),
-                    action_norm=viz_data.get("action_gt_norm", np.zeros(3)),
-                    action_gt=viz_data.get("action_gt_norm", None),  # Normalized GT for subplot 3
-                    action_gt_raw=viz_data.get("action_gt_raw", None),  # Raw GT for subplot 4
-                    table_image=viz_data.get("table_image", None),
-                    wrist_image=viz_data.get("wrist_image", None),
-                )
-            except Exception as e:
-                logging.debug(f"Failed to extract visualization data: {e}")
+            if len(xyz_visualizer.ee_pose_raw) < 1000:  # Limit to 1000 frames for XYZ viz
+                try:
+                    viz_data = extract_xyz_visualization_data(
+                        raw_batch=raw_batch,
+                        processed_batch=processed_batch,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        policy=policy,
+                        accelerator=accelerator,
+                        dataset_stats=dataset_stats,
+                        sample_idx=viz_sample_idx,  # Use cycling sample index
+                    )
+                    
+                    # Add frame to visualizer
+                    xyz_visualizer.add_frame(
+                        ee_pose_raw=viz_data.get("ee_pose_raw", np.zeros(3)),
+                        ee_pose_norm=viz_data.get("ee_pose_norm", np.zeros(3)),
+                        action_raw=viz_data.get("action_gt_raw", np.zeros(3)),
+                        action_norm=viz_data.get("action_gt_norm", np.zeros(3)),
+                        action_gt=viz_data.get("action_gt_norm", None),  # Normalized GT for subplot 3
+                        action_gt_raw=viz_data.get("action_gt_raw", None),  # Raw GT for subplot 4
+                        table_image=viz_data.get("table_image", None),
+                        wrist_image=viz_data.get("wrist_image", None),
+                    )
+                except Exception as e:
+                    logging.debug(f"Failed to extract visualization data: {e}")
         
         # Extract action chunk visualization data (after policy update to get predictions)
         # We'll do this after the update_policy call below
@@ -821,6 +927,26 @@ def train_with_xyz_visualization(
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_viz_saving_step = step % viz_save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = val_dataloader is not None and val_freq > 0 and step % val_freq == 0
+
+        # Compute validation loss
+        if is_val_step:
+            val_loss = compute_validation_loss(
+                policy=policy,
+                val_dataloader=val_dataloader,
+                preprocessor=preprocessor,
+                accelerator=accelerator,
+                max_batches=50,  # Limit to 50 batches for speed
+            )
+            if is_main_process:
+                logging.info(f"Step {step}: val_loss={val_loss:.4f}")
+                if wandb_logger:
+                    # Note: log_dict doesn't support mode="val", just use key prefix
+                    wandb_logger.log_dict({"val_loss": val_loss}, step)
+                # Also save to log file
+                log_file = Path(cfg.output_dir) / "training_log.txt"
+                with open(log_file, "a") as f:
+                    f.write(f"Step {step}: val_loss={val_loss:.4f}\n")
 
         if is_log_step:
             logging.info(train_tracker)
@@ -853,9 +979,20 @@ def train_with_xyz_visualization(
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
-                
+
+            # IMPORTANT: Synchronize BEFORE generating videos to avoid NCCL timeout
+            # Video generation can take a long time with many frames
+            accelerator.wait_for_everyone()
+            
+            # Generate visualization videos AFTER synchronization (only on main process)
+            # This way other processes don't have to wait for video generation
+            if is_main_process:
                 # Generate XYZ visualization video
                 if xyz_visualizer is not None and len(xyz_visualizer.ee_pose_raw) > 0:
+                    num_frames = len(xyz_visualizer.ee_pose_raw)
+                    # Warn if too many frames (will take a long time)
+                    if num_frames > 10000:
+                        logging.warning(f"XYZ visualizer has {num_frames} frames, video generation may take a while...")
                     try:
                         video_path = xyz_visualizer.generate_video(
                             filename_prefix=f"train_xyz_step_{step}"
@@ -879,8 +1016,6 @@ def train_with_xyz_visualization(
                     
                     # Reset visualizer for next interval
                     action_chunk_visualizer.reset(step_id=step)
-
-            accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:
             if is_main_process:

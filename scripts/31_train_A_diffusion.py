@@ -99,14 +99,32 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 torchrun --nproc_per_node=6 \
     --dataset data/A_forward_with_2images.npz \
     --out runs/diffusion_A_2cam_3 \
     --batch_size 64 \
-    --steps 800000 \
+    --steps 500000 \
     --lr 0.0001 \
     --enable_xyz_viz \
-    --viz_save_freq 50000 \
+    --viz_save_freq 5000000 \
     --n_action_steps 16 \
     --log_freq 10 \
     --include_obj_pose \
     --wandb
+
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 torchrun --nproc_per_node=6 \
+    scripts/31_train_A_diffusion.py \
+    --dataset data/A_2images_mark.npz \
+    --out runs/diffusion_A_mark \
+    --batch_size 64 \
+    --steps 100000 \
+    --lr 0.0001 \
+    --enable_xyz_viz \
+    --viz_save_freq 20000 \
+    --n_action_steps 16 \
+    --log_freq 50 \
+    --include_obj_pose \
+    --wandb
+
+    # --val_split 0.1 \
+    # --val_freq 20 \
+
 
 tmux attach -t 2m
 
@@ -375,6 +393,22 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="rev2fwd-diffusion",
         help="WandB project name. Default: rev2fwd-diffusion.",
+    )
+
+    # =========================================================================
+    # Validation Set
+    # =========================================================================
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.0,
+        help="Fraction of episodes to use for validation (0.0 to 1.0). Default: 0.0 (no validation).",
+    )
+    parser.add_argument(
+        "--val_freq",
+        type=int,
+        default=500,
+        help="Compute validation loss every N steps. Default: 500.",
     )
 
     return parser.parse_args()
@@ -770,6 +804,8 @@ def train_with_lerobot_api(
     has_wrist: bool = False,
     include_obj_pose: bool = False,
     overfit_env_init: dict | None = None,
+    train_episodes: list[int] | None = None,
+    val_episodes: list[int] | None = None,
 ) -> dict:
     """Train using LeRobot's Python API.
     
@@ -880,11 +916,21 @@ def train_with_lerobot_api(
         print(f"    {feat_type}: {norm_mode}")
     print("=" * 60 + "\n")
     
-    # Create dataset configuration
+    # Create dataset configuration (with train episodes if specified)
     dataset_cfg = DatasetConfig(
         repo_id="local/rev2fwd_diffusion",
         root=str(lerobot_dataset_dir),
+        episodes=train_episodes,  # Use train episodes if validation split is enabled
     )
+    
+    # Create validation dataset configuration if val_episodes provided
+    val_dataset_cfg = None
+    if val_episodes is not None and len(val_episodes) > 0:
+        val_dataset_cfg = DatasetConfig(
+            repo_id="local/rev2fwd_diffusion",
+            root=str(lerobot_dataset_dir),
+            episodes=val_episodes,
+        )
     
     # Create WandB configuration
     wandb_cfg = WandBConfig(
@@ -951,6 +997,11 @@ def train_with_lerobot_api(
     print(f"  WandB: {args.wandb}")
     print(f"  XYZ visualization: {args.enable_xyz_viz}")
     print(f"  Viz save frequency: {args.viz_save_freq} steps")
+    if train_episodes is not None:
+        print(f"  Train episodes: {len(train_episodes)}")
+    if val_episodes is not None:
+        print(f"  Val episodes: {len(val_episodes)}")
+        print(f"  Val frequency: {args.val_freq} steps")
     print("=" * 60 + "\n")
     
     # Run training with or without XYZ visualization
@@ -960,6 +1011,8 @@ def train_with_lerobot_api(
             train_cfg,
             viz_save_freq=args.viz_save_freq,
             xyz_viz_dir=xyz_viz_dir,
+            val_dataset_cfg=val_dataset_cfg,
+            val_freq=args.val_freq,
         )
     else:
         train(train_cfg)
@@ -1102,6 +1155,49 @@ def main() -> None:
             print("Data conversion complete. Exiting (--convert_only flag).")
         return
     
+    # Compute train/val episode split
+    train_episodes = None
+    val_episodes = None
+    
+    if args.val_split > 0.0:
+        # Read the number of episodes from the dataset metadata
+        meta_path = lerobot_dataset_dir / "meta" / "info.json"
+        if meta_path.exists():
+            with open(meta_path, "r") as f:
+                info = json.load(f)
+            total_episodes = info.get("total_episodes", 0)
+        else:
+            # Fallback: count episode directories
+            episodes_dir = lerobot_dataset_dir / "data"
+            if episodes_dir.exists():
+                total_episodes = len(list(episodes_dir.glob("episode_*")))
+            else:
+                total_episodes = 0
+        
+        if total_episodes > 0:
+            # Shuffle episode indices for random split
+            all_episode_indices = list(range(total_episodes))
+            rng = np.random.default_rng(args.seed)
+            rng.shuffle(all_episode_indices)
+            
+            # Split into train and val
+            n_val = max(1, int(total_episodes * args.val_split))
+            val_episodes = sorted(all_episode_indices[:n_val])
+            train_episodes = sorted(all_episode_indices[n_val:])
+            
+            if is_main_process:
+                print(f"\n{'='*60}")
+                print("Train/Val Split")
+                print(f"{'='*60}")
+                print(f"  Total episodes: {total_episodes}")
+                print(f"  Val split: {args.val_split:.1%}")
+                print(f"  Train episodes: {len(train_episodes)}")
+                print(f"  Val episodes: {len(val_episodes)}")
+                print(f"{'='*60}\n")
+        else:
+            if is_main_process:
+                print(f"Warning: Could not determine total episodes, skipping validation split")
+    
     # Step 2: Train the policy
     result = train_with_lerobot_api(
         args=args,
@@ -1111,6 +1207,8 @@ def main() -> None:
         has_wrist=has_wrist,
         include_obj_pose=args.include_obj_pose,
         overfit_env_init=overfit_env_init,
+        train_episodes=train_episodes,
+        val_episodes=val_episodes,
     )
     
     print("\n" + "=" * 60)

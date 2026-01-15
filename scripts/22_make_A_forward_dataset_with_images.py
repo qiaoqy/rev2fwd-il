@@ -51,6 +51,9 @@ python scripts/22_make_A_forward_dataset_with_images.py \
     --out data/A_forward_with_images.npz \
     --success_only 1
 
+python scripts/22_make_A_forward_dataset_with_images.py \
+    --input data/B_2images_mark.npz \
+    --out data/A_2images_mark.npz
 =============================================================================
 """
 
