@@ -11,7 +11,10 @@ For each episode, the following arrays are saved:
     - obs:              (T, obs_dim)  Policy observation sequence
     - state:            (T, state_dim) Full state observation (privileged)
     - images:           (T, H, W, 3)  RGB images from table camera (uint8)
-    - wrist_images:     (T, H, W, 3)  RGB images from wrist camera (uint8)
+    - wrist_wrist_cam_front:      (T, H, W, 3)  Wrist camera looking forward
+    - wrist_wrist_cam_down:       (T, H, W, 3)  Wrist camera looking down
+    - wrist_wrist_cam_front_down: (T, H, W, 3)  Wrist camera 45 deg pitch
+    - wrist_wrist_cam_front_slight: (T, H, W, 3) Wrist camera 30 deg pitch
     - ee_pose:          (T, 7)   End-effector pose [x, y, z, qw, qx, qy, qz]
     - nut_pose:         (T, 7)   Nut (held asset) pose
     - bolt_pose:        (T, 7)   Bolt (fixed asset) pose
@@ -22,20 +25,21 @@ For each episode, the following arrays are saved:
     - episode_length:   int      Total timesteps in episode
     - success:          bool     Whether task was successful
     - success_threshold: float   Threshold used for success determination
+    - wrist_cam_names:  list     Names of all wrist cameras
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
 # Basic usage (headless mode, 100 episodes)
-python scripts/1_collect_data_nut_thread.py --headless --num_episodes 100
+python scripts_nut/1_collect_data_nut_thread.py --headless --num_episodes 100
 
 # Production run (500 episodes with parallel envs)
-CUDA_VISIBLE_DEVICES=1 python scripts/1_collect_data_nut_thread.py \
-    --headless --num_episodes 300 --num_envs 4 \
+CUDA_VISIBLE_DEVICES=2 python scripts_nut/1_collect_data_nut_thread.py \
+    --headless --num_episodes 1 \
     --out data/nut_thread.npz
 
 # With custom image size
-python scripts/1_collect_data_nut_thread.py --headless --num_episodes 100 \
+python scripts_nut/1_collect_data_nut_thread.py --headless --num_episodes 100 \
     --image_width 128 --image_height 128 --out data/nut_thread_128.npz
 
 =============================================================================
@@ -45,6 +49,11 @@ from __future__ import annotations
 
 import argparse
 import time
+import sys
+
+# Disable output buffering for immediate debug output
+sys.stdout.reconfigure(line_buffering=True)
+print("[DEBUG] Script started, output buffering disabled", flush=True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -86,7 +95,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=4,
+        default=1,
         help="Number of parallel environments. Use fewer envs for image collection "
              "due to increased memory usage.",
     )
@@ -212,7 +221,10 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     
     This function modifies env_cfg.scene to add:
     1. A table-view camera - fixed third-person view looking at the workspace
-    2. A wrist camera - mounted on robot's end-effector
+    
+    NOTE: Wrist camera cannot be added here for FORGE environments because
+    the robot prim doesn't exist yet during scene creation. The wrist camera
+    is added after environment creation using add_wrist_camera_post_creation().
     
     Args:
         env_cfg: The environment configuration object.
@@ -225,10 +237,11 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # =========================================================================
     # Table Camera - Third-person fixed view for nut threading task
     # =========================================================================
-    # FORGE task workspace is centered differently than lift task
-    # The bolt is fixed at a certain position, we look at the workspace from above-front
-    camera_eye = (0.6, 0.4, 0.5)      # Camera position: in front, slightly right, above
-    camera_lookat = (0.0, 0.0, 0.15)  # Look at: workspace center, slightly above table
+    # FORGE/Factory workspace is centered at (0, 0, 0), robot base is there
+    # Use similar camera position as pick_place task but adjusted for FORGE workspace
+    # Place camera further back to capture full workspace including table
+    camera_eye = (0.7, 0.2, 0.2)      # Camera position: further back, right side, higher up
+    camera_lookat = (0.6, 0.0, 0.0)   # Look at: workspace center
     
     camera_quat = compute_camera_quat_from_lookat(camera_eye, camera_lookat)
     
@@ -242,6 +255,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
             focal_length=24.0,
             focus_distance=400.0,
             horizontal_aperture=20.955,
+            # Clip far objects to avoid seeing adjacent environments
             clipping_range=(0.1, 2.5),
         ),
         offset=CameraCfg.OffsetCfg(
@@ -251,30 +265,123 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
         ),
     )
     
-    # =========================================================================
-    # Wrist Camera - Eye-in-hand, attached to robot gripper
-    # =========================================================================
-    env_cfg.scene.wrist_cam = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_cam",
-        update_period=0.0,
-        height=image_height,
-        width=image_width,
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 2.0),
-        ),
-        offset=CameraCfg.OffsetCfg(
-            pos=(0.13, 0.0, -0.15),
-            rot=(-0.70614, 0.03701, 0.03701, -0.70614),
-            convention="ros",
-        ),
-    )
+    # NOTE: Wrist camera is NOT added here - it will be added after env creation
+    # using add_wrist_camera_post_creation() because FORGE creates robot prims
+    # during scene setup, not before.
     
     # Increase environment spacing to prevent seeing adjacent environments
+    # Default is 2.0m in Factory, increase to 5.0m so neighbors are far enough away
     env_cfg.scene.env_spacing = 5.0
+    
+    # Disable debug visualization markers if present
+    if hasattr(env_cfg, 'commands') and hasattr(env_cfg.commands, 'object_pose'):
+        env_cfg.commands.object_pose.debug_vis = False
+
+
+def add_wrist_camera_post_creation(env, num_envs: int, image_width: int, image_height: int):
+    """Add multiple wrist cameras after FORGE environment creation using replicator API.
+    
+    FORGE environments create the robot prim during scene setup, so we cannot
+    add a camera attached to robot links in the env_cfg. Instead, we add the
+    camera after the environment is created using USD and replicator APIs.
+    
+    Creates multiple wrist cameras with different orientations for debugging:
+    - wrist_cam_front: Looking forward toward gripper fingers
+    - wrist_cam_down: Looking straight down at workspace
+    - wrist_cam_front_down: Looking forward and down (45 degree pitch)
+    
+    Args:
+        env: The created FORGE gymnasium environment.
+        num_envs: Number of parallel environments.
+        image_width: Width of captured images.
+        image_height: Height of captured images.
+        
+    Returns:
+        Dict mapping camera name to (render_products, rgb_annotators) for each environment.
+    """
+    import omni.usd
+    from pxr import UsdGeom, Gf
+    import omni.replicator.core as rep
+    
+    print("[DEBUG] add_wrist_camera_post_creation: Starting (multiple cameras)...", flush=True)
+    
+    stage = omni.usd.get_context().get_stage()
+    
+    # Define multiple camera configurations
+    # Each entry: (name, position, quaternion (w,x,y,z), description)
+    # After testing, rotX_180 is the correct orientation for wrist camera
+    # Camera convention: -Z is viewing direction
+    camera_configs = [
+        # Wrist camera: Rotate 180 deg around X - looks forward toward workspace
+        ("wrist_cam",
+         Gf.Vec3d(0.05, 0.0, 0.0),
+         Gf.Quatf(0.0, 1.0, 0.0, 0.0),  # 180 deg around X
+         "Wrist camera looking at workspace"),
+    ]
+    
+    all_camera_data = {}
+    
+    for cam_name, cam_pos, cam_quat, cam_desc in camera_configs:
+        render_products = []
+        rgb_annotators = []
+        
+        for env_idx in range(num_envs):
+            # Path to panda_hand in this environment
+            panda_hand_path = f"/World/envs/env_{env_idx}/Robot/panda_hand"
+            panda_hand_prim = stage.GetPrimAtPath(panda_hand_path)
+            
+            if not panda_hand_prim.IsValid():
+                print(f"[ERROR] panda_hand not found at {panda_hand_path}", flush=True)
+                render_products.append(None)
+                rgb_annotators.append(None)
+                continue
+            
+            # Create camera prim under panda_hand
+            wrist_cam_path = f"{panda_hand_path}/{cam_name}"
+            
+            # Check if camera already exists
+            if not stage.GetPrimAtPath(wrist_cam_path).IsValid():
+                # Create camera using USD API
+                camera_prim = UsdGeom.Camera.Define(stage, wrist_cam_path)
+                
+                # Set camera properties - moderate FOV for wrist camera
+                camera_prim.GetFocalLengthAttr().Set(18.0)  # Longer focal length = narrower FOV
+                camera_prim.GetHorizontalApertureAttr().Set(20.955)
+                camera_prim.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 2.0))
+                
+                # Set local transform (relative to panda_hand)
+                xform = UsdGeom.Xformable(camera_prim.GetPrim())
+                xform.ClearXformOpOrder()
+                
+                translate_op = xform.AddTranslateOp()
+                translate_op.Set(cam_pos)
+                
+                orient_op = xform.AddOrientOp()
+                orient_op.Set(cam_quat)
+            
+            # Create render product for this camera
+            try:
+                render_product = rep.create.render_product(wrist_cam_path, (image_width, image_height))
+                
+                # Create RGB annotator
+                rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+                rgb_annotator.attach([render_product])
+                
+                render_products.append(render_product)
+                rgb_annotators.append(rgb_annotator)
+                
+                if env_idx == 0:
+                    print(f"[DEBUG] {cam_name} created: {cam_desc}", flush=True)
+            except Exception as e:
+                print(f"[ERROR] Failed to create {cam_name} for env_{env_idx}: {e}", flush=True)
+                render_products.append(None)
+                rgb_annotators.append(None)
+        
+        all_camera_data[cam_name] = (render_products, rgb_annotators)
+    
+    print(f"[DEBUG] add_wrist_camera_post_creation: Created {len(camera_configs)} camera types", flush=True)
+    
+    return all_camera_data
 
 
 def make_forge_env_with_camera(
@@ -311,14 +418,54 @@ def make_forge_env_with_camera(
     print("[DEBUG] make_forge_env_with_camera: Config parsed")
     
     # Add camera to the environment configuration
-    print("[DEBUG] make_forge_env_with_camera: Adding camera to env config...")
+    print("[DEBUG] make_forge_env_with_camera: Adding camera to env config...", flush=True)
     add_camera_to_env_cfg(env_cfg, image_width, image_height)
-    print("[DEBUG] make_forge_env_with_camera: Camera config added")
+    print("[DEBUG] make_forge_env_with_camera: Camera config added", flush=True)
+    
+    # Debug: print the scene config to verify table camera was added
+    print(f"[DEBUG] make_forge_env_with_camera: scene has table_cam: {hasattr(env_cfg.scene, 'table_cam')}", flush=True)
     
     # Create environment
-    print("[DEBUG] make_forge_env_with_camera: Creating gym environment...")
-    env = gym.make(task_id, cfg=env_cfg)
-    print("[DEBUG] make_forge_env_with_camera: Gym environment created")
+    print("[DEBUG] make_forge_env_with_camera: Creating gym environment...", flush=True)
+    import sys
+    sys.stdout.flush()
+    try:
+        env = gym.make(task_id, cfg=env_cfg)
+        print("[DEBUG] make_forge_env_with_camera: Gym environment created", flush=True)
+    except Exception as e:
+        print(f"[DEBUG] ERROR in gym.make: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise
+    
+    # After env creation, check if scene is properly initialized
+    print(f"[DEBUG] make_forge_env_with_camera: env type: {type(env)}", flush=True)
+    print(f"[DEBUG] make_forge_env_with_camera: env.unwrapped type: {type(env.unwrapped)}", flush=True)
+    
+    # Check scene sensors (should have table_cam)
+    print(f"[DEBUG] make_forge_env_with_camera: Checking scene.sensors...", flush=True)
+    try:
+        sensors = env.unwrapped.scene.sensors
+        print(f"[DEBUG] make_forge_env_with_camera: sensors keys: {list(sensors.keys())}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG] ERROR accessing scene.sensors: {e}", flush=True)
+    
+    # Now add wrist cameras using replicator API (after robot prim exists)
+    print("[DEBUG] make_forge_env_with_camera: Adding wrist cameras post-creation...", flush=True)
+    wrist_camera_data = add_wrist_camera_post_creation(
+        env, num_envs, image_width, image_height
+    )
+    
+    # Store all wrist camera info in env for later access
+    # wrist_camera_data is a dict: {cam_name: (render_products, rgb_annotators)}
+    env.unwrapped._wrist_camera_data = wrist_camera_data
+    
+    # For backward compatibility, also store the first camera as default
+    first_cam_name = list(wrist_camera_data.keys())[0] if wrist_camera_data else None
+    if first_cam_name:
+        env.unwrapped._wrist_render_products = wrist_camera_data[first_cam_name][0]
+        env.unwrapped._wrist_rgb_annotators = wrist_camera_data[first_cam_name][1]
+    
     return env
 
 
@@ -492,8 +639,19 @@ def rollout_nut_threading(
     
     # Get camera sensor references
     print("[DEBUG] rollout: Getting camera sensor references...")
-    table_camera = env.unwrapped.scene.sensors["table_cam"]
-    wrist_camera = env.unwrapped.scene.sensors["wrist_cam"]
+    try:
+        table_camera = env.unwrapped.scene.sensors["table_cam"]
+        print(f"[DEBUG] rollout: table_camera acquired: {type(table_camera)}")
+    except Exception as e:
+        print(f"[DEBUG] ERROR getting table_cam: {e}")
+        raise
+    
+    # Get wrist camera data (multiple cameras added post-creation using replicator API)
+    wrist_camera_data = getattr(env.unwrapped, '_wrist_camera_data', None)
+    if wrist_camera_data is not None:
+        print(f"[DEBUG] rollout: wrist cameras acquired: {list(wrist_camera_data.keys())}")
+    else:
+        print("[DEBUG] rollout: wrist_camera_data not available, using zeros for wrist images")
     print(f"[DEBUG] rollout: Cameras acquired")
     
     # =========================================================================
@@ -501,6 +659,9 @@ def rollout_nut_threading(
     # =========================================================================
     print("[DEBUG] rollout: Resetting environment...")
     obs_dict, _ = env.reset()
+    print(f"[DEBUG] rollout: obs_dict type: {type(obs_dict)}")
+    if isinstance(obs_dict, dict):
+        print(f"[DEBUG] rollout: obs_dict keys: {obs_dict.keys()}")
     expert.reset()
     print(f"[DEBUG] rollout: Reset done")
     
@@ -513,7 +674,9 @@ def rollout_nut_threading(
     obs_lists = [[] for _ in range(num_envs)]
     state_lists = [[] for _ in range(num_envs)]
     image_lists = [[] for _ in range(num_envs)]
-    wrist_image_lists = [[] for _ in range(num_envs)]
+    # Create separate lists for each wrist camera
+    wrist_cam_names = list(wrist_camera_data.keys()) if wrist_camera_data else []
+    wrist_image_lists_dict = {cam_name: [[] for _ in range(num_envs)] for cam_name in wrist_cam_names}
     ee_pose_lists = [[] for _ in range(num_envs)]
     nut_pose_lists = [[] for _ in range(num_envs)]
     bolt_pose_lists = [[] for _ in range(num_envs)]
@@ -544,35 +707,86 @@ def rollout_nut_threading(
             critic_state = obs_dict
         
         # Get camera images
+        if t == 0:
+            print(f"[DEBUG] rollout: Getting camera images...")
+            print(f"[DEBUG] rollout: table_camera.data.output keys: {table_camera.data.output.keys()}")
         table_rgb = table_camera.data.output["rgb"]
-        wrist_rgb = wrist_camera.data.output["rgb"]
+        
+        # Get wrist camera images from all cameras
+        wrist_images_by_cam = {}
+        if wrist_camera_data is not None:
+            for cam_name, (render_products, rgb_annotators) in wrist_camera_data.items():
+                wrist_images_list = []
+                for i, annotator in enumerate(rgb_annotators):
+                    if annotator is not None:
+                        data = annotator.get_data()
+                        if data is not None:
+                            # Convert to torch tensor if needed
+                            if not isinstance(data, torch.Tensor):
+                                data = torch.from_numpy(data).to(device)
+                            wrist_images_list.append(data)
+                        else:
+                            wrist_images_list.append(torch.zeros(table_rgb.shape[1:], dtype=table_rgb.dtype, device=device))
+                    else:
+                        wrist_images_list.append(torch.zeros(table_rgb.shape[1:], dtype=table_rgb.dtype, device=device))
+                wrist_images_by_cam[cam_name] = torch.stack(wrist_images_list, dim=0)
+        
+        if t == 0:
+            print(f"[DEBUG] rollout: table_rgb shape: {table_rgb.shape}, dtype: {table_rgb.dtype}")
+            for cam_name, wrist_rgb in wrist_images_by_cam.items():
+                print(f"[DEBUG] rollout: {cam_name} shape: {wrist_rgb.shape}, dtype: {wrist_rgb.dtype}")
+        
+        # Truncate to 3 channels if RGBA
         if table_rgb.shape[-1] > 3:
             table_rgb = table_rgb[..., :3]
-        if wrist_rgb.shape[-1] > 3:
-            wrist_rgb = wrist_rgb[..., :3]
+        for cam_name in wrist_images_by_cam:
+            if wrist_images_by_cam[cam_name].shape[-1] > 3:
+                wrist_images_by_cam[cam_name] = wrist_images_by_cam[cam_name][..., :3]
         
         # Get poses and force data from FORGE environment
         # These are internal tensors maintained by ForgeEnv
+        if t == 0:
+            print(f"[DEBUG] rollout: Getting fingertip_pos...")
+            print(f"[DEBUG] rollout: forge_env attributes: fingertip_midpoint_pos={hasattr(forge_env, 'fingertip_midpoint_pos')}")
         fingertip_pos = forge_env.fingertip_midpoint_pos.clone()
         fingertip_quat = forge_env.fingertip_midpoint_quat.clone()
+        if t == 0:
+            print(f"[DEBUG] rollout: fingertip_pos shape: {fingertip_pos.shape}")
         
         # Held asset (nut) pose
+        if t == 0:
+            print(f"[DEBUG] rollout: Getting held_asset (nut) pose...")
+            print(f"[DEBUG] rollout: _held_asset exists: {hasattr(forge_env, '_held_asset')}")
         nut_pos = forge_env._held_asset.data.root_pos_w - forge_env.scene.env_origins
         nut_quat = forge_env._held_asset.data.root_quat_w
         nut_pose = torch.cat([nut_pos, nut_quat], dim=-1)
+        if t == 0:
+            print(f"[DEBUG] rollout: nut_pose shape: {nut_pose.shape}")
         
         # Fixed asset (bolt) pose  
+        if t == 0:
+            print(f"[DEBUG] rollout: Getting fixed_asset (bolt) pose...")
+            print(f"[DEBUG] rollout: _fixed_asset exists: {hasattr(forge_env, '_fixed_asset')}")
         bolt_pos = forge_env._fixed_asset.data.root_pos_w - forge_env.scene.env_origins
         bolt_quat = forge_env._fixed_asset.data.root_quat_w
         bolt_pose = torch.cat([bolt_pos, bolt_quat], dim=-1)
+        if t == 0:
+            print(f"[DEBUG] rollout: bolt_pose shape: {bolt_pose.shape}")
         
         # Get force sensor data - this is the key FORGE feature!
         # force_sensor_smooth contains smoothed force/torque readings (6D: Fx, Fy, Fz, Tx, Ty, Tz)
+        if t == 0:
+            print(f"[DEBUG] rollout: Checking force_sensor_smooth...")
+            print(f"[DEBUG] rollout: force_sensor_smooth exists: {hasattr(forge_env, 'force_sensor_smooth')}")
         if hasattr(forge_env, 'force_sensor_smooth'):
             ft_force_raw = forge_env.force_sensor_smooth.clone()
             ft_force = ft_force_raw[:, :3]  # Just the force components
+            if t == 0:
+                print(f"[DEBUG] rollout: ft_force_raw shape: {ft_force_raw.shape}")
         else:
             # Fallback if force sensor not available
+            if t == 0:
+                print(f"[DEBUG] rollout: WARNING - force_sensor_smooth not found, using zeros")
             ft_force_raw = torch.zeros(num_envs, 6, device=device)
             ft_force = torch.zeros(num_envs, 3, device=device)
         
@@ -595,7 +809,11 @@ def rollout_nut_threading(
         policy_obs_np = policy_obs.cpu().numpy()
         critic_state_np = critic_state.cpu().numpy()
         table_images_np = table_rgb.cpu().numpy().astype(np.uint8)
-        wrist_images_np = wrist_rgb.cpu().numpy().astype(np.uint8)
+        # Convert all wrist camera images to numpy
+        wrist_images_np_dict = {
+            cam_name: wrist_images_by_cam[cam_name].cpu().numpy().astype(np.uint8)
+            for cam_name in wrist_images_by_cam
+        }
         ee_pose_np = ee_pose.cpu().numpy()
         nut_pose_np = nut_pose.cpu().numpy()
         bolt_pose_np = bolt_pose.cpu().numpy()
@@ -608,7 +826,9 @@ def rollout_nut_threading(
             obs_lists[i].append(policy_obs_np[i])
             state_lists[i].append(critic_state_np[i])
             image_lists[i].append(table_images_np[i])
-            wrist_image_lists[i].append(wrist_images_np[i])
+            # Append each wrist camera image
+            for cam_name in wrist_cam_names:
+                wrist_image_lists_dict[cam_name][i].append(wrist_images_np_dict[cam_name][i])
             ee_pose_lists[i].append(ee_pose_np[i])
             nut_pose_lists[i].append(nut_pose_np[i])
             bolt_pose_lists[i].append(bolt_pose_np[i])
@@ -618,7 +838,13 @@ def rollout_nut_threading(
             joint_pos_lists[i].append(joint_pos_np[i])
         
         # Step environment
+        if t == 0:
+            print(f"[DEBUG] rollout: Calling env.step...")
+            print(f"[DEBUG] rollout: action shape: {action.shape}, dtype: {action.dtype}")
         obs_dict, reward, terminated, truncated, info = env.step(action)
+        if t == 0:
+            print(f"[DEBUG] rollout: env.step returned successfully")
+            print(f"[DEBUG] rollout: reward: {reward}, terminated: {terminated}, truncated: {truncated}")
         
         # Check for resets (environment may auto-reset on success)
         done = terminated | truncated
@@ -644,7 +870,9 @@ def rollout_nut_threading(
             "obs": np.array(obs_lists[i], dtype=np.float32),
             "state": np.array(state_lists[i], dtype=np.float32),
             "images": np.array(image_lists[i], dtype=np.uint8),
-            "wrist_images": np.array(wrist_image_lists[i], dtype=np.uint8),
+            # Save all wrist cameras with their names as keys
+            **{f"wrist_{cam_name}": np.array(wrist_image_lists_dict[cam_name][i], dtype=np.uint8) 
+               for cam_name in wrist_cam_names},
             "ee_pose": np.array(ee_pose_lists[i], dtype=np.float32),
             "nut_pose": np.array(nut_pose_lists[i], dtype=np.float32),
             "bolt_pose": np.array(bolt_pose_lists[i], dtype=np.float32),
@@ -655,6 +883,7 @@ def rollout_nut_threading(
             "episode_length": len(obs_lists[i]),
             "success": False,  # Will be determined by inspection
             "success_threshold": success_threshold,
+            "wrist_cam_names": wrist_cam_names,  # Store camera names for reference
         }
         results.append(episode_dict)
     
@@ -685,7 +914,12 @@ def save_episodes(path: str, episodes: list[dict]) -> None:
         print(f"  - Policy obs shape: {ep0['obs'].shape}")
         print(f"  - State shape: {ep0['state'].shape}")
         print(f"  - Table camera image shape: {ep0['images'].shape}")
-        print(f"  - Wrist camera image shape: {ep0['wrist_images'].shape}")
+        # Print all wrist camera shapes
+        wrist_cam_names = ep0.get('wrist_cam_names', [])
+        for cam_name in wrist_cam_names:
+            key = f"wrist_{cam_name}"
+            if key in ep0:
+                print(f"  - {key} image shape: {ep0[key].shape}")
         print(f"  - EE pose shape: {ep0['ee_pose'].shape}")
         print(f"  - Action shape: {ep0['action'].shape}")
         print(f"  - Force sensor shape: {ep0['ft_force'].shape}")
@@ -745,25 +979,45 @@ def main() -> None:
         )
         print("[DEBUG] Step 4: Environment created successfully")
         
+        print("[DEBUG] Getting env.unwrapped.device...")
         device = env.unwrapped.device
         print(f"[DEBUG] Environment device: {device}")
         
         # Print FORGE environment info
+        print("[DEBUG] Getting forge_env = env.unwrapped...")
         forge_env = env.unwrapped
+        print(f"[DEBUG] forge_env type: {type(forge_env)}")
+        
+        print("[DEBUG] Accessing forge_env.cfg_task...")
         print(f"[DEBUG] FORGE task name: {forge_env.cfg_task.name}")
+        
+        print("[DEBUG] Accessing forge_env.cfg.obs_order...")
         print(f"[DEBUG] FORGE obs order: {forge_env.cfg.obs_order}")
         print(f"[DEBUG] FORGE state order: {forge_env.cfg.state_order}")
+        
+        print("[DEBUG] Accessing action/observation space...")
         print(f"[DEBUG] FORGE action space: {env.action_space}")
         print(f"[DEBUG] FORGE observation space: {env.observation_space}")
         
         # Check camera sensor
         print("[DEBUG] Checking camera sensors...")
+        print(f"[DEBUG] Available sensors: {list(env.unwrapped.scene.sensors.keys())}")
         if "table_cam" in env.unwrapped.scene.sensors:
             camera = env.unwrapped.scene.sensors["table_cam"]
             print(f"[DEBUG] Table camera found: {camera.cfg.width}x{camera.cfg.height}")
-        if "wrist_cam" in env.unwrapped.scene.sensors:
-            camera = env.unwrapped.scene.sensors["wrist_cam"]
-            print(f"[DEBUG] Wrist camera found: {camera.cfg.width}x{camera.cfg.height}")
+            print(f"[DEBUG] Table camera data types: {camera.cfg.data_types}")
+        else:
+            print("[DEBUG] WARNING: table_cam NOT found in sensors!")
+        
+        # Check wrist cameras (added post-creation via replicator API)
+        wrist_camera_data = getattr(env.unwrapped, '_wrist_camera_data', None)
+        if wrist_camera_data is not None:
+            print(f"[DEBUG] Wrist cameras found: {list(wrist_camera_data.keys())}")
+            for cam_name, (render_products, rgb_annotators) in wrist_camera_data.items():
+                valid_count = len([a for a in rgb_annotators if a is not None])
+                print(f"[DEBUG]   - {cam_name}: {valid_count} valid annotators")
+        else:
+            print("[DEBUG] WARNING: wrist camera data NOT found!")
         
         # =================================================================
         # Step 5: Create expert policy

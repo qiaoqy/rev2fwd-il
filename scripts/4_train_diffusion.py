@@ -785,7 +785,8 @@ def train_with_lerobot_api(
     # Create training pipeline configuration
     checkpoint_dir = out_dir / "checkpoints"
     
-    # When resuming, check that checkpoints exist
+    # When resuming, load the config from checkpoint and update necessary fields
+    resume_config_path = None  # Track for sys.argv injection
     if args.resume:
         checkpoints_subdir = checkpoint_dir / "checkpoints"
         if not checkpoints_subdir.exists():
@@ -793,7 +794,7 @@ def train_with_lerobot_api(
                 f"Cannot resume: checkpoint directory {checkpoints_subdir} does not exist. "
                 f"Please run training without --resume first."
             )
-        checkpoint_dirs = sorted(checkpoints_subdir.iterdir())
+        checkpoint_dirs = sorted([d for d in checkpoints_subdir.iterdir() if d.is_dir()])
         if not checkpoint_dirs:
             raise FileNotFoundError(
                 f"Cannot resume: no checkpoints found in {checkpoints_subdir}. "
@@ -801,22 +802,43 @@ def train_with_lerobot_api(
             )
         latest_checkpoint = checkpoint_dirs[-1]
         print(f"Resuming from checkpoint: {latest_checkpoint}")
-    
-    train_cfg = TrainPipelineConfig(
-        dataset=dataset_cfg,
-        policy=policy_cfg,
-        output_dir=checkpoint_dir,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        steps=args.steps,
-        log_freq=args.log_freq,
-        save_freq=args.save_freq,
-        save_checkpoint=True,
-        wandb=wandb_cfg,
-        resume=args.resume,
-        eval_freq=0,
-    )
+        
+        # LeRobot requires loading config from checkpoint when resuming
+        resume_config_path = latest_checkpoint / "pretrained_model" / "train_config.json"
+        if not resume_config_path.exists():
+            raise FileNotFoundError(
+                f"Cannot resume: train_config.json not found at {resume_config_path}. "
+                f"Please run training without --resume first."
+            )
+        print(f"Loading config from: {resume_config_path}")
+        
+        # Load the saved config from checkpoint
+        train_cfg = TrainPipelineConfig.from_pretrained(str(resume_config_path.parent))
+        
+        # Update fields that should change on resume
+        train_cfg.resume = True
+        train_cfg.steps = args.steps  # Allow extending training steps
+        train_cfg.wandb = wandb_cfg  # Update wandb config
+        train_cfg.checkpoint_path = latest_checkpoint
+        train_cfg.policy.pretrained_path = latest_checkpoint / "pretrained_model"
+        
+        print(f"  Loaded config, will continue training to {args.steps} steps")
+    else:
+        train_cfg = TrainPipelineConfig(
+            dataset=dataset_cfg,
+            policy=policy_cfg,
+            output_dir=checkpoint_dir,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            steps=args.steps,
+            log_freq=args.log_freq,
+            save_freq=args.save_freq,
+            save_checkpoint=True,
+            wandb=wandb_cfg,
+            resume=False,
+            eval_freq=0,
+        )
     
     # Print training info
     print("\n" + "=" * 60)
@@ -850,17 +872,27 @@ def train_with_lerobot_api(
     print("=" * 60 + "\n")
     
     # Run training with or without XYZ visualization
-    if args.enable_xyz_viz:
-        xyz_viz_dir = out_dir / "xyz_viz"
-        train_with_xyz_visualization(
-            train_cfg,
-            viz_save_freq=args.viz_save_freq,
-            xyz_viz_dir=xyz_viz_dir,
-            val_dataset_cfg=val_dataset_cfg,
-            val_freq=args.val_freq,
-        )
-    else:
-        train(train_cfg)
+    # Note: When resuming, we need to inject config_path into sys.argv for LeRobot's
+    # parser.parse_arg() to find it during validate()
+    import sys
+    original_argv = sys.argv.copy()
+    if resume_config_path is not None:
+        sys.argv = [sys.argv[0], f"--config_path={resume_config_path}"]
+    
+    try:
+        if args.enable_xyz_viz:
+            xyz_viz_dir = out_dir / "xyz_viz"
+            train_with_xyz_visualization(
+                train_cfg,
+                viz_save_freq=args.viz_save_freq,
+                xyz_viz_dir=xyz_viz_dir,
+                val_dataset_cfg=val_dataset_cfg,
+                val_freq=args.val_freq,
+            )
+        else:
+            train(train_cfg)
+    finally:
+        sys.argv = original_argv
     
     return {
         "output_dir": str(checkpoint_dir),

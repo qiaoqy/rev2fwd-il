@@ -21,10 +21,15 @@ CUDA_VISIBLE_DEVICES=0 python scripts/5_eval_diffusion.py \
     --num_episodes 5 --visualize_xyz --headless
 
 # With action chunk visualization
-CUDA_VISIBLE_DEVICES=0 python scripts/5_eval_diffusion.py \
-    --checkpoint runs/diffusion_A_goal/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_goal/videos \
-    --num_episodes 1 --visualize_action_chunk --headless
+CUDA_VISIBLE_DEVICES=4 python scripts/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_pick_place/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_pick_place/videos --horizon 1000 \
+    --num_episodes 1 --visualize_action_chunk --n_action_steps 16 --headless
+
+CUDA_VISIBLE_DEVICES=4 python scripts/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_pick_place/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_pick_place/videos --horizon 1000 \
+    --num_episodes 10 --n_action_steps 16 --headless
 
 =============================================================================
 VISUALIZATION OPTIONS
@@ -325,7 +330,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--horizon",
         type=int,
-        default=300,
+        default=1000,
         help="Max steps per episode.",
     )
     parser.add_argument(
@@ -857,6 +862,7 @@ def run_episode(
     
     steps = 0
     success = False
+    success_step = None  # Step at which success was first achieved
     last_action = None
     final_dist = None
 
@@ -1140,18 +1146,21 @@ def run_episode(
         dist_to_goal = np.linalg.norm(obj_xy - np.array(goal_xy))
         final_dist = dist_to_goal
         
-        # if dist_to_goal < success_radius:
-        #     success = True
-        #     print(f"  SUCCESS at step {t+1}! Distance: {dist_to_goal:.4f}m")
-        #     break
-            
-        # Early termination (but not success)
+        # Check if success achieved (first time only)
+        if not success and dist_to_goal < success_radius:
+            success = True
+            success_step = t + 1
+            print(f"  ✓ SUCCESS at step {t+1}! Distance: {dist_to_goal:.4f}m (continuing to complete horizon for debug)")
+        
+        # Continue execution even after success to complete full horizon for debugging
+        # Only break on early termination from environment
         if terminated[0] or truncated[0]:
             break
 
     return {
         "steps": steps,
         "success": success,
+        "success_step": success_step,  # Step at which success was first achieved (None if failed)
         "final_dist": final_dist,
         "last_action": None if last_action is None else last_action.detach().cpu().numpy(),
     }
@@ -1373,21 +1382,32 @@ def main() -> None:
             )
             
             writer.close()
+            
+            # Rename video file based on success/failure
+            if result['success']:
+                new_video_path = out_dir / f"ep{ep}_success.mp4"
+            else:
+                new_video_path = out_dir / f"ep{ep}_failed.mp4"
+            video_path.rename(new_video_path)
+            video_path = new_video_path
             video_paths.append(video_path)
             
             # Generate XYZ curves video if enabled
             if xyz_visualizer is not None:
-                xyz_video_path = xyz_visualizer.generate_video(filename_prefix="eval_xyz_curves")
+                suffix = "_success" if result['success'] else "_failed"
+                xyz_video_path = xyz_visualizer.generate_video(filename_prefix=f"eval_xyz_curves{suffix}")
                 xyz_video_paths.append(xyz_video_path)
             
             # Generate action chunk video if enabled
             if action_chunk_visualizer is not None:
-                action_chunk_video_path = action_chunk_visualizer.generate_video(filename_prefix="eval_action_chunk")
+                suffix = "_success" if result['success'] else "_failed"
+                action_chunk_video_path = action_chunk_visualizer.generate_video(filename_prefix=f"eval_action_chunk{suffix}")
                 action_chunk_video_paths.append(action_chunk_video_path)
             
             stats.append(result)
-            status = "SUCCESS" if result['success'] else "FAILED"
-            print(f"  Result: {status} | steps={result['steps']} | final_dist={result['final_dist']:.4f}m")
+            status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+            success_info = f" (achieved at step {result['success_step']})" if result['success_step'] else ""
+            print(f"  Result: {status}{success_info} | total_steps={result['steps']} | final_dist={result['final_dist']:.4f}m")
             print(f"  Video saved: {video_path}")
             if xyz_visualizer is not None:
                 print(f"  XYZ curves saved: {xyz_video_path}")
