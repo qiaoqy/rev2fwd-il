@@ -12,7 +12,7 @@ conda create -n rev2fwd_il python=3.11
 conda activate rev2fwd_il
 pip install -U torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install isaaclab[isaacsim,all]==2.3.0 --extra-index-url https://pypi.nvidia.com
-pip install wandb lerobot==0.4.2
+pip install wandb==0.24.0 lerobot==0.4.2
 pip install -e ./isaaclab_tasks
 pip install -e .
 ```

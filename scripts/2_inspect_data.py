@@ -15,11 +15,11 @@ USAGE EXAMPLES
 python scripts/2_inspect_data.py --dataset data/B_2images_goal.npz
 
 # Specific episode and frame
-python scripts/2_inspect_data.py --dataset data/B_2images_goal.npz \
+python scripts/2_inspect_data.py --dataset data/B_pick_place.npz \
     --episode 5 --frame 50
 
 # With XYZ curve visualization
-python scripts/2_inspect_data.py --dataset data/B_2images_goal.npz \
+python scripts/2_inspect_data.py --dataset data/B_pick_place.npz \
     --enable_xyz_viz --episode 0
 
 =============================================================================

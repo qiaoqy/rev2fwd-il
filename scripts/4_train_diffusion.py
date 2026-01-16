@@ -16,6 +16,19 @@ NPZ file with episodes list, each dict containing:
     - action:        (T, 8)   Goal actions [ee_pose, gripper]
 
 =============================================================================
+TMUX BACKGROUND EXECUTION (Recommended for long training)
+=============================================================================
+# Create a new tmux session and run training in background
+tmux new -s train -d 'CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py --dataset data/A_pick_place.npz --out runs/diffusion_A_pick_place --steps 50000 --wandb'
+
+# Common tmux commands:
+#   tmux ls                  # List all sessions
+#   tmux a -t train          # Attach to session named "train"
+#   tmux kill-session -t train  # Kill session named "train"
+#   Ctrl+b d                 # Detach from current session (inside tmux)
+#   Ctrl+b [                 # Enter scroll mode (q to exit)
+
+=============================================================================
 USAGE EXAMPLES
 =============================================================================
 # Single GPU training
@@ -26,17 +39,17 @@ CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
     --include_obj_pose --wandb
 
 # Multi-GPU training
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 \
     scripts/4_train_diffusion.py \
-    --dataset data/A_2images_goal.npz \
-    --out runs/diffusion_A_goal \
+    --dataset data/A_pick_place.npz \
+    --out runs/diffusion_A_pick_place \
     --batch_size 64 --steps 50000 \
     --include_obj_pose --wandb
 
 # Data conversion only (for debugging)
-CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
-    --dataset data/A_2images_goal.npz \
-    --out runs/diffusion_A_goal \
+CUDA_VISIBLE_DEVICES=1 python scripts/4_train_diffusion.py \
+    --dataset data/A_pick_place.npz \
+    --out runs/diffusion_A_pick_place \
     --convert_only --include_obj_pose
 
 =============================================================================
@@ -214,14 +227,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log_freq",
         type=int,
-        default=100,
-        help="Log metrics every N steps. Default: 100.",
+        default=50,
+        help="Log metrics every N steps. Default: 50.",
     )
     parser.add_argument(
         "--save_freq",
         type=int,
-        default=500,
-        help="Save checkpoint every N steps. Default: 500.",
+        default=20000,
+        help="Save checkpoint every N steps. Default: 20000.",
     )
     parser.add_argument(
         "--resume",
@@ -237,8 +250,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--viz_save_freq",
         type=int,
-        default=200,
-        help="Save checkpoint and XYZ visualization every N steps. Default: 200.",
+        default=20000,
+        help="Save checkpoint and XYZ visualization every N steps. Default: 20000.",
     )
     parser.add_argument(
         "--enable_xyz_viz",
@@ -277,8 +290,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb_project",
         type=str,
-        default="rev2fwd-diffusion-B",
-        help="WandB project name. Default: rev2fwd-diffusion-B.",
+        default="rev2fwd-diffusion-pick-place-A",
+        help="WandB project name. Default: rev2fwd-diffusion-pick-place-A.",
     )
 
     # =========================================================================

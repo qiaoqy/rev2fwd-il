@@ -28,9 +28,9 @@ USAGE EXAMPLES
 python scripts/1_collect_data.py --headless --num_episodes 100
 
 # Production run (500 episodes with parallel envs)
-CUDA_VISIBLE_DEVICES=0 python scripts/1_collect_data.py \
-    --headless --num_episodes 500 --num_envs 256 \
-    --out data/B_2images_goal.npz
+CUDA_VISIBLE_DEVICES=1 python scripts/1_collect_data.py \
+    --headless --num_episodes 300 --num_envs 8 \
+    --out data/B_pick_place.npz
 
 =============================================================================
 """
