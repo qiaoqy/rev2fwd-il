@@ -1,110 +1,42 @@
 #!/usr/bin/env python3
-"""Build forward BC dataset with goal-based actions from reverse rollouts (from script 14).
+"""Step 3: Build forward training data by time-reversing reverse rollouts.
 
-This script extends 22_make_A_forward_dataset_with_images.py to handle goal-based action data.
-It processes reverse rollouts from Expert B (collected with script 14) and converts them into 
-forward training data, using the FSM state's goal action as the action label.
+This script processes reverse rollouts from script 1 (Task B: goal -> table) and
+converts them into forward training data (Task A: table -> goal) by reversing
+the trajectories in time.
 
 =============================================================================
-CORE IDEA: TIME REVERSAL WITH GOAL-BASED ACTIONS
+CORE IDEA: TIME REVERSAL
 =============================================================================
-When we reverse the trajectory in time, we need to properly handle the goal-based actions.
-
-In the REVERSE trajectory (Task B: goal -> table):
-    - Each FSM state has a GOAL position that the robot is moving TOWARD
-    - The action at each timestep is the goal of the current state
-    - Action changes abruptly at state transitions
-
-When we REVERSE to get FORWARD trajectory (Task A: table -> goal):
-    - The robot now moves from where Task B ended to where Task B started
-    - For each reversed segment, the action should be the DESTINATION of that segment
-    - This destination is the GOAL of the PREVIOUS state in the reversed order
-      (which was the NEXT state in the original order)
-
-Strategy:
-    For each timestep t in the reversed trajectory:
-    - Find what FSM state this timestep belonged to in the original trajectory
-    - The action should be the goal position of the NEXT state (in original order)
-    - At state boundaries, use the goal of the state we're transitioning TO
-    - This makes the reversed trajectory have "look-ahead" goal actions
-
-Alternative Strategy (simpler, used here):
-    - Use the action value right AFTER a state transition as the goal for that segment
-    - This is the first action of the next state, which is the goal of that next state
-    - For the last segment (returning to rest), use the rest_pose
+A reverse trajectory (goal -> table) when played backwards becomes a forward
+trajectory (table -> goal). This script:
+1. Reverses all sequences (obs, images, poses) in time
+2. Recomputes goal actions appropriate for forward execution
 
 =============================================================================
 INPUT/OUTPUT DATA FORMATS
 =============================================================================
-INPUT (from script 14_collect_B_with_goal_actions.py):
-    NPZ file with episodes list, each dict containing:
-    - obs:           (T, 36)  State observations (REVERSE order: goal -> table)
-    - images:        (T, H, W, 3)  RGB images (REVERSE order)
-    - wrist_images:  (T, H, W, 3)  Wrist camera RGB images (REVERSE order)
-    - ee_pose:       (T, 7)   EE poses (REVERSE order)
-    - obj_pose:      (T, 7)   Object poses (REVERSE order)
-    - action:        (T, 8)   Goal actions [x, y, z, qw, qx, qy, qz, gripper] (REVERSE order)
-    - gripper:       (T,)     Gripper actions (REVERSE order)
-    - fsm_state:     (T,)     FSM state at each timestep (int)
-    - place_pose:    (7,)     Place target (was Expert B's target)
-    - goal_pose:     (7,)     Goal position (plate center)
-    - success:       bool     Whether reverse task succeeded
+INPUT (from script 1_collect_data.py):
+    NPZ file with reverse trajectories (goal -> table)
 
 OUTPUT:
-    NPZ file with episodes list, each dict containing:
-    - obs:           (T-1, 36)  State observations (FORWARD order: table -> goal)
-    - images:        (T-1, H, W, 3)  RGB images (FORWARD order)
-    - wrist_images:  (T-1, H, W, 3)  Wrist camera RGB images (FORWARD order)
-    - ee_pose:       (T-1, 7)   EE poses (FORWARD order)
-    - obj_pose:      (T-1, 7)   Object poses (FORWARD order)
-    - action:        (T-1, 8)   Goal actions (FORWARD order, recomputed)
-    - gripper:       (T-1,)     Gripper actions (FORWARD order)
-    - fsm_state:     (T-1,)     FSM state (reversed order)
-    - place_pose:    (7,)     Original place target (now becomes start position)
-    - goal_pose:     (7,)     Goal position (plate center)
-    - success:       bool     Whether reverse task succeeded
-
-=============================================================================
-FSM STATE MAPPING (from script 14)
-=============================================================================
-Task B FSM states (reverse order: goal -> table):
-    1. REST             -> go to rest pose
-    2. GO_ABOVE_OBJ     -> go above object (at goal position)
-    3. GO_TO_OBJ        -> go down to object
-    4. CLOSE            -> close gripper
-    5. LIFT             -> lift object
-    6. GO_ABOVE_PLACE   -> go above place position
-    7. GO_TO_PLACE      -> go down to place position
-    8. LOWER_TO_RELEASE -> lower for release
-    9. OPEN             -> open gripper
-    10. LIFT_AFTER_RELEASE -> lift after release
-    11. RETURN_REST     -> return to rest
-    12. DONE            -> done
-
-When reversed for Task A (forward: table -> goal):
-    11 -> 10 -> 9 -> 8 -> 7 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1
-    
-    The robot now:
-    - Starts at rest
-    - Goes to table position (above, then down)
-    - Grasps object
-    - Lifts and moves to goal
-    - Places object at goal
-    - Returns to rest
+    NPZ file with forward trajectories (table -> goal)
+    Same format, but sequences are time-reversed.
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
 # Basic usage
-python scripts/23_make_A_forward_with_goal_actions.py \
+python scripts/3_make_forward_data.py \
     --input data/B_2images_goal.npz \
     --out data/A_2images_goal.npz
 
 # Only use successful episodes
-python scripts/23_make_A_forward_with_goal_actions.py \
+python scripts/3_make_forward_data.py \
     --input data/B_2images_goal.npz \
     --out data/A_2images_goal.npz \
     --success_only 1
+
 =============================================================================
 """
 

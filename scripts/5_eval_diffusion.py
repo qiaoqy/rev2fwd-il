@@ -1,99 +1,43 @@
 #!/usr/bin/env python3
-"""Evaluate and visualize the LeRobot Diffusion Policy in Isaac Lab.
+"""Step 5: Evaluate and visualize the trained Diffusion Policy in Isaac Lab.
 
-This script loads a diffusion policy trained by ``31_train_A_diffusion.py``
-and evaluates it on the forward pick-and-place task (cube starts at random
-table position -> place to the plate center). A camera is injected into the
-Isaac Lab scene (same as script 12) so the policy receives RGB + EE state.
-The RGB stream is recorded to an MP4 video.
+This script loads a diffusion policy trained by script 4 and evaluates it on
+the forward pick-and-place task. Video is recorded from the camera feed.
 
 =============================================================================
 OVERVIEW
 =============================================================================
-This script performs evaluation of a vision-based diffusion policy:
-- Input: RGB image (128x128) + EE pose (7D: position + quaternion)
-- Output: Action (8D: target EE pose + gripper command)
-- Task: Pick cube from random table position and place at goal (plate center)
+- Input: RGB image (128x128) + EE pose (7D)
+- Output: Action (8D: target EE pose + gripper)
+- Task: Pick cube from random table position and place at goal
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-# Basic evaluation (headless mode, 5 episodes, auto-saves ep0.mp4 to ep4.mp4)
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_2cam_3/videos \
-    --num_episodes 3 \
-    --visualize_xyz \
-    --headless
+# Basic evaluation
+CUDA_VISIBLE_DEVICES=0 python scripts/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_goal/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_goal/videos \
+    --num_episodes 5 --visualize_xyz --headless
 
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A_mark/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_mark/videos \
-    --num_episodes 3 \
-    --visualize_xyz \
-    --headless --horizon 2000 --n_action_steps 16
-
-# With action chunk visualization (shows model input and predicted 16-step chunk)
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A_mark/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_mark/videos \
-    --num_episodes 2 \
-    --visualize_action_chunk \
-    --headless --horizon 1000 --n_action_steps 16
-
-# With GUI visualization (for debugging)
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A/videos
-
-# Custom horizon and resolution
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A/videos \
-    --horizon 500 \
-    --image_width 128 \
-    --image_height 128 \
-    --headless
-
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A_2cam_overfit_2/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_2cam_overfit_2/videos     --num_episodes 3     --overfit \
-    --visualize_xyz     --headless
-
-CUDA_VISIBLE_DEVICES=1 python scripts/41_test_A_diffusion_visualize.py \
-    --checkpoint runs/diffusion_A_2cam_3/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_2cam_3/videos_train_set     --num_episodes 1 \
-    --visualize_xyz     --headless --horizon 2000 --n_action_steps 16 --init_obj_xy 0.5942 0.2070
-    
-=============================================================================
-CHECKPOINT STRUCTURE
-=============================================================================
-The checkpoint directory should contain:
-    - config.json              Policy configuration
-    - model.safetensors        Model weights
-    - policy_preprocessor.json (optional) Preprocessor config
-    - policy_postprocessor.json (optional) Postprocessor config
-    - *_normalizer_*.safetensors (optional) Normalization stats
+# With action chunk visualization
+CUDA_VISIBLE_DEVICES=0 python scripts/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_goal/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_goal/videos \
+    --num_episodes 1 --visualize_action_chunk --headless
 
 =============================================================================
 VISUALIZATION OPTIONS
 =============================================================================
---visualize_xyz:           Generates per-timestep XYZ curves showing EE pose and 
-                           single action over time. Saved to {out_dir}/xyz_curves/
-
---visualize_action_chunk:  Generates per-inference-step visualization showing:
-                           - Input: EE pose XYZ (raw and normalized), camera images
-                           - Output: Full predicted action chunk (16 steps) XYZ curves
-                           One frame per inference step. Saved to {out_dir}/action_chunks/
+--visualize_xyz:           Per-timestep XYZ curves of EE pose and action
+--visualize_action_chunk:  Per-inference visualization with input/output details
 
 =============================================================================
 NOTES
 =============================================================================
-- Video is encoded from camera frames (not viewer), works in headless mode.
-- The policy internally handles input normalization via LeRobot's normalizers.
-- Images are converted to float32 [0,1] before feeding to the policy.
-- First inference step may be slow due to CUDA JIT compilation.
-- Isaac Sim may hang during shutdown - use Ctrl+C if needed after video saves.
+- Video is recorded from camera frames (works in headless mode)
+- First inference may be slow due to CUDA JIT compilation
+- Isaac Sim may hang during shutdown - use Ctrl+C after video saves if needed
 """
 
 from __future__ import annotations

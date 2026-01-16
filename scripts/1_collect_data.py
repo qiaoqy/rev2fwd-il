@@ -1,67 +1,36 @@
 #!/usr/bin/env python3
-"""Collect reverse rollouts from Expert B with goal-based actions.
+"""Step 1: Collect reverse rollouts from Expert B with goal-based actions.
 
-This script extends 12_collect_B_with_images.py by recording the state machine's
-goal position as action instead of the next frame state. This produces more
-decisive/sharp action labels compared to smooth interpolated trajectories.
-
-=============================================================================
-KEY DIFFERENCE FROM SCRIPT 12
-=============================================================================
-In script 12:
-    - Action = expert.act() output = target pose for current state
-    - This is what the controller tries to reach, but may be far from current EE pose
-    
-In this script 14:
-    - Action = state machine's goal position for current state
-    - We directly record what the FSM is commanding at each timestep
-    - This creates sharper, more decisive action labels
-
-The goal positions for each FSM state are:
-    - REST: rest_pose
-    - GO_ABOVE_OBJ: above_obj_pos (object XY, hover_z)
-    - GO_TO_OBJ: at_obj_pos (object XY, object_z + grasp_offset)
-    - CLOSE: at_obj_pos
-    - LIFT: above_obj_pos
-    - GO_ABOVE_PLACE: above_place_pos (place XY, hover_z)
-    - GO_TO_PLACE: at_place_pos (place XY, place_z)
-    - LOWER_TO_RELEASE: release_pos (place XY, place_z + release_offset)
-    - OPEN: release_pos
-    - LIFT_AFTER_RELEASE: above_place_pos
-    - RETURN_REST: rest_pose
-    - DONE: rest_pose
+This script collects reverse trajectory data using an FSM-based expert policy.
+The expert performs Task B (goal -> table): picks cube from goal position and
+places it at a random table position.
 
 =============================================================================
 OUTPUT DATA FORMAT (NPZ file)
 =============================================================================
-For each episode i, the following arrays are saved:
-    - obs_i:           (T, 36)  Policy observation sequence (original state obs)
-    - images_i:        (T, H, W, 3)  RGB images from camera (uint8)
-    - wrist_images_i:  (T, H, W, 3)  RGB images from wrist camera (uint8)
-    - ee_pose_i:       (T, 7)   End-effector pose [x, y, z, qw, qx, qy, qz]
-    - obj_pose_i:      (T, 7)   Object (cube) pose [x, y, z, qw, qx, qy, qz]
-    - action_i:        (T, 8)   Goal action [x, y, z, qw, qx, qy, qz, gripper]
-    - gripper_i:       (T,)     Gripper action (+1=open, -1=close)
-    - fsm_state_i:     (T,)     FSM state at each timestep (int)
-    - place_pose_i:    (7,)     Target place position (random table position)
-    - goal_pose_i:     (7,)     Goal position (plate center, fixed)
-    - success_i:       bool     Whether cube ended up near target position
+For each episode, the following arrays are saved:
+    - obs:           (T, 36)  Policy observation sequence
+    - images:        (T, H, W, 3)  RGB images from table camera (uint8)
+    - wrist_images:  (T, H, W, 3)  RGB images from wrist camera (uint8)
+    - ee_pose:       (T, 7)   End-effector pose [x, y, z, qw, qx, qy, qz]
+    - obj_pose:      (T, 7)   Object (cube) pose
+    - action:        (T, 8)   Goal action [ee_pose, gripper]
+    - gripper:       (T,)     Gripper action (+1=open, -1=close)
+    - fsm_state:     (T,)     FSM state at each timestep (int)
+    - place_pose:    (7,)     Target place position (random table position)
+    - goal_pose:     (7,)     Goal position (plate center)
+    - success:       bool     Whether cube ended up near target position
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
 # Basic usage (headless mode, 100 episodes)
-python scripts/14_collect_B_with_goal_actions.py --headless --num_episodes 100
+python scripts/1_collect_data.py --headless --num_episodes 100
 
-# Custom resolution and output path
-python scripts/14_collect_B_with_goal_actions.py --headless --num_episodes 50 \
-    --image_width 256 --image_height 256 --out data/B_goal_actions.npz
-
-CUDA_VISIBLE_DEVICES=2 python scripts/14_collect_B_with_goal_actions.py \
-    --headless --num_episodes 500 --num_envs 256 --out data/B_goal_actions_500.npz
-
-CUDA_VISIBLE_DEVICES=3 python scripts/14_collect_B_with_goal_actions.py \
-    --headless --num_episodes 40 --num_envs 8 --out data/B_2images_goal.npz
+# Production run (500 episodes with parallel envs)
+CUDA_VISIBLE_DEVICES=0 python scripts/1_collect_data.py \
+    --headless --num_episodes 500 --num_envs 256 \
+    --out data/B_2images_goal.npz
 
 =============================================================================
 """

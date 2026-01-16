@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Inspect collected image data from Expert B rollouts.
+"""Step 2: Inspect and visualize collected trajectory data.
 
-This script provides utilities to inspect the data collected by script 12:
+This script provides utilities to inspect the data collected by script 1:
 1. Extract a single frame and save as PNG image + JSON metadata
 2. Compile an episode's image sequence into an MP4 video
 3. Generate XYZ curve visualization video (optional)
@@ -9,46 +9,18 @@ This script provides utilities to inspect the data collected by script 12:
 The inspection data is saved in a timestamped folder under data/ for easy management.
 
 =============================================================================
-OBSERVATION VECTOR (36-dim) EXPLANATION for Isaac-Lift-Cube-Franka-IK-Abs-v0
-=============================================================================
-The 36-dimensional observation vector is a concatenation of several terms,
-as defined in isaaclab_tasks.manager_based.manipulation.lift.lift_env_cfg.ObservationsCfg.PolicyCfg.
-
-| Index   | Dim | Field                 | Description                            |
-|---------|-----|-----------------------|----------------------------------------|
-| 0-8     |  9  | joint_pos_rel         | Joint positions relative to default    |
-| 9-17    |  9  | joint_vel_rel         | Joint velocities                       |
-| 18-20   |  3  | object_position       | Object XYZ in robot root frame         |
-| 21-27   |  7  | target_object_position| Target pose (pos_xyz + quat_wxyz)      |
-| 28-35   |  8  | last_action           | Previous action (ee_pose + gripper)    |
-
-Note: Quaternions are typically stored as [w, x, y, z].
-=============================================================================
-
 USAGE EXAMPLES
 =============================================================================
-# Extract frame 0 from episode 0 and create video
-python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz
+# Basic inspection (episode 0, frame 0)
+python scripts/2_inspect_data.py --dataset data/B_2images_goal.npz
 
-# Extract specific frame and episode
-python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
+# Specific episode and frame
+python scripts/2_inspect_data.py --dataset data/B_2images_goal.npz \
     --episode 5 --frame 50
 
-# Custom output name and video fps
-python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
-    --name my_inspection --fps 30
-
-# Enable XYZ curve visualization
-python scripts/13_inspect_B_images.py --dataset data/B_with_images_latest.npz \\
-    --enable_xyz_viz --stats_json runs/diffusion_A_2cam_3/lerobot_dataset/meta/stats.json
-
-python scripts/13_inspect_B_images.py --dataset data/B_2images_mark.npz \
-    --enable_xyz_viz --stats_json runs/diffusion_A_2cam_3/lerobot_dataset/meta/stats.json \
-    --name B_2images_mark --episode 200
-
-python scripts/13_inspect_B_images.py --dataset data/A_2images_mark.npz \
-    --enable_xyz_viz --stats_json runs/diffusion_A_mark/lerobot_dataset/meta/stats.json \
-    --name A_2images_mark --episode 200
+# With XYZ curve visualization
+python scripts/2_inspect_data.py --dataset data/B_2images_goal.npz \
+    --enable_xyz_viz --episode 0
 
 =============================================================================
 """
