@@ -4,3 +4,4 @@ runs/*
 __pycache__/*
 scripts/train_dp_zarr.py
 scripts/eval_cube_sm_trg_pos_dp_normcheck.py
+scripts_archive/*
