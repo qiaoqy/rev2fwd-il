@@ -241,7 +241,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # Use similar camera position as pick_place task but adjusted for FORGE workspace
     # Place camera further back to capture full workspace including table
     camera_eye = (0.7, 0.2, 0.2)      # Camera position: further back, right side, higher up
-    camera_lookat = (0.6, 0.0, 0.0)   # Look at: workspace center
+    camera_lookat = (0.6, 0.0, 0.1)   # Look at: workspace center
     
     camera_quat = compute_camera_quat_from_lookat(camera_eye, camera_lookat)
     
@@ -276,6 +276,14 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # Disable debug visualization markers if present
     if hasattr(env_cfg, 'commands') and hasattr(env_cfg.commands, 'object_pose'):
         env_cfg.commands.object_pose.debug_vis = False
+    
+    # =========================================================================
+    # Extend episode length to prevent auto-reset during data collection
+    # =========================================================================
+    # Default is 30s at 15Hz = 450 steps. We extend to allow horizon steps.
+    # Control freq = 120Hz (sim) / 8 (decimation) = 15Hz
+    # Set episode_length_s high enough to cover our horizon
+    env_cfg.episode_length_s = 120.0  # 120 seconds = 1800 steps at 15Hz
 
 
 def add_wrist_camera_post_creation(env, num_envs: int, image_width: int, image_height: int):
@@ -470,16 +478,25 @@ def make_forge_env_with_camera(
 
 
 class NutThreadingExpert:
-    """Simple scripted expert for nut threading task.
+    """Force-feedback scripted expert for nut threading task.
     
-    The expert follows a simple strategy:
-    1. Approach: Move down toward the bolt while maintaining alignment
-    2. Engage: Press down gently to engage the threads
-    3. Thread: Rotate in the threading direction while applying downward force
-    4. Done: Stop when fully threaded or force exceeds threshold
+    The expert follows a force-guided strategy for robust threading:
     
-    This is a simplified demonstration policy - real threading requires
-    more sophisticated force-based control.
+    PHASES:
+    0. APPROACH: Move down toward bolt until contact detected
+    1. SEARCH: Small spiral motion to find thread alignment
+    2. ENGAGE: Gentle rotation + downward pressure to catch threads
+    3. THREAD: Continuous rotation with force-guided downward motion
+    4. DONE: Stopped because torque too high (can't rotate further) or timeout
+    
+    KEY IMPROVEMENTS over simple time-based control:
+    - Force feedback to detect contact and thread engagement
+    - Spiral search pattern for alignment correction
+    - Adaptive pressure based on force readings
+    - Rotation gating based on vertical force (only rotate when engaged)
+    
+    This handles the FORGE dead zone issue by maintaining consistent
+    contact force above the dead zone threshold (~5N).
     """
     
     def __init__(
@@ -488,14 +505,36 @@ class NutThreadingExpert:
         device: str,
         rotation_speed: float = 0.5,
         downward_force: float = 5.0,
+        # Force thresholds
+        contact_force_threshold: float = 2.0,    # Force to detect initial contact
+        engage_force_threshold: float = 6.0,     # Force indicating thread engagement
+        max_force_threshold: float = 25.0,       # Max force before backing off
+        # Search parameters
+        search_radius: float = 0.005,            # Spiral search radius (5mm, increased for faster coverage)
+        search_speed: float = 4.0,               # Angular speed of spiral (rad/s, doubled for speed)
+        # Threading parameters  
+        thread_rotation_speed: float = 1.0,      # Yaw action during threading (max speed)
+        thread_downward_action: float = -0.2,    # Z action during threading
+        # Torque threshold for completion
+        max_torque_threshold: float = 3.0,       # Max Z-torque before stopping (Nm, increased from 1.5)
+        # Engagement parameters
+        engage_rotation_speed: float = 0.4,      # Rotation during engage (faster than before)
+        reverse_rotation_steps: int = 15,        # Steps to reverse-rotate to find thread start
     ):
-        """Initialize the nut threading expert.
+        """Initialize the nut threading expert with force feedback.
         
         Args:
             num_envs: Number of parallel environments.
             device: Torch device.
             rotation_speed: Angular velocity for threading (rad/s).
             downward_force: Target downward force during threading (N).
+            contact_force_threshold: Force threshold to detect contact (N).
+            engage_force_threshold: Force threshold indicating thread engagement (N).
+            max_force_threshold: Maximum allowed force before easing pressure (N).
+            search_radius: Radius of spiral search pattern (m).
+            search_speed: Angular speed of spiral search (rad/s).
+            thread_rotation_speed: Yaw action value during threading phase.
+            thread_downward_action: Z action value during threading phase.
         """
         import torch
         
@@ -504,14 +543,72 @@ class NutThreadingExpert:
         self.rotation_speed = rotation_speed
         self.downward_force = downward_force
         
+        # Force thresholds
+        self.contact_force_threshold = contact_force_threshold
+        self.engage_force_threshold = engage_force_threshold
+        self.max_force_threshold = max_force_threshold
+        
+        # Search parameters
+        self.search_radius = search_radius
+        self.search_speed = search_speed
+        
+        # Threading parameters
+        self.thread_rotation_speed = thread_rotation_speed
+        self.thread_downward_action = thread_downward_action
+        self.max_torque_threshold = max_torque_threshold
+        self.engage_rotation_speed = engage_rotation_speed
+        self.reverse_rotation_steps = reverse_rotation_steps
+        
         # State tracking
         self.step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
         self.phase = torch.zeros(num_envs, dtype=torch.int32, device=device)
-        # Phases: 0=approach, 1=engage, 2=thread, 3=done
+        # Phases: 
+        #   0=approach, 1=search, 2=engage, 3=thread, 4=done
+        #   5=release (let go of nut), 6=reposition (rotate back to -1), 7=regrasp (grab nut again)
         
-        # Threading parameters
-        self.approach_steps = 50  # Steps to approach
-        self.engage_steps = 30   # Steps to engage threads
+        self.phase_step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        
+        # Search state
+        self.search_angle = torch.zeros(num_envs, device=device)
+        self.search_attempts = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        self.max_search_attempts = 3  # Number of spiral cycles (reduced for speed)
+        
+        # Engagement tracking
+        self.engage_step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        self.engage_success_steps = 10  # Steps of sustained engagement (reduced from 20)
+        
+        # Position tracking for progress detection
+        self.initial_z = torch.zeros(num_envs, device=device)
+        self.z_progress = torch.zeros(num_envs, device=device)
+        self.z_progress_total = torch.zeros(num_envs, device=device)  # Total Z progress across all cycles
+        self.last_z_progress = torch.zeros(num_envs, device=device)  # For stall detection
+        self.stall_counter = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        self.stall_threshold = 30  # Steps without progress before checking (reduced from 50)
+        self.min_progress_per_window = 0.001  # 1mm minimum progress in stall_threshold steps (increased from 0.5mm)
+        
+        # Phase timing limits
+        self.approach_timeout = 60     # Max steps in approach (reduced)
+        self.search_timeout = 100      # Max steps in search (reduced from 200)
+        self.engage_timeout = 60       # Max steps in engage attempt (reduced)
+        self.thread_timeout = 400      # Max steps in threading
+        self.release_timeout = 30      # Max steps in release phase
+        self.reposition_timeout = 60   # Max steps in reposition phase
+        self.regrasp_timeout = 60      # Max steps in regrasp phase
+        
+        # Debug: phase entry timestamps
+        self.phase_entry_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        
+        # IMPORTANT: Cumulative rotation target for FORGE environment
+        # FORGE uses target poses, not velocity commands!
+        # action[5] maps to yaw angle: [-1,1] -> [-180°, +90°]
+        # We need to gradually increase the target to achieve continuous rotation
+        self.cumulative_yaw_target = torch.zeros(num_envs, device=device)  # Normalized [-1, 1]
+        self.yaw_increment_per_step = 0.05  # How much to increment target per step
+        
+        # Multi-turn tracking
+        self.regrasp_count = torch.zeros(num_envs, dtype=torch.int32, device=device)  # How many times we've regripped
+        self.max_regrasp_cycles = 15  # Allow up to 15 regrasp cycles (~15 * 270° = 4050° = ~11 turns)
+        self.yaw_threshold_for_regrasp = 0.9  # When to trigger regrasp (close to +1.0 limit)
         
     def reset(self, env_ids=None):
         """Reset expert state for specified environments."""
@@ -522,6 +619,18 @@ class NutThreadingExpert:
         
         self.step_count[env_ids] = 0
         self.phase[env_ids] = 0
+        self.phase_step_count[env_ids] = 0
+        self.search_angle[env_ids] = 0.0
+        self.search_attempts[env_ids] = 0
+        self.engage_step_count[env_ids] = 0
+        self.initial_z[env_ids] = 0.0
+        self.z_progress[env_ids] = 0.0
+        self.z_progress_total[env_ids] = 0.0
+        self.last_z_progress[env_ids] = 0.0
+        self.stall_counter[env_ids] = 0
+        self.phase_entry_step[env_ids] = 0
+        self.cumulative_yaw_target[env_ids] = 0.0  # Reset rotation target
+        self.regrasp_count[env_ids] = 0  # Reset regrasp counter
     
     def compute_action(
         self,
@@ -529,20 +638,29 @@ class NutThreadingExpert:
         fingertip_quat: "torch.Tensor",
         fixed_pos: "torch.Tensor",
         force_sensor: "torch.Tensor",
+        torque_sensor: "torch.Tensor",
         dt: float,
     ) -> "torch.Tensor":
-        """Compute expert action based on current state.
+        """Compute expert action with force feedback control.
         
         The FORGE action space is 7D:
         - pos (3): Position target relative to bolt frame
         - rot (3): Rotation target (roll, pitch, yaw) 
         - success_pred (1): Success prediction output
         
+        Force feedback logic:
+        - APPROACH: Move down until force > contact_threshold
+        - SEARCH: Spiral pattern while pressing down, looking for thread catch
+        - ENGAGE: Small rotation + downward pressure, wait for force > engage_threshold
+        - THREAD: Continuous rotation + adaptive downward pressure
+        - DONE: Stop when Z-torque exceeds threshold (threading complete or jammed)
+        
         Args:
             fingertip_pos: Current fingertip position (num_envs, 3)
             fingertip_quat: Current fingertip quaternion (num_envs, 4)
             fixed_pos: Position of fixed asset (bolt) (num_envs, 3)
-            force_sensor: Force sensor readings (num_envs, 3)
+            force_sensor: Force sensor readings (num_envs, 3) [Fx, Fy, Fz]
+            torque_sensor: Torque sensor readings (num_envs, 3) [Tx, Ty, Tz]
             dt: Physics timestep
             
         Returns:
@@ -554,63 +672,410 @@ class NutThreadingExpert:
         # Initialize action
         action = torch.zeros(self.num_envs, 7, device=self.device)
         
-        # Position action: relative to bolt position
-        # For threading, we want to stay centered over the bolt
-        rel_pos = fingertip_pos - fixed_pos
-        
-        # Simple phase-based control
+        # Update counters
         self.step_count += 1
+        self.phase_step_count += 1
         
-        # Phase transitions
-        approach_done = self.step_count > self.approach_steps
-        engage_done = self.step_count > (self.approach_steps + self.engage_steps)
+        # Extract force components
+        # In FORGE, positive Fz typically means upward force (reaction to pressing down)
+        fz = force_sensor[:, 2]  # Vertical force
+        fxy = torch.norm(force_sensor[:, :2], dim=1)  # Lateral force magnitude
+        force_magnitude = torch.norm(force_sensor, dim=1)
         
-        self.phase = torch.where(
-            (self.phase == 0) & approach_done,
-            torch.ones_like(self.phase),  # -> engage
-            self.phase
-        )
-        self.phase = torch.where(
-            (self.phase == 1) & engage_done,
-            torch.full_like(self.phase, 2),  # -> thread
-            self.phase
-        )
+        # Extract torque components
+        tz = torque_sensor[:, 2]  # Z-axis torque (threading resistance)
         
-        # Phase 0: Approach - move down
-        approach_mask = self.phase == 0
+        # Current position relative to bolt
+        rel_pos = fingertip_pos - fixed_pos
+        current_z = fingertip_pos[:, 2]
+        
+        # =====================================================================
+        # IMPORTANT: Snapshot phase at start of step to prevent cascade transitions
+        # This ensures only ONE phase transition per step
+        # =====================================================================
+        phase_snapshot = self.phase.clone()
+        next_phase = self.phase.clone()  # Will be modified, applied at end
+        
+        # =====================================================================
+        # PHASE 0: APPROACH - Move down until contact detected
+        # =====================================================================
+        approach_mask = phase_snapshot == 0
         if approach_mask.any():
-            # Small downward motion
-            action[approach_mask, 0:3] = 0.0  # Stay centered
-            action[approach_mask, 2] = -0.1   # Move down slightly
+            # Move downward steadily
+            action[approach_mask, 0:2] = 0.0  # Stay centered XY
+            action[approach_mask, 2] = -0.3   # Move down
             action[approach_mask, 3:6] = 0.0  # No rotation
+            
+            # Record initial Z when first entering approach
+            first_step_mask = approach_mask & (self.phase_step_count == 1)
+            if first_step_mask.any():
+                self.initial_z[first_step_mask] = current_z[first_step_mask]
+            
+            # Transition to SEARCH when contact detected
+            contact_detected = approach_mask & (force_magnitude > self.contact_force_threshold)
+            next_phase = torch.where(contact_detected, torch.full_like(next_phase, 1), next_phase)
+            
+            # Timeout: move to search anyway after approach_timeout
+            timeout = approach_mask & (self.phase_step_count > self.approach_timeout)
+            next_phase = torch.where(timeout, torch.full_like(next_phase, 1), next_phase)
         
-        # Phase 1: Engage - press down gently
-        engage_mask = self.phase == 1
+        # =====================================================================
+        # PHASE 1: SEARCH - Spiral motion to find thread alignment
+        # =====================================================================
+        search_mask = phase_snapshot == 1
+        if search_mask.any():
+            # Reset initial_z when first entering search phase
+            first_step_search = search_mask & (self.phase_step_count == 1)
+            if first_step_search.any():
+                self.initial_z[first_step_search] = current_z[first_step_search]
+                self.search_angle[first_step_search] = 0.0
+                self.search_attempts[first_step_search] = 0
+            
+            # Update search angle
+            self.search_angle[search_mask] += self.search_speed * dt
+            
+            # Spiral pattern: increasing radius circles
+            # Reset angle when completing a circle
+            circle_complete = search_mask & (self.search_angle > 2 * np.pi)
+            if circle_complete.any():
+                self.search_angle[circle_complete] -= 2 * np.pi
+                self.search_attempts[circle_complete] += 1
+            
+            # Compute spiral offset (XY)
+            progress = self.search_attempts.float() / self.max_search_attempts
+            current_radius = self.search_radius * (0.5 + 0.5 * progress)  # Grow radius
+            
+            spiral_x = current_radius * torch.cos(self.search_angle)
+            spiral_y = current_radius * torch.sin(self.search_angle)
+            
+            # Action: spiral XY + stronger downward pressure
+            action[search_mask, 0] = spiral_x[search_mask] * 15.0  # Scale to action space (increased)
+            action[search_mask, 1] = spiral_y[search_mask] * 15.0
+            action[search_mask, 2] = -0.4   # Stronger downward pressure (increased from -0.25)
+            
+            # Larger rotation oscillation to help find thread
+            # Also include reverse rotation trick during search
+            rot_osc = 0.3 * torch.sin(self.search_angle * 2)  # Larger amplitude, slower frequency
+            action[search_mask, 5] = rot_osc[search_mask]
+            
+            # Transition to ENGAGE if we detect significant vertical force
+            # (indicating thread tips are touching)
+            engage_ready = search_mask & (fz.abs() > self.engage_force_threshold * 0.5)
+            next_phase = torch.where(engage_ready, torch.full_like(next_phase, 2), next_phase)
+            
+            # Also transition if Z has dropped (thread starting to catch)
+            # Use initial_z set at SEARCH phase entry, not APPROACH phase
+            z_dropped = search_mask & ((self.initial_z - current_z) > 0.002)
+            next_phase = torch.where(z_dropped, torch.full_like(next_phase, 2), next_phase)
+            
+            # Timeout: force transition to engage
+            timeout = search_mask & (self.phase_step_count > self.search_timeout)
+            next_phase = torch.where(timeout, torch.full_like(next_phase, 2), next_phase)
+        
+        # =====================================================================
+        # PHASE 2: ENGAGE - Try to catch threads with rotation + pressure
+        # =====================================================================
+        engage_mask = phase_snapshot == 2
         if engage_mask.any():
-            action[engage_mask, 0:3] = 0.0
-            action[engage_mask, 2] = -0.2   # Press down more
-            action[engage_mask, 3:6] = 0.0
+            # Reset engage counter on phase entry
+            first_step = engage_mask & (self.phase_step_count == 1)
+            if first_step.any():
+                self.engage_step_count[first_step] = 0
+                self.initial_z[first_step] = current_z[first_step]
+            
+            # Center on bolt + downward pressure + rotation
+            action[engage_mask, 0:2] = 0.0  # Center XY
+            action[engage_mask, 2] = -0.4   # Firm downward pressure (increased)
+            
+            # TRICK: Reverse-then-forward rotation to find thread start
+            # First few steps: rotate backwards (CCW) to find thread engagement point
+            # Then: rotate forwards (CW) to catch and start threading
+            # FORGE uses TARGET poses, so we increment cumulative target
+            is_reverse_phase = self.phase_step_count <= self.reverse_rotation_steps
+            yaw_delta = torch.where(
+                is_reverse_phase,
+                torch.full((self.num_envs,), -self.yaw_increment_per_step * 2, device=self.device),  # Reverse faster
+                torch.full((self.num_envs,), self.yaw_increment_per_step, device=self.device)       # Forward
+            )
+            self.cumulative_yaw_target = torch.where(
+                engage_mask,
+                (self.cumulative_yaw_target + yaw_delta).clamp(-1.0, 1.0),
+                self.cumulative_yaw_target
+            )
+            action[engage_mask, 5] = self.cumulative_yaw_target[engage_mask]
+            
+            # Check for successful engagement:
+            # 1. Sustained force above threshold
+            # 2. Z position is dropping (nut is threading down)
+            is_engaged = fz.abs() > self.engage_force_threshold
+            z_progress_engage = self.initial_z - current_z
+            is_progressing = z_progress_engage > 0.001  # At least 1mm progress
+            
+            # Count consecutive engaged steps
+            self.engage_step_count = torch.where(
+                engage_mask & is_engaged,
+                self.engage_step_count + 1,
+                torch.zeros_like(self.engage_step_count)
+            )
+            
+            # Transition to THREAD when engagement confirmed
+            confirmed_engage = engage_mask & (self.engage_step_count > self.engage_success_steps)
+            next_phase = torch.where(confirmed_engage, torch.full_like(next_phase, 3), next_phase)
+            
+            # Also transition if good progress regardless of force
+            good_progress = engage_mask & (z_progress_engage > 0.003)  # 3mm drop
+            next_phase = torch.where(good_progress, torch.full_like(next_phase, 3), next_phase)
+            
+            # If force too high without progress, back off to search
+            high_force_stuck = engage_mask & (fz.abs() > self.max_force_threshold) & (~is_progressing)
+            next_phase = torch.where(high_force_stuck, torch.full_like(next_phase, 1), next_phase)
+            
+            # Timeout
+            timeout = engage_mask & (self.phase_step_count > self.engage_timeout)
+            next_phase = torch.where(timeout, torch.full_like(next_phase, 3), next_phase)
         
-        # Phase 2: Thread - rotate while pressing down
-        thread_mask = self.phase == 2
+        # =====================================================================
+        # PHASE 3: THREAD - Continuous rotation with adaptive pressure
+        # =====================================================================
+        thread_mask = phase_snapshot == 3
         if thread_mask.any():
-            action[thread_mask, 0:3] = 0.0
-            action[thread_mask, 2] = -0.15  # Maintain downward pressure
-            # Yaw rotation for threading
-            # Action[5] is yaw, normalized to [-1, 1] range
-            # Maps to [-180, +90] degrees in FORGE
-            action[thread_mask, 5] = 0.3   # Rotate in threading direction
+            # Record starting Z on phase entry
+            first_step = thread_mask & (self.phase_step_count == 1)
+            if first_step.any():
+                self.initial_z[first_step] = current_z[first_step]
+                self.last_z_progress[first_step] = 0.0
+                self.stall_counter[first_step] = 0
+            
+            # Track threading progress (only for envs in thread phase)
+            z_progress_thread = self.initial_z - current_z
+            # Only update z_progress for thread phase envs
+            self.z_progress = torch.where(thread_mask, z_progress_thread, self.z_progress)
+            
+            # Stall detection: check if progress has stalled
+            # Every stall_threshold steps, check if we made minimum progress
+            check_stall = thread_mask & (self.phase_step_count % self.stall_threshold == 0) & (self.phase_step_count > 0)
+            if check_stall.any():
+                progress_delta = self.z_progress - self.last_z_progress
+                is_stalled = check_stall & (progress_delta < self.min_progress_per_window)
+                # If stalled and force is low (not engaged), go back to SEARCH
+                stall_and_low_force = is_stalled & (fz.abs() < self.engage_force_threshold * 0.8)
+                next_phase = torch.where(stall_and_low_force, torch.full_like(next_phase, 1), next_phase)
+                # Update last_z_progress for next check
+                self.last_z_progress = torch.where(check_stall, self.z_progress.clone(), self.last_z_progress)
+            
+            # Adaptive downward pressure based on force
+            # If force is low, press harder; if force is high, ease up
+            force_ratio = fz.abs() / self.engage_force_threshold
+            
+            # Base action: rotate + downward with small XY wobble to help find threads
+            # Small oscillation helps threads catch if slightly misaligned
+            wobble_freq = 2.0  # Hz
+            wobble_amp = 0.02  # Small amplitude
+            wobble_phase = self.phase_step_count.float() * wobble_freq * dt * 2 * 3.14159
+            action[thread_mask, 0] = wobble_amp * torch.sin(wobble_phase)[thread_mask]
+            action[thread_mask, 1] = wobble_amp * torch.cos(wobble_phase)[thread_mask]
+            
+            # Adaptive Z action: MUCH stronger pressure to ensure thread engagement
+            # Real threading requires significant downward force to overcome thread resistance
+            z_action = torch.where(
+                force_ratio < 0.5,
+                torch.full_like(fz, -0.8),    # Low force: press VERY hard
+                torch.where(
+                    force_ratio < 1.5,
+                    torch.full_like(fz, -0.6),  # Normal force: still press hard
+                    torch.full_like(fz, -0.3)   # High force: moderate pressure
+                )
+            )
+            action[thread_mask, 2] = z_action[thread_mask]
+            
+            # Check if force is too high BEFORE updating rotation target
+            too_high = thread_mask & (fz.abs() > self.max_force_threshold)
+            should_rotate = thread_mask & ~too_high
+            
+            # Rotation: FORGE uses TARGET poses, not velocity!
+            # We need to increment the target yaw gradually to achieve continuous rotation
+            # FORGE maps action[5] from [-1, 1] to [-180°, +90°] yaw angle
+            # Only increment if not in too_high state
+            self.cumulative_yaw_target = torch.where(
+                should_rotate,
+                (self.cumulative_yaw_target + self.yaw_increment_per_step).clamp(-1.0, 1.0),
+                self.cumulative_yaw_target  # Don't increment if force too high
+            )
+            action[thread_mask, 5] = self.cumulative_yaw_target[thread_mask]
+            
+            # If force gets too high, reduce downward pressure
+            if too_high.any():
+                action[too_high, 2] = -0.1  # Light pressure
+            
+            # =========== MULTI-TURN REGRASP LOGIC ===========
+            # When yaw target reaches threshold, trigger release-reposition-regrasp cycle
+            # This allows unlimited rotation (10+ turns) within FORGE's limited action space
+            needs_regrasp = thread_mask & (self.cumulative_yaw_target >= self.yaw_threshold_for_regrasp) & (self.regrasp_count < self.max_regrasp_cycles)
+            if needs_regrasp.any():
+                # Accumulate total z progress before releasing
+                self.z_progress_total = torch.where(needs_regrasp, 
+                                                     self.z_progress_total + self.z_progress,
+                                                     self.z_progress_total)
+                # Transition to RELEASE phase
+                next_phase = torch.where(needs_regrasp, torch.full_like(next_phase, 5), next_phase)
+            # =========== END MULTI-TURN REGRASP LOGIC ===========
+            
+            # Transition to DONE if torque too high AND we have made some progress
+            # (High torque alone is not enough - could just be initial contact resistance)
+            min_progress_for_torque_done = 0.003  # At least 3mm progress required
+            total_progress = self.z_progress_total + self.z_progress
+            high_torque = thread_mask & (tz.abs() > self.max_torque_threshold) & (total_progress > min_progress_for_torque_done)
+            next_phase = torch.where(high_torque, torch.full_like(next_phase, 4), next_phase)
+            
+            # Also transition to DONE if significant TOTAL progress made
+            # With regrasp, we can achieve much more than 12mm
+            target_total_progress = 0.040  # 40mm = ~10 turns on M8x1.25 thread
+            done = thread_mask & (total_progress > target_total_progress)
+            next_phase = torch.where(done, torch.full_like(next_phase, 4), next_phase)
+            
+            # Timeout
+            timeout = thread_mask & (self.phase_step_count > self.thread_timeout)
+            next_phase = torch.where(timeout, torch.full_like(next_phase, 4), next_phase)
         
-        # Success prediction: estimate based on how long we've been threading
-        thread_progress = (self.step_count - self.approach_steps - self.engage_steps).float()
-        thread_progress = thread_progress.clamp(min=0) / 200.0  # Normalize
-        action[:, 6] = thread_progress.clamp(max=1.0) * 2.0 - 1.0  # Scale to [-1, 1]
+        # =====================================================================
+        # PHASE 5: RELEASE - Lift up and open gripper to release nut
+        # =====================================================================
+        release_mask = phase_snapshot == 5
+        if release_mask.any():
+            # First step: record that we're starting a regrasp cycle
+            first_step = release_mask & (self.phase_step_count == 1)
+            if first_step.any():
+                self.regrasp_count[first_step] += 1
+            
+            # Lift up to create clearance, maintain current yaw
+            action[release_mask, 0:2] = 0.0  # Stay centered XY
+            action[release_mask, 2] = 0.5    # Move UP
+            action[release_mask, 3:5] = 0.0  # No roll/pitch change
+            action[release_mask, 5] = self.cumulative_yaw_target[release_mask]  # Keep yaw
+            action[release_mask, 6] = -1.0   # OPEN GRIPPER (release nut)
+            
+            # After some steps, transition to REPOSITION
+            lifted_enough = release_mask & (self.phase_step_count > self.release_timeout)
+            next_phase = torch.where(lifted_enough, torch.full_like(next_phase, 6), next_phase)
+        
+        # =====================================================================
+        # PHASE 6: REPOSITION - Rotate yaw back to starting position (-1.0)
+        # =====================================================================
+        reposition_mask = phase_snapshot == 6
+        if reposition_mask.any():
+            # Keep lifted, rotate yaw back towards -1.0 (starting position)
+            action[reposition_mask, 0:2] = 0.0  # Stay centered XY
+            action[reposition_mask, 2] = 0.3    # Stay lifted
+            action[reposition_mask, 3:5] = 0.0  # No roll/pitch change
+            action[reposition_mask, 6] = -1.0   # Keep gripper OPEN
+            
+            # Decrement yaw target back towards -0.8 (leave some margin from -1.0)
+            # Use larger steps for faster repositioning
+            reposition_yaw_step = 0.08
+            self.cumulative_yaw_target = torch.where(
+                reposition_mask,
+                (self.cumulative_yaw_target - reposition_yaw_step).clamp(-0.8, 1.0),
+                self.cumulative_yaw_target
+            )
+            action[reposition_mask, 5] = self.cumulative_yaw_target[reposition_mask]
+            
+            # Transition to REGRASP when yaw is back near starting position
+            yaw_repositioned = reposition_mask & (self.cumulative_yaw_target <= -0.75)
+            next_phase = torch.where(yaw_repositioned, torch.full_like(next_phase, 7), next_phase)
+            
+            # Timeout: force transition
+            timeout = reposition_mask & (self.phase_step_count > self.reposition_timeout)
+            next_phase = torch.where(timeout, torch.full_like(next_phase, 7), next_phase)
+        
+        # =====================================================================
+        # PHASE 7: REGRASP - Descend and close gripper to regrasp nut
+        # =====================================================================
+        regrasp_mask = phase_snapshot == 7
+        if regrasp_mask.any():
+            # Descend towards nut
+            action[regrasp_mask, 0:2] = 0.0  # Stay centered XY
+            action[regrasp_mask, 3:5] = 0.0  # No roll/pitch change
+            action[regrasp_mask, 5] = self.cumulative_yaw_target[regrasp_mask]  # Keep yaw
+            
+            # Two sub-phases: descend, then close gripper
+            descend_steps = self.regrasp_timeout // 2
+            is_descending = self.phase_step_count <= descend_steps
+            
+            # Descend phase: move down with open gripper
+            action[regrasp_mask, 2] = torch.where(
+                is_descending[regrasp_mask],
+                torch.full((regrasp_mask.sum(),), -0.4, device=self.device),
+                torch.full((regrasp_mask.sum(),), -0.2, device=self.device)  # Lighter when closing
+            )
+            action[regrasp_mask, 6] = torch.where(
+                is_descending[regrasp_mask],
+                torch.full((regrasp_mask.sum(),), -1.0, device=self.device),  # Open during descend
+                torch.full((regrasp_mask.sum(),), 1.0, device=self.device)    # Close to grasp
+            )
+            
+            # Transition back to THREAD after completing regrasp
+            regrasp_done = regrasp_mask & (self.phase_step_count > self.regrasp_timeout)
+            if regrasp_done.any():
+                # Reset z_progress for the new threading cycle (keeping z_progress_total)
+                self.z_progress[regrasp_done] = 0.0
+                self.initial_z[regrasp_done] = current_z[regrasp_done]
+            next_phase = torch.where(regrasp_done, torch.full_like(next_phase, 3), next_phase)
+        
+        # =====================================================================
+        # PHASE 4: DONE - Maintain position
+        # =====================================================================
+        done_mask = phase_snapshot == 4
+        if done_mask.any():
+            action[done_mask, 0:6] = 0.0  # Hold position
+        
+        # =====================================================================
+        # Apply phase transitions (only one transition per step)
+        # =====================================================================
+        phase_changed = next_phase != phase_snapshot
+        if phase_changed.any():
+            self.phase = next_phase
+            # Reset phase step count for environments that changed phase
+            self.phase_step_count = torch.where(phase_changed, 
+                                                 torch.zeros_like(self.phase_step_count),
+                                                 self.phase_step_count)
+            self.phase_entry_step = torch.where(phase_changed,
+                                                 self.step_count,
+                                                 self.phase_entry_step)
+        
+        # =====================================================================
+        # Success prediction
+        # =====================================================================
+        # Estimate based on phase and progress
+        is_threading = (self.phase >= 3).float()
+        progress_normalized = (self.z_progress / 0.015).clamp(0, 1)
+        success_estimate = 0.3 * is_threading + 0.7 * progress_normalized
+        action[:, 6] = success_estimate * 2.0 - 1.0  # Scale to [-1, 1]
         
         return action
     
     def is_done(self) -> "torch.Tensor":
         """Check which environments have completed the task."""
-        return self.phase >= 3
+        # Only phase 4 (DONE) is truly done
+        # Phases 5-7 (RELEASE, REPOSITION, REGRASP) are part of multi-turn cycling
+        return self.phase == 4
+    
+    def get_phase_names(self) -> list:
+        """Return human-readable phase names for debugging."""
+        return ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE", "RELEASE", "REPOSITION", "REGRASP"]
+    
+    def get_debug_info(self) -> dict:
+        """Return debug information for monitoring."""
+        return {
+            "phase": self.phase.cpu().numpy(),
+            "step_count": self.step_count.cpu().numpy(),
+            "phase_step_count": self.phase_step_count.cpu().numpy(),
+            "search_attempts": self.search_attempts.cpu().numpy(),
+            "engage_step_count": self.engage_step_count.cpu().numpy(),
+            "z_progress": self.z_progress.cpu().numpy(),
+            "z_progress_total": self.z_progress_total.cpu().numpy(),
+            "cumulative_yaw_target": self.cumulative_yaw_target.cpu().numpy(),
+            "regrasp_count": self.regrasp_count.cpu().numpy(),
+        }
 
 
 def rollout_nut_threading(
@@ -684,6 +1149,7 @@ def rollout_nut_threading(
     ft_force_lists = [[] for _ in range(num_envs)]
     ft_force_raw_lists = [[] for _ in range(num_envs)]
     joint_pos_lists = [[] for _ in range(num_envs)]
+    phase_lists = [[] for _ in range(num_envs)]  # Expert state machine phase
     
     # =========================================================================
     # Step 3: Run episode and record data
@@ -797,11 +1263,14 @@ def rollout_nut_threading(
         ee_pose = torch.cat([fingertip_pos, fingertip_quat], dim=-1)
         
         # Compute expert action
+        # Extract torque from raw sensor data (indices 3:6 are Tx, Ty, Tz)
+        ft_torque = ft_force_raw[:, 3:6]
         action = expert.compute_action(
             fingertip_pos=fingertip_pos,
             fingertip_quat=fingertip_quat,
             fixed_pos=bolt_pos,
             force_sensor=ft_force,
+            torque_sensor=ft_torque,
             dt=physics_dt,
         )
         
@@ -813,6 +1282,10 @@ def rollout_nut_threading(
         wrist_images_np_dict = {
             cam_name: wrist_images_by_cam[cam_name].cpu().numpy().astype(np.uint8)
             for cam_name in wrist_images_by_cam
+        }
+        # Get current phase from expert
+        phase_np = expert.phase.cpu().numpy().copy()
+        _ = {
         }
         ee_pose_np = ee_pose.cpu().numpy()
         nut_pose_np = nut_pose.cpu().numpy()
@@ -836,6 +1309,7 @@ def rollout_nut_threading(
             ft_force_lists[i].append(ft_force_np[i])
             ft_force_raw_lists[i].append(ft_force_raw_np[i])
             joint_pos_lists[i].append(joint_pos_np[i])
+            phase_lists[i].append(phase_np[i])
         
         # Step environment
         if t == 0:
@@ -846,11 +1320,30 @@ def rollout_nut_threading(
             print(f"[DEBUG] rollout: env.step returned successfully")
             print(f"[DEBUG] rollout: reward: {reward}, terminated: {terminated}, truncated: {truncated}")
         
-        # Check for resets (environment may auto-reset on success)
+        # Debug: Print state machine status periodically
+        if (t + 1) % 1 == 0:
+            phase_names = expert.get_phase_names()
+            debug_info = expert.get_debug_info()
+            for i in range(min(num_envs, 2)):  # Only print first 2 envs
+                phase_idx = int(debug_info["phase"][i])
+                phase_name = phase_names[phase_idx] if phase_idx < len(phase_names) else "UNKNOWN"
+                fz_val = ft_force_np[i, 2]
+                tz_val = ft_force_raw_np[i, 5]  # Z-axis torque
+                ty_val = ft_force_raw_np[i, 4]  # Y-axis torque
+                z_prog = debug_info["z_progress"][i] * 1000  # mm
+                z_prog_total = debug_info["z_progress_total"][i] * 1000  # mm
+                yaw_target = debug_info["cumulative_yaw_target"][i]
+                regrasp_cnt = debug_info["regrasp_count"][i]
+                # Also print actual action values for debugging
+                act_z = action_np[i, 2]
+                act_yaw = action_np[i, 5]
+                print(f"[DEBUG] t={t+1} env{i}: phase={phase_name}, Fz={fz_val:.2f}N, Ty={ty_val:.3f}Nm, "
+                      f"z_prog={z_prog:.2f}mm, z_tot={z_prog_total:.2f}mm, yaw_tgt={yaw_target:.3f}, regrasp#{regrasp_cnt}")
+        
+        # Check for done status (but don't reset - we disabled auto-reset by extending episode length)
         done = terminated | truncated
         if done.any():
-            print(f"[DEBUG] Step {t+1}: {done.sum().item()} envs done")
-            # Don't break - let the episode continue for all data
+            print(f"[DEBUG] Step {t+1}: {done.sum().item()} envs signaled done (but continuing)")
     
     print("[DEBUG] rollout: Main loop finished")
     
@@ -880,6 +1373,8 @@ def rollout_nut_threading(
             "ft_force": np.array(ft_force_lists[i], dtype=np.float32),
             "ft_force_raw": np.array(ft_force_raw_lists[i], dtype=np.float32),
             "joint_pos": np.array(joint_pos_lists[i], dtype=np.float32),
+            "phase": np.array(phase_lists[i], dtype=np.int32),  # Expert state machine phase
+            "phase_names": ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE"],  # Phase name mapping
             "episode_length": len(obs_lists[i]),
             "success": False,  # Will be determined by inspection
             "success_threshold": success_threshold,

@@ -298,51 +298,153 @@ def create_video_with_overlay(
     output_path: Path,
     fps: int,
 ) -> None:
-    """Create video with force data overlay."""
+    """Create video with force/torque data overlay and phase annotation.
+    
+    Displays:
+    - Left: Camera image with current phase annotation
+    - Right top: Force plot (Fx, Fy, Fz) over time
+    - Right bottom: Torque plot (Tx, Ty, Tz) over time
+    - Phase colored background regions on plots
+    """
     import imageio
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     
     images = episode_data["images"]
-    ft_force = episode_data["ft_force"]
+    ft_force = episode_data["ft_force"]  # (T, 3)
+    ft_force_raw = episode_data["ft_force_raw"]  # (T, 6) - last 3 are torque
     ee_pose = episode_data["ee_pose"]
     T = len(images)
     
+    # Get phase data if available
+    phase_data = episode_data.get("phase", None)
+    phase_names = episode_data.get("phase_names", ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE"])
+    
+    # Phase colors for background shading
+    phase_colors = {
+        0: '#FFE4E1',  # APPROACH - light pink/red
+        1: '#E6E6FA',  # SEARCH - light lavender
+        2: '#FFFACD',  # ENGAGE - light yellow
+        3: '#98FB98',  # THREAD - light green
+        4: '#D3D3D3',  # DONE - light gray
+    }
+    
+    # Extract torque from raw data
+    ft_torque = ft_force_raw[:, 3:6] if ft_force_raw.shape[1] >= 6 else np.zeros((T, 3))
+    
     print(f"Creating video with overlay ({T} frames at {fps} fps)...")
+    if phase_data is not None:
+        print(f"  Phase data available: {len(phase_data)} timesteps")
+    else:
+        print(f"  Phase data NOT available (will not show phase)")
     
     frames_with_overlay = []
     
     for t in range(T):
-        # Create figure with image and data
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        # Create figure with image and data (3 subplots: image, force, torque)
+        fig = plt.figure(figsize=(14, 6))
         
-        # Left: Camera image
-        axes[0].imshow(images[t])
-        axes[0].set_title(f'Frame {t}/{T}')
-        axes[0].axis('off')
+        # Layout: [Image (left 40%)] [Force plot (right top 60%)] [Torque plot (right bottom 60%)]
+        ax_img = fig.add_axes([0.02, 0.1, 0.38, 0.8])  # Left: camera image
+        ax_force = fig.add_axes([0.45, 0.55, 0.52, 0.38])  # Right top: force
+        ax_torque = fig.add_axes([0.45, 0.1, 0.52, 0.38])  # Right bottom: torque
         
-        # Right: Force plot up to current time
-        ax_force = axes[1]
+        # Get current phase
+        current_phase = int(phase_data[t]) if phase_data is not None else -1
+        current_phase_name = phase_names[current_phase] if 0 <= current_phase < len(phase_names) else "UNKNOWN"
+        
+        # Left: Camera image with phase annotation
+        ax_img.imshow(images[t])
+        if phase_data is not None:
+            # Add phase label on image with colored background
+            phase_color = phase_colors.get(current_phase, '#FFFFFF')
+            ax_img.text(0.5, 0.95, f'Phase: {current_phase_name}',
+                       transform=ax_img.transAxes, fontsize=14, fontweight='bold',
+                       horizontalalignment='center', verticalalignment='top',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor=phase_color, 
+                                edgecolor='black', alpha=0.9))
+        ax_img.set_title(f'Frame {t}/{T}', fontsize=12)
+        ax_img.axis('off')
+        
+        # Add EE position text below image
+        ee_pos = ee_pose[t, :3]
+        ax_img.text(0.5, 0.02, f'EE: ({ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f})',
+                   transform=ax_img.transAxes, fontsize=9, horizontalalignment='center',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        # Helper function to add phase background shading
+        def add_phase_background(ax, phase_data, T, y_min, y_max):
+            if phase_data is None:
+                return
+            # Find phase transitions
+            phase_starts = [0]
+            phase_values = [int(phase_data[0])]
+            for i in range(1, len(phase_data)):
+                if phase_data[i] != phase_data[i-1]:
+                    phase_starts.append(i)
+                    phase_values.append(int(phase_data[i]))
+            phase_starts.append(len(phase_data))
+            
+            # Draw background rectangles for each phase region
+            for i in range(len(phase_values)):
+                start = phase_starts[i]
+                end = phase_starts[i + 1]
+                phase_val = phase_values[i]
+                color = phase_colors.get(phase_val, '#FFFFFF')
+                ax.axvspan(start, end, alpha=0.3, color=color, zorder=0)
+        
+        # Right top: Force plot
         time_range = np.arange(min(t + 1, T))
-        ax_force.plot(time_range, ft_force[:t + 1, 0], 'r-', label='Fx', linewidth=1)
-        ax_force.plot(time_range, ft_force[:t + 1, 1], 'g-', label='Fy', linewidth=1)
-        ax_force.plot(time_range, ft_force[:t + 1, 2], 'b-', label='Fz', linewidth=1)
-        ax_force.axvline(x=t, color='k', linestyle='--', alpha=0.5)
+        
+        # Add phase background shading to force plot
+        add_phase_background(ax_force, phase_data, T, ft_force.min() - 0.5, ft_force.max() + 0.5)
+        
+        ax_force.plot(time_range, ft_force[:t + 1, 0], 'r-', label='Fx', linewidth=1.5)
+        ax_force.plot(time_range, ft_force[:t + 1, 1], 'g-', label='Fy', linewidth=1.5)
+        ax_force.plot(time_range, ft_force[:t + 1, 2], 'b-', label='Fz', linewidth=1.5)
+        ax_force.axvline(x=t, color='k', linestyle='--', alpha=0.7, linewidth=1)
         ax_force.set_xlim(0, T)
         ax_force.set_ylim(ft_force.min() - 0.5, ft_force.max() + 0.5)
-        ax_force.set_xlabel('Time Step')
-        ax_force.set_ylabel('Force (N)')
-        ax_force.set_title('Force Sensor')
+        ax_force.set_ylabel('Force (N)', fontsize=10)
+        ax_force.set_title('Force Sensor (Fx, Fy, Fz)', fontsize=11)
         ax_force.legend(loc='upper right', fontsize=8)
-        ax_force.grid(True, alpha=0.3)
+        ax_force.grid(True, alpha=0.3, zorder=1)
+        ax_force.set_xticklabels([])  # Hide x labels since torque plot has them
         
-        # Add EE position text
-        ee_pos = ee_pose[t, :3]
-        ax_force.text(0.02, 0.98, f'EE: ({ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f})',
-                     transform=ax_force.transAxes, fontsize=8, verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # Add current force values annotation
+        ax_force.text(0.02, 0.95, f'Fz={ft_force[t, 2]:.2f}N',
+                     transform=ax_force.transAxes, fontsize=9, verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
         
-        plt.tight_layout()
+        # Right bottom: Torque plot
+        add_phase_background(ax_torque, phase_data, T, ft_torque.min() - 0.1, ft_torque.max() + 0.1)
+        
+        ax_torque.plot(time_range, ft_torque[:t + 1, 0], 'r-', label='Tx', linewidth=1.5)
+        ax_torque.plot(time_range, ft_torque[:t + 1, 1], 'g-', label='Ty', linewidth=1.5)
+        ax_torque.plot(time_range, ft_torque[:t + 1, 2], 'b-', label='Tz', linewidth=1.5)
+        ax_torque.axvline(x=t, color='k', linestyle='--', alpha=0.7, linewidth=1)
+        ax_torque.set_xlim(0, T)
+        # Handle case where torque data might be all zeros
+        torque_min = min(ft_torque.min(), -0.1)
+        torque_max = max(ft_torque.max(), 0.1)
+        ax_torque.set_ylim(torque_min - 0.1, torque_max + 0.1)
+        ax_torque.set_xlabel('Time Step', fontsize=10)
+        ax_torque.set_ylabel('Torque (Nm)', fontsize=10)
+        ax_torque.set_title('Torque Sensor (Tx, Ty, Tz)', fontsize=11)
+        ax_torque.legend(loc='upper right', fontsize=8)
+        ax_torque.grid(True, alpha=0.3, zorder=1)
+        
+        # Add current torque values annotation
+        ax_torque.text(0.02, 0.95, f'Tz={ft_torque[t, 2]:.3f}Nm',
+                      transform=ax_torque.transAxes, fontsize=9, verticalalignment='top',
+                      bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+        
+        # Add phase legend at the top if phase data available
+        if phase_data is not None:
+            legend_text = ' | '.join([f'{name}' for name in phase_names])
+            fig.text(0.72, 0.98, f'Phases: {legend_text}', fontsize=8,
+                    horizontalalignment='center', verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
         
         # Convert figure to image array
         canvas = FigureCanvasAgg(fig)
@@ -407,6 +509,33 @@ def print_episode_stats(episode_data: dict, episode_idx: int) -> None:
     print(f"  - Shape: {action.shape}")
     print(f"  - Position action range: [{action[:, :3].min():.3f}, {action[:, :3].max():.3f}]")
     print(f"  - Rotation action range: [{action[:, 3:6].min():.3f}, {action[:, 3:6].max():.3f}]")
+    
+    # Phase stats (if available)
+    phase_data = episode_data.get("phase", None)
+    phase_names = episode_data.get("phase_names", ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE"])
+    if phase_data is not None:
+        print(f"\nState Machine Phase:")
+        print(f"  - Shape: {phase_data.shape}")
+        # Count steps in each phase
+        for i, name in enumerate(phase_names):
+            count = np.sum(phase_data == i)
+            if count > 0:
+                print(f"  - {name}: {count} steps ({100*count/len(phase_data):.1f}%)")
+        # Final phase
+        final_phase = int(phase_data[-1])
+        final_name = phase_names[final_phase] if final_phase < len(phase_names) else "UNKNOWN"
+        print(f"  - Final phase: {final_name}")
+    else:
+        print(f"\nState Machine Phase: NOT AVAILABLE (data collected without phase tracking)")
+    
+    # Torque stats
+    ft_force_raw = episode_data.get("ft_force_raw", None)
+    if ft_force_raw is not None and ft_force_raw.shape[1] >= 6:
+        ft_torque = ft_force_raw[:, 3:6]
+        print(f"\nTorque Sensor:")
+        print(f"  - Tx: min={ft_torque[:, 0].min():.4f}, max={ft_torque[:, 0].max():.4f}, mean={ft_torque[:, 0].mean():.4f}")
+        print(f"  - Ty: min={ft_torque[:, 1].min():.4f}, max={ft_torque[:, 1].max():.4f}, mean={ft_torque[:, 1].mean():.4f}")
+        print(f"  - Tz: min={ft_torque[:, 2].min():.4f}, max={ft_torque[:, 2].max():.4f}, mean={ft_torque[:, 2].mean():.4f}")
     
     print(f"{'='*60}\n")
 
