@@ -32,11 +32,11 @@ USAGE EXAMPLES
 =============================================================================
 # Basic usage
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/6_test_alternating.py \
-    --policy_A runs/diffusion_A_circle/checkpoints/checkpoints/last/pretrained_model \
-    --policy_B runs/diffusion_B_circle/checkpoints/checkpoints/last/pretrained_model \
+    --policy_A runs/PP_A_circle/checkpoints/checkpoints/last/pretrained_model \
+    --policy_B runs/PP_B_circle/checkpoints/checkpoints/last/pretrained_model \
     --out_A data/rollout_A_circle_iter1.npz \
     --out_B data/rollout_B_circle_iter1.npz \
-    --max_cycles 50 --save_video --headless
+    --max_cycles 5 --save_video --visualize_action_chunk --action_chunk 16 --headless
 
 # With custom thresholds
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/6_test_alternating.py \
@@ -125,7 +125,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--horizon",
         type=int,
-        default=1000,
+        default=500,
         help="Maximum steps per task attempt.",
     )
     parser.add_argument(
@@ -969,22 +969,59 @@ class AlternatingTester:
                 success = True
                 success_step = t + 1
                 print(f"    [{task_name}] ✓ SUCCESS at step {t+1}")
-                # Continue for a few more steps to stabilize
-                for _ in range(20):
-                    # Get observation for recording
-                    table_rgb, wrist_rgb, ee_pose, obj_pose, _ = self._get_observation()
+                # Success! Execute 20 more frames and record them.
+                print(f"    [{task_name}] Recording 20 additional frames after success...")
+                for extra_t in range(20):
+                    # Get observation
+                    table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
+                    
+                    # Record data
                     images_list.append(table_rgb)
                     if wrist_rgb is not None:
                         wrist_images_list.append(wrist_rgb)
                     ee_pose_list.append(ee_pose)
                     obj_pose_list.append(obj_pose)
-                    action_list.append(action_np)  # Repeat last action
                     
                     # Record video frame
                     self.video_frames.append(table_rgb.copy())
-
-                    # Step with same action
+                    
+                    # Prepare policy input
+                    policy_inputs = self._prepare_policy_input(
+                        table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state,
+                        include_obj_pose=include_obj_pose,
+                        include_gripper=include_gripper,
+                        has_wrist=has_wrist,
+                    )
+                    
+                    # Preprocess
+                    if preprocessor is not None:
+                        policy_inputs = preprocessor(policy_inputs)
+                    
+                    # Get action from policy
+                    with torch.no_grad():
+                        action = policy.select_action(policy_inputs)
+                    
+                    # Postprocess (unnormalize)
+                    if postprocessor is not None:
+                        action = postprocessor(action)
+                    
+                    action_np = action[0].cpu().numpy()
+                    action_list.append(action_np)
+                    
+                    # Update gripper state from action
+                    self.current_gripper_state = float(action_np[7])
+                    
+                    # Execute action in environment
+                    action_t = action.to(self.device)
+                    num_envs = self.env.unwrapped.num_envs
+                    if action_t.ndim == 1:
+                        action_t = action_t.unsqueeze(0)
+                    if action_t.shape[0] == 1 and num_envs > 1:
+                        action_t = action_t.repeat(num_envs, 1)
+                    
                     self.env.step(action_t)
+                
+                # Now stop recording. Transition frames will be handled by the caller.
                 break
 
             # Print progress
@@ -1012,21 +1049,31 @@ class AlternatingTester:
         return episode_data, success
 
     def check_task_A_success(self) -> bool:
-        """Check if Task A succeeded (object lifted and at goal)."""
+        """Check if Task A succeeded (object placed on table at goal position).
+        
+        Success criteria:
+        - Object XY position is near the goal position (green marker)
+        - Object Z height is near table surface (similar to initial spawn height ~0.02-0.05)
+        - Gripper is open (object has been released)
+        """
         from rev2fwd_il.sim.scene_api import get_object_pose_w
 
         obj_pose = get_object_pose_w(self.env)[0].cpu().numpy()
         obj_z = obj_pose[2]
         obj_xy = obj_pose[:2]
 
-        # Check height
-        is_lifted = obj_z > self.height_threshold
+        # Check object is on the table (low z, similar to initial spawn height)
+        # Cube half-height is ~0.025m, so on-table z should be < 0.05m
+        is_on_table = obj_z < 0.05
 
         # Check distance to goal
         dist_to_goal = np.linalg.norm(obj_xy - self.goal_xy)
         is_at_goal = dist_to_goal < self.distance_threshold
 
-        return is_lifted and is_at_goal
+        # Check gripper is open (object released)
+        is_gripper_open = self.current_gripper_state > 0.5
+
+        return is_on_table and is_at_goal and is_gripper_open
 
     def check_task_B_success(self) -> bool:
         """Check if Task B succeeded (object placed at target position)."""
@@ -1087,6 +1134,71 @@ class AlternatingTester:
                 self.env,
             )
             print(f"    [Marker] Updated red place marker to: [{place_xy[0]:.3f}, {place_xy[1]:.3f}]")
+
+    def _run_transition(self, n_frames: int, policy, preprocessor, postprocessor,
+                         n_action_steps: int, include_obj_pose: bool, 
+                         include_gripper: bool, has_wrist: bool, task_name: str) -> None:
+        """Execute transition frames without recording data.
+        
+        This is used after a task succeeds to allow the robot to continue
+        moving before switching to the next task.
+        
+        Args:
+            n_frames: Number of frames to execute.
+            policy: The policy to use.
+            preprocessor: Preprocessor for policy input.
+            postprocessor: Postprocessor for policy output.
+            n_action_steps: Number of action steps per inference.
+            include_obj_pose: Whether to include obj_pose in state.
+            include_gripper: Whether to include gripper_state in state.
+            has_wrist: Whether policy expects wrist camera input.
+            task_name: Name of the task for logging.
+        """
+        print(f"    [{task_name}] Running {n_frames} transition frames (not recording)...")
+        
+        for t in range(n_frames):
+            # Get observation
+            table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
+            
+            # Record video frame (but not data)
+            self.video_frames.append(table_rgb.copy())
+            
+            # Prepare policy input
+            policy_inputs = self._prepare_policy_input(
+                table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state,
+                include_obj_pose=include_obj_pose,
+                include_gripper=include_gripper,
+                has_wrist=has_wrist,
+            )
+            
+            # Preprocess
+            if preprocessor is not None:
+                policy_inputs = preprocessor(policy_inputs)
+            
+            # Get action from policy
+            with torch.no_grad():
+                action = policy.select_action(policy_inputs)
+            
+            # Postprocess (unnormalize)
+            if postprocessor is not None:
+                action = postprocessor(action)
+            
+            action_np = action[0].cpu().numpy()
+            
+            # Update gripper state from action
+            self.current_gripper_state = float(action_np[7])
+            
+            # Execute action in environment
+            action_t = action.to(self.device)
+            num_envs = self.env.unwrapped.num_envs
+            if action_t.ndim == 1:
+                action_t = action_t.unsqueeze(0)
+            if action_t.shape[0] == 1 and num_envs > 1:
+                action_t = action_t.repeat(num_envs, 1)
+            
+            self.env.step(action_t)
+        
+        print(f"    [{task_name}] Transition complete.")
 
     def run_task_A(self) -> Tuple[dict, bool]:
         """Execute Task A (pick from table → place at goal)."""
@@ -1208,12 +1320,25 @@ class AlternatingTester:
                 print(f"  ✗ Task A FAILED at cycle {cycle + 1}")
                 break
             
-            # After Task A succeeds, sample a NEW place target for Task B
-            # This updates the red marker to a new random position
+            # After Task A succeeds:
+            # 1. Sample a NEW place target for Task B (update red marker)
             new_place_xy = self._sample_new_place_target()
             self._update_place_marker(new_place_xy)
+            
+            # 2. Run 100 transition frames with Policy A (not recording data)
+            self._run_transition(
+                n_frames=100,
+                policy=self.policy_A,
+                preprocessor=self.preprocessor_A,
+                postprocessor=self.postprocessor_A,
+                n_action_steps=self.n_action_steps_A,
+                include_obj_pose=self.include_obj_pose_A,
+                include_gripper=self.include_gripper_A,
+                has_wrist=self.has_wrist_A,
+                task_name="Task A (transition)",
+            )
 
-            # Execute Task B (pick from goal → place at red marker)
+            # 3. Execute Task B (pick from goal → place at red marker)
             print(f"  Running Task B (pick from goal → place at red marker)...")
             print(f"    Target: red marker at [{self.current_place_xy[0]:.3f}, {self.current_place_xy[1]:.3f}]")
             ep_B, success_B = self.run_task_B()
@@ -1222,6 +1347,21 @@ class AlternatingTester:
             if not success_B:
                 print(f"  ✗ Task B FAILED at cycle {cycle + 1}")
                 break
+            
+            # After Task B succeeds:
+            # Run 100 transition frames with Policy B (not recording data)
+            # Red marker position stays the same (will be used as start for next Task A)
+            self._run_transition(
+                n_frames=100,
+                policy=self.policy_B,
+                preprocessor=self.preprocessor_B,
+                postprocessor=self.postprocessor_B,
+                n_action_steps=self.n_action_steps_B,
+                include_obj_pose=self.include_obj_pose_B,
+                include_gripper=self.include_gripper_B,
+                has_wrist=self.has_wrist_B,
+                task_name="Task B (transition)",
+            )
 
             consecutive_success += 1
             print(f"  ✓ Cycle {cycle + 1} complete! Consecutive successes: {consecutive_success}")

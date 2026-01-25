@@ -561,6 +561,7 @@ def train_with_xyz_visualization(
     xyz_viz_dir: str | Path | None = None,
     val_dataset_cfg=None,
     val_freq: int = 500,
+    state_slice_end: int | None = None,
 ):
     """
     Train a policy with XYZ curve visualization.
@@ -569,6 +570,7 @@ def train_with_xyz_visualization(
     1. Checkpoint saving every viz_save_freq steps (default 200)
     2. XYZ curve visualization for debugging
     3. Validation loss computation and logging
+    4. State dimension slicing for training with subset of state features
     
     Args:
         cfg: A `TrainPipelineConfig` object containing all training configurations.
@@ -577,6 +579,8 @@ def train_with_xyz_visualization(
         xyz_viz_dir: Directory to save XYZ visualization videos. If None, uses output_dir/xyz_viz.
         val_dataset_cfg: Optional DatasetConfig for validation dataset.
         val_freq: Frequency (in steps) to compute validation loss.
+        state_slice_end: If set, slice observation.state to [:state_slice_end].
+                         Useful for training with subset of state without re-converting data.
     """
     cfg.validate()
 
@@ -616,6 +620,60 @@ def train_with_xyz_visualization(
 
     if not is_main_process:
         dataset = make_dataset(cfg)
+
+    # =========================================================================
+    # State slicing: modify dataset stats and add transform if needed
+    # =========================================================================
+    if state_slice_end is not None:
+        if is_main_process:
+            logging.info(f"Applying state slicing: observation.state[:, :, :{state_slice_end}]")
+        
+        # Create a transform that slices the state
+        def state_slice_transform(batch):
+            """Slice observation.state to the first state_slice_end dimensions."""
+            if "observation.state" in batch:
+                # batch["observation.state"] shape: (batch, n_obs_steps, state_dim)
+                batch["observation.state"] = batch["observation.state"][..., :state_slice_end]
+            return batch
+        
+        # Store original transform if any
+        original_transform = dataset.transform
+        
+        # Compose transforms
+        if original_transform is not None:
+            def combined_transform(batch):
+                batch = original_transform(batch)
+                return state_slice_transform(batch)
+            dataset.transform = combined_transform
+        else:
+            dataset.transform = state_slice_transform
+        
+        # Update dataset stats to reflect sliced state
+        if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'stats'):
+            stats = dataset.meta.stats
+            if "observation.state" in stats:
+                old_stats = stats["observation.state"]
+                new_stats = {}
+                for key, value in old_stats.items():
+                    if isinstance(value, torch.Tensor):
+                        new_stats[key] = value[..., :state_slice_end]
+                    elif isinstance(value, np.ndarray):
+                        new_stats[key] = value[..., :state_slice_end]
+                    else:
+                        new_stats[key] = value
+                stats["observation.state"] = new_stats
+                if is_main_process:
+                    logging.info(f"  Updated observation.state stats shape: {new_stats.get('mean', new_stats.get('min', 'N/A'))}")
+        
+        # Update features in metadata
+        if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'features'):
+            if "observation.state" in dataset.meta.features:
+                old_shape = dataset.meta.features["observation.state"].get("shape", None)
+                if old_shape is not None:
+                    new_shape = (state_slice_end,)
+                    dataset.meta.features["observation.state"]["shape"] = new_shape
+                    if is_main_process:
+                        logging.info(f"  Updated observation.state feature shape: {old_shape} -> {new_shape}")
 
     # Create environment for evaluation if configured
     eval_env = None
@@ -738,6 +796,26 @@ def train_with_xyz_visualization(
         val_cfg.dataset = val_dataset_cfg
         
         val_dataset = make_dataset(val_cfg)
+        
+        # Apply state slicing transform to validation dataset if needed
+        if state_slice_end is not None:
+            def val_state_slice_transform(batch):
+                """Slice observation.state to the first state_slice_end dimensions."""
+                if "observation.state" in batch:
+                    batch["observation.state"] = batch["observation.state"][..., :state_slice_end]
+                return batch
+            
+            original_val_transform = val_dataset.transform
+            if original_val_transform is not None:
+                def combined_val_transform(batch):
+                    batch = original_val_transform(batch)
+                    return val_state_slice_transform(batch)
+                val_dataset.transform = combined_val_transform
+            else:
+                val_dataset.transform = val_state_slice_transform
+            
+            if is_main_process:
+                logging.info(f"Applied state slicing to validation dataset: [:, :, :{state_slice_end}]")
         
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset,

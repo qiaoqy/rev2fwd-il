@@ -16,6 +16,46 @@ NPZ file with episodes list, each dict containing:
     - action:        (T, 8)   Goal actions [ee_pose, gripper]
 
 =============================================================================
+OBSERVATION STATE DIMENSION OPTIONS
+=============================================================================
+The observation.state can include different combinations of features:
+
+  Flags                                    | state_dim | Components
+  -----------------------------------------|-----------|---------------------------
+  (none)                                   |     7     | ee_pose(7)
+  --include_gripper                        |     8     | ee_pose(7) + gripper(1)
+  --include_obj_pose                       |    14     | ee_pose(7) + obj_pose(7)
+  --include_obj_pose --include_gripper     |    15     | ee_pose(7) + obj_pose(7) + gripper(1)
+
+Default: state_dim=7 (ee_pose only, no gripper in observation)
+
+NOTE: gripper state is always included in the ACTION output (8D), regardless of
+      whether it's in the observation state.
+
+=============================================================================
+STATE SLICING (Train with subset of state without re-conversion)
+=============================================================================
+If you have already converted a dataset with more state features (e.g., 15D),
+you can train with fewer features (e.g., 14D) WITHOUT re-converting data:
+
+# Example: Dataset was converted with --include_obj_pose --include_gripper (15D)
+#          But you want to train with only --include_obj_pose (14D)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/B_circle_200.npz \
+    --out runs/PP_B_circle_200_no_gripper \
+    --batch_size 64 --steps 50000 \
+    --include_obj_pose \
+    --skip_convert \
+    --wandb
+
+The script will automatically detect the mismatch and slice observation.state
+to the first N dimensions. Output will show:
+  [State Slicing] Training with subset of state features
+    Dataset state_dim: 15
+    Policy state_dim:  14
+    Will slice state to [:, :, :14]
+
+=============================================================================
 TMUX BACKGROUND EXECUTION (Recommended for long training)
 =============================================================================
 # Create a new tmux session and run training in background
@@ -31,57 +71,57 @@ tmux new -s train -d 'CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-# Single GPU training
-CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
+# Single GPU training (default: ee_pose only, state_dim=7)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_2images_goal.npz \
     --out runs/diffusion_A_goal \
-    --batch_size 64 --steps 50000 \
-    --include_obj_pose --wandb
+    --batch_size 64 --steps 50000 --wandb
+
+# With object pose (state_dim=14)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/B_circle.npz \
     --out runs/diffusion_B_circle \
     --batch_size 64 --steps 50000 \
-    --include_obj_pose --wandb --convert_only
+    --include_obj_pose --wandb
 
+# With object pose AND gripper in observation (state_dim=15)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/B_circle_200.npz \
     --out runs/PP_B_circle_200 \
     --batch_size 64 --steps 50000 \
-    --include_obj_pose --wandb --convert_only
-CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
-    --dataset data/A_circle_200.npz \
-    --out runs/PP_A_circle_200 \
-    --batch_size 64 --steps 50000 \
-    --include_obj_pose --wandb --convert_only
+    --include_obj_pose --include_gripper --wandb
 
 # Multi-GPU training (single job)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --nproc_per_node=5 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9 torchrun --nproc_per_node=10 \
     scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_circle.npz \
-    --out runs/diffusion_A_circle \
-    --batch_size 32 --steps 8000 \
-    --include_obj_pose --wandb
+    --out runs/PP_A_circle \
+    --batch_size 32 --steps 10000 \
+    --include_obj_pose --include_gripper --wandb \
+    --enable_xyz_viz --viz_save_freq 4000 \
+    --n_action_steps 16
+
 
 # Multi-GPU training (two jobs simultaneously - use different port and rdzv_id)
-CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 --master_port=29500 --rdzv_id=job1 \
+CUDA_VISIBLE_DEVICES=2,3,7 torchrun --nproc_per_node=3 --master_port=29500 --rdzv_id=job1 \
     scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_pick_place.npz \
     --out runs/PP_A_circle \
     --batch_size 64 --steps 200000 \
-    --include_obj_pose --wandb --resume
+    --include_obj_pose --wandb
 
 CUDA_VISIBLE_DEVICES=4,5,6 torchrun --nproc_per_node=3 --master_port=29501 --rdzv_id=job2 \
     scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/B_pick_place.npz \
     --out runs/PP_B_circle \
     --batch_size 64 --steps 200000 \
-    --include_obj_pose --wandb --resume
+    --include_obj_pose --wandb
 
 # Data conversion only (for debugging)
 CUDA_VISIBLE_DEVICES=1 python scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_pick_place.npz \
     --out runs/diffusion_A_pick_place \
-    --convert_only --include_obj_pose
+    --convert_only --include_obj_pose --include_gripper
 
 =============================================================================
 """
@@ -156,7 +196,13 @@ def _parse_args() -> argparse.Namespace:
         "--include_obj_pose",
         action="store_true",
         help="Include object pose (7D) in observation.state. "
-             "If enabled, state becomes 14D (ee_pose + obj_pose).",
+             "If enabled, state includes obj_pose.",
+    )
+    parser.add_argument(
+        "--include_gripper",
+        action="store_true",
+        help="Include gripper state (1D) in observation.state. "
+             "If enabled, state includes gripper open/close state. Default: False.",
     )
 
     # =========================================================================
@@ -389,6 +435,7 @@ def convert_npz_to_lerobot_format(
     force: bool = False,
     num_episodes: int = -1,
     include_obj_pose: bool = False,
+    include_gripper: bool = False,
     overfit: bool = False,
 ) -> tuple[int, int, bool, dict | None]:
     """Convert NPZ dataset (with goal actions) to LeRobot v3.0 format.
@@ -405,6 +452,7 @@ def convert_npz_to_lerobot_format(
         force: Force re-conversion even if dataset exists.
         num_episodes: Number of episodes to use. -1 means use all.
         include_obj_pose: Whether to include object pose in observation.state.
+        include_gripper: Whether to include gripper state in observation.state.
         overfit: Whether to extract overfit env init params from first episode.
         
     Returns:
@@ -516,17 +564,20 @@ def convert_npz_to_lerobot_format(
         raise ValueError("No episodes found in NPZ file!")
     
     # Get data dimensions from first episode
+    # State dim combinations:
+    #   - state_dim=7:  ee_pose(7) only
+    #   - state_dim=8:  ee_pose(7) + gripper(1)
+    #   - state_dim=14: ee_pose(7) + obj_pose(7)
+    #   - state_dim=15: ee_pose(7) + obj_pose(7) + gripper(1)
     ep0 = episodes[0]
+    state_names = ["ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz"]
+    state_dim = 7  # base: ee_pose (7)
     if include_obj_pose:
-        state_dim = 15  # ee_pose (7) + obj_pose (7) + gripper (1)
-        state_names = [
-            "ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz",
-            "obj_x", "obj_y", "obj_z", "obj_qw", "obj_qx", "obj_qy", "obj_qz",
-            "gripper",
-        ]
-    else:
-        state_dim = 8  # ee_pose (7) + gripper (1)
-        state_names = ["ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz", "gripper"]
+        state_dim += 7
+        state_names += ["obj_x", "obj_y", "obj_z", "obj_qw", "obj_qx", "obj_qy", "obj_qz"]
+    if include_gripper:
+        state_dim += 1
+        state_names += ["gripper"]
     action_dim = 8  # goal action: [x, y, z, qw, qx, qy, qz, gripper]
     
     print(f"  Table camera image shape: {image_shape} (H, W, C)")
@@ -535,7 +586,8 @@ def convert_npz_to_lerobot_format(
         print(f"  Wrist camera image shape: {wrist_shape} (H, W, C)")
     else:
         print(f"  Wrist camera: not available")
-    print(f"  State dim: {state_dim} (ee_pose + gripper{' + obj_pose' if include_obj_pose else ''})")
+    state_desc = "ee_pose" + (" + obj_pose" if include_obj_pose else "") + (" + gripper" if include_gripper else "")
+    print(f"  State dim: {state_dim} ({state_desc})")
     print(f"  Action dim: {action_dim} (goal ee_pose + gripper)")
     
     # Print FSM state distribution for first episode
@@ -628,11 +680,14 @@ def convert_npz_to_lerobot_format(
         for t in range(T):
             # Current observation
             img = images[t]  # (H, W, 3)
-            gripper_state = np.array([gripper_states[t]], dtype=np.float32)  # (1,)
+            # Build state based on include_obj_pose and include_gripper flags
+            state_parts = [ee_pose[t]]  # Always include ee_pose (7,)
             if include_obj_pose:
-                state = np.concatenate([ee_pose[t], obj_pose[t], gripper_state])  # (15,)
-            else:
-                state = np.concatenate([ee_pose[t], gripper_state])  # (8,)
+                state_parts.append(obj_pose[t])  # Add obj_pose (7,)
+            if include_gripper:
+                gripper_state = np.array([gripper_states[t]], dtype=np.float32)  # (1,)
+                state_parts.append(gripper_state)
+            state = np.concatenate(state_parts)
             
             # Action: use goal action directly from the dataset
             action = actions[t]  # (8,) [goal_x, goal_y, goal_z, goal_qw, goal_qx, goal_qy, goal_qz, gripper]
@@ -682,9 +737,11 @@ def train_with_lerobot_api(
     image_width: int,
     has_wrist: bool = False,
     include_obj_pose: bool = False,
+    include_gripper: bool = False,
     overfit_env_init: dict | None = None,
     train_episodes: list[int] | None = None,
     val_episodes: list[int] | None = None,
+    state_slice_end: int | None = None,
 ) -> dict:
     """Train using LeRobot's Python API.
     
@@ -695,9 +752,12 @@ def train_with_lerobot_api(
         image_width: Image width.
         has_wrist: Whether the dataset has wrist camera images.
         include_obj_pose: Whether object pose is included in observation.state.
+        include_gripper: Whether gripper state is included in observation.state.
         overfit_env_init: Optional dict with initial env params for overfit mode.
         train_episodes: List of episode indices for training (None = all).
         val_episodes: List of episode indices for validation (None = no validation).
+        state_slice_end: If set, slice observation.state to [:state_slice_end]. 
+                         Useful for training with subset of state without re-converting data.
         
     Returns:
         Dictionary with training results.
@@ -740,9 +800,17 @@ def train_with_lerobot_api(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Determine state dimension based on whether obj_pose is included
-    # Now includes gripper state: ee_pose(7) + gripper(1) [+ obj_pose(7)]
-    state_dim = 15 if include_obj_pose else 8
+    # Determine state dimension based on include_obj_pose and include_gripper
+    # State dim combinations:
+    #   - state_dim=7:  ee_pose(7) only
+    #   - state_dim=8:  ee_pose(7) + gripper(1)
+    #   - state_dim=14: ee_pose(7) + obj_pose(7)
+    #   - state_dim=15: ee_pose(7) + obj_pose(7) + gripper(1)
+    state_dim = 7  # base: ee_pose (7)
+    if include_obj_pose:
+        state_dim += 7
+    if include_gripper:
+        state_dim += 1
     
     # Configure input/output features for the policy
     input_features = {
@@ -890,6 +958,7 @@ def train_with_lerobot_api(
     print(f"  Image shape: ({image_height}, {image_width})")
     print(f"  Has wrist camera: {has_wrist}")
     print(f"  Include obj_pose: {include_obj_pose}")
+    print(f"  Include gripper: {include_gripper}")
     print(f"  State dim: {state_dim}")
     print(f"  Crop shape: {tuple(args.crop_shape)}")
     print(f"  Horizon: {args.horizon}")
@@ -925,9 +994,21 @@ def train_with_lerobot_api(
                 xyz_viz_dir=xyz_viz_dir,
                 val_dataset_cfg=val_dataset_cfg,
                 val_freq=args.val_freq,
+                state_slice_end=state_slice_end,
             )
         else:
-            train(train_cfg)
+            # For regular training without xyz viz, we need to use custom train if slicing
+            if state_slice_end is not None:
+                train_with_xyz_visualization(
+                    train_cfg,
+                    viz_save_freq=0,  # Disable viz
+                    xyz_viz_dir=None,
+                    val_dataset_cfg=val_dataset_cfg,
+                    val_freq=args.val_freq,
+                    state_slice_end=state_slice_end,
+                )
+            else:
+                train(train_cfg)
     finally:
         sys.argv = original_argv
     
@@ -997,6 +1078,7 @@ def main() -> None:
                 force=args.force_convert,
                 num_episodes=args.num_episodes,
                 include_obj_pose=args.include_obj_pose,
+                include_gripper=args.include_gripper,
                 overfit=args.overfit,
             )
             # Write metadata to a temp file so other processes can read it
@@ -1006,6 +1088,7 @@ def main() -> None:
                 "image_width": image_width,
                 "has_wrist": has_wrist,
                 "include_obj_pose": args.include_obj_pose,
+                "include_gripper": args.include_gripper,
                 "overfit_env_init": overfit_env_init,
             }
             with open(meta_file, "w") as f:
@@ -1062,6 +1145,44 @@ def main() -> None:
             print("Data conversion complete. Exiting (--convert_only flag).")
         return
     
+    # =========================================================================
+    # Check if state slicing is needed
+    # =========================================================================
+    # Read dataset's actual state_dim from metadata
+    meta_path = lerobot_dataset_dir / "meta" / "info.json"
+    dataset_state_dim = None
+    if meta_path.exists():
+        with open(meta_path, "r") as f:
+            info = json.load(f)
+        features = info.get("features", {})
+        if "observation.state" in features:
+            dataset_state_dim = features["observation.state"]["shape"][0]
+    
+    # Calculate expected state_dim based on training args
+    policy_state_dim = 7  # base: ee_pose (7)
+    if args.include_obj_pose:
+        policy_state_dim += 7
+    if args.include_gripper:
+        policy_state_dim += 1
+    
+    # Determine if we need to slice state
+    state_slice_end = None
+    if dataset_state_dim is not None and policy_state_dim < dataset_state_dim:
+        state_slice_end = policy_state_dim
+        if is_main_process:
+            print(f"\n{'='*60}")
+            print("[State Slicing] Training with subset of state features")
+            print(f"{'='*60}")
+            print(f"  Dataset state_dim: {dataset_state_dim}")
+            print(f"  Policy state_dim:  {policy_state_dim}")
+            print(f"  Will slice state to [:, :, :{state_slice_end}]")
+            print(f"{'='*60}\n")
+    elif dataset_state_dim is not None and policy_state_dim > dataset_state_dim:
+        raise ValueError(
+            f"Policy state_dim ({policy_state_dim}) > dataset state_dim ({dataset_state_dim}). "
+            f"Please re-convert the dataset with the correct flags or adjust training args."
+        )
+    
     # Compute train/val episode split
     train_episodes = None
     val_episodes = None
@@ -1109,9 +1230,11 @@ def main() -> None:
         image_width=image_width,
         has_wrist=has_wrist,
         include_obj_pose=args.include_obj_pose,
+        include_gripper=args.include_gripper,
         overfit_env_init=overfit_env_init,
         train_episodes=train_episodes,
         val_episodes=val_episodes,
+        state_slice_end=state_slice_end,
     )
     
     print("\n" + "=" * 60)
