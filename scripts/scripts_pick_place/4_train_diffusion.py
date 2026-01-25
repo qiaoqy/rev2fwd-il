@@ -37,17 +37,48 @@ CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
     --out runs/diffusion_A_goal \
     --batch_size 64 --steps 50000 \
     --include_obj_pose --wandb
-
-# Multi-GPU training
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 \
-    scripts/4_train_diffusion.py \
-    --dataset data/A_pick_place.npz \
-    --out runs/diffusion_A_pick_place \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/B_circle.npz \
+    --out runs/diffusion_B_circle \
     --batch_size 64 --steps 50000 \
+    --include_obj_pose --wandb --convert_only
+
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/B_circle_200.npz \
+    --out runs/PP_B_circle_200 \
+    --batch_size 64 --steps 50000 \
+    --include_obj_pose --wandb --convert_only
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/A_circle_200.npz \
+    --out runs/PP_A_circle_200 \
+    --batch_size 64 --steps 50000 \
+    --include_obj_pose --wandb --convert_only
+
+# Multi-GPU training (single job)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --nproc_per_node=5 \
+    scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/A_circle.npz \
+    --out runs/diffusion_A_circle \
+    --batch_size 32 --steps 8000 \
     --include_obj_pose --wandb
 
+# Multi-GPU training (two jobs simultaneously - use different port and rdzv_id)
+CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 --master_port=29500 --rdzv_id=job1 \
+    scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/A_pick_place.npz \
+    --out runs/PP_A_circle \
+    --batch_size 64 --steps 200000 \
+    --include_obj_pose --wandb --resume
+
+CUDA_VISIBLE_DEVICES=4,5,6 torchrun --nproc_per_node=3 --master_port=29501 --rdzv_id=job2 \
+    scripts/scripts_pick_place/4_train_diffusion.py \
+    --dataset data/B_pick_place.npz \
+    --out runs/PP_B_circle \
+    --batch_size 64 --steps 200000 \
+    --include_obj_pose --wandb --resume
+
 # Data conversion only (for debugging)
-CUDA_VISIBLE_DEVICES=1 python scripts/4_train_diffusion.py \
+CUDA_VISIBLE_DEVICES=1 python scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_pick_place.npz \
     --out runs/diffusion_A_pick_place \
     --convert_only --include_obj_pose
@@ -487,14 +518,15 @@ def convert_npz_to_lerobot_format(
     # Get data dimensions from first episode
     ep0 = episodes[0]
     if include_obj_pose:
-        state_dim = 14  # ee_pose (7) + obj_pose (7)
+        state_dim = 15  # ee_pose (7) + obj_pose (7) + gripper (1)
         state_names = [
             "ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz",
             "obj_x", "obj_y", "obj_z", "obj_qw", "obj_qx", "obj_qy", "obj_qz",
+            "gripper",
         ]
     else:
-        state_dim = 7  # ee_pose: [x, y, z, qw, qx, qy, qz]
-        state_names = ["ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz"]
+        state_dim = 8  # ee_pose (7) + gripper (1)
+        state_names = ["ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz", "gripper"]
     action_dim = 8  # goal action: [x, y, z, qw, qx, qy, qz, gripper]
     
     print(f"  Table camera image shape: {image_shape} (H, W, C)")
@@ -503,7 +535,7 @@ def convert_npz_to_lerobot_format(
         print(f"  Wrist camera image shape: {wrist_shape} (H, W, C)")
     else:
         print(f"  Wrist camera: not available")
-    print(f"  State dim: {state_dim} (ee_pose{' + obj_pose' if include_obj_pose else ''})")
+    print(f"  State dim: {state_dim} (ee_pose + gripper{' + obj_pose' if include_obj_pose else ''})")
     print(f"  Action dim: {action_dim} (goal ee_pose + gripper)")
     
     # Print FSM state distribution for first episode
@@ -585,6 +617,9 @@ def convert_npz_to_lerobot_format(
         actions = ep["action"]  # (T, 8) - GOAL ACTIONS from script 14
         wrist_images = ep.get("wrist_images", None)  # (T, H, W, 3) uint8 or None
         
+        # Get gripper states from action (last dimension)
+        gripper_states = actions[:, 7]  # (T,)
+        
         # =====================================================================
         # KEY DIFFERENCE: Use goal action directly instead of next frame state
         # =====================================================================
@@ -593,10 +628,11 @@ def convert_npz_to_lerobot_format(
         for t in range(T):
             # Current observation
             img = images[t]  # (H, W, 3)
+            gripper_state = np.array([gripper_states[t]], dtype=np.float32)  # (1,)
             if include_obj_pose:
-                state = np.concatenate([ee_pose[t], obj_pose[t]])  # (14,)
+                state = np.concatenate([ee_pose[t], obj_pose[t], gripper_state])  # (15,)
             else:
-                state = ee_pose[t]  # (7,)
+                state = np.concatenate([ee_pose[t], gripper_state])  # (8,)
             
             # Action: use goal action directly from the dataset
             action = actions[t]  # (8,) [goal_x, goal_y, goal_z, goal_qw, goal_qx, goal_qy, goal_qz, gripper]
@@ -705,7 +741,8 @@ def train_with_lerobot_api(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Determine state dimension based on whether obj_pose is included
-    state_dim = 14 if include_obj_pose else 7
+    # Now includes gripper state: ee_pose(7) + gripper(1) [+ obj_pose(7)]
+    state_dim = 15 if include_obj_pose else 8
     
     # Configure input/output features for the policy
     input_features = {

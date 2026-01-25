@@ -91,6 +91,11 @@ class PickPlaceExpertB:
         # wxyz format: [w, x, y, z] = [0, 1, 0, 0] represents 180° rotation around x-axis
         self.grasp_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device)
 
+        # Randomization parameters per environment (initialized in reset)
+        self.episode_hover_z = None  # (num_envs,)
+        self.above_obj_dxy = None    # (num_envs, 2)
+        self.above_place_dxy = None  # (num_envs, 2)
+
     def reset(
         self,
         ee_pose: torch.Tensor,
@@ -108,6 +113,19 @@ class PickPlaceExpertB:
         """
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
+
+        # Initialize randomization parameters if not present
+        if self.episode_hover_z is None:
+            self.episode_hover_z = torch.zeros(self.num_envs, device=self.device)
+            self.above_obj_dxy = torch.zeros(self.num_envs, 2, device=self.device)
+            self.above_place_dxy = torch.zeros(self.num_envs, 2, device=self.device)
+        
+        # Randomize parameters for reset environments
+        self.episode_hover_z[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(0.2, 0.3)
+        
+        # above_obj_dxy ~ Uniform(-0.005, 0.005) - very small noise to avoid collision
+        self.above_obj_dxy[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-0.005, 0.005)
+        self.above_place_dxy[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-0.005, 0.005)
 
         # Store rest pose
         if self.rest_pose is None:
@@ -153,8 +171,8 @@ class PickPlaceExpertB:
 
         # Above object position
         above_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
-        above_obj_pos[:, :2] = obj_xy
-        above_obj_pos[:, 2] = self.hover_z
+        above_obj_pos[:, :2] = obj_xy + self.above_obj_dxy
+        above_obj_pos[:, 2] = self.episode_hover_z
 
         # At object position (for grasping)
         at_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
@@ -163,8 +181,8 @@ class PickPlaceExpertB:
 
         # Above place position
         above_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
-        above_place_pos[:, :2] = self.place_pose[:, :2]
-        above_place_pos[:, 2] = self.hover_z
+        above_place_pos[:, :2] = self.place_pose[:, :2] + self.above_place_dxy
+        above_place_pos[:, 2] = self.episode_hover_z
 
         # At place position (approach height)
         at_place_pos = self.place_pose[:, :3].clone()

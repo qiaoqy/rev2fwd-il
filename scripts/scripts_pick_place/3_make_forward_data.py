@@ -27,16 +27,9 @@ OUTPUT:
 USAGE EXAMPLES
 =============================================================================
 # Basic usage
-python scripts/3_make_forward_data.py \
-    --input data/B_pick_place.npz \
-    --out data/A_pick_place.npz
-
-# Only use successful episodes
-python scripts/3_make_forward_data.py \
-    --input data/B_pick_place.npz \
-    --out data/A_pick_place.npz \
-    --success_only 1
-
+python scripts/scripts_pick_place/3_make_forward_data.py \
+    --input data/B_circle_200.npz \
+    --out data/A_circle_200.npz
 =============================================================================
 """
 

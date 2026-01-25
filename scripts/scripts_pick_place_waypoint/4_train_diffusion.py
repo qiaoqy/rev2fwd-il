@@ -32,11 +32,11 @@ tmux new -s train -d 'CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py
 USAGE EXAMPLES
 =============================================================================
 # Single GPU training
-CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
-    --dataset data/A_2images_goal.npz \
-    --out runs/diffusion_A_goal \
-    --batch_size 64 --steps 50000 \
-    --include_obj_pose --wandb
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place_waypoint/4_train_diffusion.py \
+    --dataset data/A_2images_mark.npz \
+    --out runs/diffusion_A_mark_v3 \
+    --batch_size 64 --steps 10000 \
+    --include_obj_pose --wandb   --convert_only
 
 # Multi-GPU training
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 \
@@ -339,13 +339,15 @@ def load_episodes_from_npz(path: str, num_episodes: int = -1) -> list[dict]:
     else:
         print(f"Loaded {len(episodes)} episodes from {path} in {load_time:.1f}s")
     
-    # Verify that the dataset has 'action' field (from script 14)
-    if len(episodes) > 0 and "action" not in episodes[0]:
-        raise ValueError(
-            f"Dataset does not contain 'action' field. "
-            f"Please use data collected by script 14 (14_collect_B_with_goal_actions.py). "
-            f"Available fields: {list(episodes[0].keys())}"
-        )
+    # Check available fields
+    if len(episodes) > 0:
+        fields = list(episodes[0].keys())
+        has_action = "action" in fields
+        print(f"  Available fields: {fields}")
+        if has_action:
+            print(f"  Action source: 'action' field (pre-computed)")
+        else:
+            print(f"  Action source: computed from ee_pose[t+1] + gripper[t]")
     
     return episodes
 
@@ -583,15 +585,33 @@ def convert_npz_to_lerobot_format(
         images = ep["images"]  # (T, H, W, 3) uint8
         ee_pose = ep["ee_pose"]  # (T, 7)
         obj_pose = ep["obj_pose"]  # (T, 7)
-        actions = ep["action"]  # (T, 8) - GOAL ACTIONS from script 14
         wrist_images = ep.get("wrist_images", None)  # (T, H, W, 3) uint8 or None
         
-        # =====================================================================
+        # Get gripper states
+        gripper_states = ep.get("gripper", None)  # (T,) or None
+        
+        # Get or compute actions
         # Action format: next frame's ee_pose + current gripper
-        # =====================================================================
-        # action[t] = [ee_pose[t+1], gripper[t]] - where robot should move next
-        # Get gripper states from the gripper field in episode
-        gripper_states = ep.get("gripper", actions[:, 7])  # Use gripper field or fall back to action's gripper
+        if "action" in ep:
+            # Use pre-computed actions from script 14
+            actions = ep["action"]  # (T, 8)
+        else:
+            # Compute actions: action[t] = [ee_pose[t+1], gripper[t]]
+            # For the last frame, use ee_pose[T-1] (stay in place)
+            T = len(ee_pose)
+            actions = np.zeros((T, 8), dtype=np.float32)
+            # Next ee_pose (shift by 1, last frame stays)
+            actions[:-1, :7] = ee_pose[1:]  # ee_pose[t+1] for t=0..T-2
+            actions[-1, :7] = ee_pose[-1]   # ee_pose[T-1] for t=T-1
+            # Current gripper
+            if gripper_states is not None:
+                actions[:, 7] = gripper_states
+            else:
+                actions[:, 7] = 1.0  # Default to open gripper
+        
+        # Ensure gripper_states is set for state construction
+        if gripper_states is None:
+            gripper_states = actions[:, 7]
         
         for t in range(T):
             # Current observation

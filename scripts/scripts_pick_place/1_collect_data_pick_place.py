@@ -25,12 +25,12 @@ For each episode, the following arrays are saved:
 USAGE EXAMPLES
 =============================================================================
 # Basic usage (headless mode, 100 episodes)
-python scripts/1_collect_data.py --headless --num_episodes 100
+python scripts/scripts_pick_place/1_collect_data_pick_place.py --headless --num_episodes 100
 
 # Production run (500 episodes with parallel envs)
-CUDA_VISIBLE_DEVICES=1 python scripts/1_collect_data.py \
-    --headless --num_episodes 300 --num_envs 8 \
-    --out data/B_pick_place.npz
+CUDA_VISIBLE_DEVICES=9 python scripts/scripts_pick_place/1_collect_data_pick_place.py \
+    --headless --num_episodes 200 --num_envs 20 \
+    --out data/B_circle_200.npz
 
 =============================================================================
 """
@@ -509,8 +509,15 @@ def get_fsm_goal_action(expert, object_pose) -> "torch.Tensor":
     
     # Above object position
     above_obj_pos = torch.zeros(num_envs, 3, device=device)
-    above_obj_pos[:, :2] = obj_xy
-    above_obj_pos[:, 2] = expert.hover_z
+    if hasattr(expert, 'above_obj_dxy') and expert.above_obj_dxy is not None:
+        above_obj_pos[:, :2] = obj_xy + expert.above_obj_dxy
+    else:
+        above_obj_pos[:, :2] = obj_xy
+        
+    if hasattr(expert, 'episode_hover_z') and expert.episode_hover_z is not None:
+        above_obj_pos[:, 2] = expert.episode_hover_z
+    else:
+        above_obj_pos[:, 2] = expert.hover_z
     
     # At object position (for grasping)
     at_obj_pos = torch.zeros(num_envs, 3, device=device)
@@ -519,8 +526,15 @@ def get_fsm_goal_action(expert, object_pose) -> "torch.Tensor":
     
     # Above place position
     above_place_pos = torch.zeros(num_envs, 3, device=device)
-    above_place_pos[:, :2] = expert.place_pose[:, :2]
-    above_place_pos[:, 2] = expert.hover_z
+    if hasattr(expert, 'above_place_dxy') and expert.above_place_dxy is not None:
+        above_place_pos[:, :2] = expert.place_pose[:, :2] + expert.above_place_dxy
+    else:
+        above_place_pos[:, :2] = expert.place_pose[:, :2]
+        
+    if hasattr(expert, 'episode_hover_z') and expert.episode_hover_z is not None:
+        above_place_pos[:, 2] = expert.episode_hover_z
+    else:
+        above_place_pos[:, 2] = expert.hover_z
     
     # At place position
     at_place_pos = expert.place_pose[:, :3].clone()

@@ -31,6 +31,11 @@ CUDA_VISIBLE_DEVICES=4 python scripts/5_eval_diffusion.py \
     --out_dir runs/diffusion_A_pick_place_0117/videos --horizon 1000 \
     --num_episodes 10 --n_action_steps 16 --headless
 
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place_waypoint/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_mark_v3/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_mark_v3/videos --horizon 1000 \
+    --num_episodes 1 --visualize_action_chunk --n_action_steps 16 --headless
+
 =============================================================================
 VISUALIZATION OPTIONS
 =============================================================================

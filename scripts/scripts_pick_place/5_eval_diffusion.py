@@ -21,14 +21,14 @@ CUDA_VISIBLE_DEVICES=0 python scripts/5_eval_diffusion.py \
     --num_episodes 5 --visualize_xyz --headless
 
 # With action chunk visualization
-CUDA_VISIBLE_DEVICES=4 python scripts/5_eval_diffusion.py \
-    --checkpoint runs/diffusion_A_pick_place/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_pick_place/videos --horizon 1000 \
-    --num_episodes 1 --visualize_action_chunk --n_action_steps 16 --headless
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_circle/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_circle/videos --horizon 500 \
+    --num_episodes 10 --n_action_steps 16 --headless
 
-CUDA_VISIBLE_DEVICES=4 python scripts/5_eval_diffusion.py \
-    --checkpoint runs/diffusion_A_pick_place_0117/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_pick_place_0117/videos --horizon 1000 \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/5_eval_diffusion.py \
+    --checkpoint runs/diffusion_A_circle/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_circle/videos --horizon 500 \
     --num_episodes 10 --n_action_steps 16 --headless
 
 =============================================================================
@@ -515,8 +515,13 @@ def load_policy_config(pretrained_dir: str) -> Dict[str, Any]:
     if "action" in output_features:
         action_dim = output_features["action"]["shape"][0]
     
-    # Check if obj_pose is included (state_dim=14 means ee_pose(7) + obj_pose(7))
-    include_obj_pose = (state_dim == 14) if state_dim is not None else False
+    # Check if obj_pose and gripper are included based on state_dim:
+    # state_dim=7:  ee_pose(7) only
+    # state_dim=8:  ee_pose(7) + gripper(1)
+    # state_dim=14: ee_pose(7) + obj_pose(7)
+    # state_dim=15: ee_pose(7) + obj_pose(7) + gripper(1)
+    include_obj_pose = (state_dim in [14, 15]) if state_dim is not None else False
+    include_gripper = (state_dim in [8, 15]) if state_dim is not None else False
     
     return {
         "has_wrist": has_wrist,
@@ -524,6 +529,7 @@ def load_policy_config(pretrained_dir: str) -> Dict[str, Any]:
         "state_dim": state_dim,
         "action_dim": action_dim,
         "include_obj_pose": include_obj_pose,
+        "include_gripper": include_gripper,
         "raw_config": config_dict,
     }
 
@@ -734,6 +740,7 @@ def run_episode(
     max_reset_attempts: int = 20,
     has_wrist: bool = False,
     include_obj_pose: bool = False,
+    include_gripper: bool = False,
     xyz_visualizer=None,
     overfit_env_init: dict | None = None,
     n_action_steps: int = 8,
@@ -758,6 +765,7 @@ def run_episode(
         max_reset_attempts: Max attempts to find valid initial position.
         has_wrist: Whether the policy expects wrist camera input.
         include_obj_pose: Whether the policy expects object pose in state.
+        include_gripper: Whether the policy expects gripper state in state.
         xyz_visualizer: Optional XYZCurveVisualizer for debugging.
         overfit_env_init: Optional dict with initial poses for overfit testing.
             If provided, teleports object to saved initial pose after reset.
@@ -865,6 +873,10 @@ def run_episode(
     success_step = None  # Step at which success was first achieved
     last_action = None
     final_dist = None
+    
+    # Track gripper state (initialized to open, will be updated from actions)
+    # Gripper: +1 = open, -1 = close
+    current_gripper_state = 1.0
 
 
     for t in range(horizon):
@@ -904,12 +916,19 @@ def run_episode(
         # EE state
         ee_pose = get_ee_pose_w(env)[0:1]
         
-        # Build observation.state based on whether obj_pose is included
+        # Build observation.state based on include_obj_pose and include_gripper:
+        # state_dim=7:  ee_pose(7) only
+        # state_dim=8:  ee_pose(7) + gripper(1)
+        # state_dim=14: ee_pose(7) + obj_pose(7)
+        # state_dim=15: ee_pose(7) + obj_pose(7) + gripper(1)
+        state_parts = [ee_pose]
         if include_obj_pose:
             obj_pose = get_object_pose_w(env)[0:1]  # (1, 7)
-            state = torch.cat([ee_pose, obj_pose], dim=-1)  # (1, 14)
-        else:
-            state = ee_pose  # (1, 7)
+            state_parts.append(obj_pose)
+        if include_gripper:
+            gripper_tensor = torch.tensor([[current_gripper_state]], dtype=torch.float32, device=device)
+            state_parts.append(gripper_tensor)
+        state = torch.cat(state_parts, dim=-1)
 
         policy_inputs: Dict[str, torch.Tensor] = {
             "observation.image": table_rgb_chw,
@@ -1139,6 +1158,12 @@ def run_episode(
             action = action.repeat(num_envs, 1)
 
         obs_dict, _, terminated, truncated, _ = env.step(action)
+        
+        # Update gripper state from the action (last element)
+        # The action is (8,): [pos(3), quat(4), gripper(1)]
+        # Gripper: +1 = open, -1 = close
+        if include_gripper:
+            current_gripper_state = action_for_text[-1]
 
         # Check success: object XY distance to goal
         obj_pose = get_object_pose_w(env)[0].cpu().numpy()
@@ -1203,6 +1228,7 @@ def main() -> None:
         policy_info = load_policy_config(args.checkpoint)
         has_wrist = policy_info["has_wrist"]
         include_obj_pose = policy_info["include_obj_pose"]
+        include_gripper = policy_info["include_gripper"]
         
         print(f"  Policy checkpoint: {args.checkpoint}")
         print(f"  Expected image shape: {policy_info['image_shape']} (C, H, W)")
@@ -1210,6 +1236,7 @@ def main() -> None:
         print(f"  Expected action dim: {policy_info['action_dim']}")
         print(f"  Requires wrist camera: {has_wrist}")
         print(f"  Includes obj_pose in state: {include_obj_pose}")
+        print(f"  Includes gripper in state: {policy_info['include_gripper']}")
         
         # Validate image dimensions match
         if policy_info["image_shape"] is not None:
@@ -1371,6 +1398,7 @@ def main() -> None:
                 min_init_dist=min_init_dist,
                 has_wrist=has_wrist,
                 include_obj_pose=include_obj_pose,
+                include_gripper=include_gripper,
                 xyz_visualizer=xyz_visualizer,
                 overfit_env_init=overfit_env_init,
                 n_action_steps=n_action_steps,

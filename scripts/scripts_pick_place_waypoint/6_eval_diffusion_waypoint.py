@@ -38,8 +38,8 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place_waypoint/6_eval_diffusi
     --max_steps_per_waypoint 50 --num_episodes 5 --headless
 
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place_waypoint/6_eval_diffusion_waypoint.py \
-    --checkpoint runs/diffusion_A_mark/checkpoints/checkpoints/last/pretrained_model \
-    --out_dir runs/diffusion_A_mark/videos_waypoint \
+    --checkpoint runs/diffusion_A_mark_v3/checkpoints/checkpoints/last/pretrained_model \
+    --out_dir runs/diffusion_A_mark_v3/videos_waypoint \
     --position_threshold 0.01 --max_steps_per_waypoint 150 \
     --num_episodes 1 --visualize_action_chunk --headless
 
