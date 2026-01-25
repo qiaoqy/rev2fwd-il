@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/5_eval_diffusion.py \
     --out_dir runs/diffusion_A_circle/videos --horizon 500 \
     --num_episodes 10 --n_action_steps 16 --headless
 
-CUDA_VISIBLE_DEVICES=1 python scripts/scripts_pick_place/5_eval_diffusion.py \
+CUDA_VISIBLE_DEVICES=5 python scripts/scripts_pick_place/5_eval_diffusion.py \
     --checkpoint runs/PP_A_circle_200/checkpoints/checkpoints/last/pretrained_model \
     --out_dir runs/PP_A_circle_200/videos --horizon 500 \
     --num_episodes 10 --visualize_action_chunk --n_action_steps 16 --headless

@@ -35,8 +35,11 @@ HORIZON=400                 # Maximum steps per task attempt
 BATCH_SIZE=32               # Training batch size
 
 # Thresholds for success detection
-HEIGHT_THRESHOLD=0.15       # Minimum object z-position to consider lifted
+# Note: New success criteria requires object on table (z<0.05), at goal (XY distance), and gripper open
 DISTANCE_THRESHOLD=0.05     # Maximum distance from target for success
+
+# Action chunk settings
+N_ACTION_STEPS=16           # Number of action steps to execute per inference
 
 # Policy directories
 POLICY_A_DIR="runs/diffusion_A_circle"
@@ -125,8 +128,8 @@ echo "  STEPS_PER_ITER:     $STEPS_PER_ITER"
 echo "  MAX_CYCLES:         $MAX_CYCLES"
 echo "  HORIZON:            $HORIZON"
 echo "  BATCH_SIZE:         $BATCH_SIZE"
-echo "  HEIGHT_THRESHOLD:   $HEIGHT_THRESHOLD"
 echo "  DISTANCE_THRESHOLD: $DISTANCE_THRESHOLD"
+echo "  N_ACTION_STEPS:     $N_ACTION_STEPS"
 echo ""
 echo "  POLICY_A_DIR:       $POLICY_A_DIR"
 echo "  POLICY_B_DIR:       $POLICY_B_DIR"
@@ -149,7 +152,7 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
     CHECKPOINT_B=$(get_checkpoint_path "$POLICY_B_DIR")
     
     # =========================================================================
-    # Step 1: Alternating Test
+    # Step 1: Alternating Test (with retry until data is collected)
     # =========================================================================
     print_section "[Step 1] Running alternating test..."
     
@@ -158,22 +161,55 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
     echo "  Output A: $ROLLOUT_A"
     echo "  Output B: $ROLLOUT_B"
     
-    python scripts/scripts_pick_place/6_test_alternating.py \
-        --policy_A "$CHECKPOINT_A" \
-        --policy_B "$CHECKPOINT_B" \
-        --out_A "$ROLLOUT_A" \
-        --out_B "$ROLLOUT_B" \
-        --max_cycles $MAX_CYCLES \
-        --horizon $HORIZON \
-        --height_threshold $HEIGHT_THRESHOLD \
-        --distance_threshold $DISTANCE_THRESHOLD \
-        --goal_xy $GOAL_X $GOAL_Y \
-        $HEADLESS
+    MAX_RETRIES=10  # Maximum number of retries for data collection
+    retry_count=0
     
-    # Check if rollout data was collected
-    if [ ! -f "$ROLLOUT_A" ] && [ ! -f "$ROLLOUT_B" ]; then
-        echo "WARNING: No rollout data collected in iteration $iter"
-        echo "This may indicate that both policies failed immediately."
+    while true; do
+        retry_count=$((retry_count + 1))
+        echo ""
+        echo "  [Attempt $retry_count/$MAX_RETRIES] Running alternating test..."
+        
+        # Remove any existing partial data files before retry
+        rm -f "$ROLLOUT_A" "$ROLLOUT_B"
+        
+        python scripts/scripts_pick_place/6_test_alternating.py \
+            --policy_A "$CHECKPOINT_A" \
+            --policy_B "$CHECKPOINT_B" \
+            --out_A "$ROLLOUT_A" \
+            --out_B "$ROLLOUT_B" \
+            --max_cycles $MAX_CYCLES \
+            --horizon $HORIZON \
+            --distance_threshold $DISTANCE_THRESHOLD \
+            --n_action_steps $N_ACTION_STEPS \
+            --goal_xy $GOAL_X $GOAL_Y \
+            $HEADLESS
+        
+        # Check if BOTH rollout data files were collected
+        if [ -f "$ROLLOUT_A" ] && [ -f "$ROLLOUT_B" ]; then
+            echo "  ✓ Both Task A and Task B rollout data collected!"
+            break
+        elif [ -f "$ROLLOUT_A" ]; then
+            echo "  ⚠ Only Task A data collected, Task B missing. Retrying..."
+        elif [ -f "$ROLLOUT_B" ]; then
+            echo "  ⚠ Only Task B data collected, Task A missing. Retrying..."
+        else
+            echo "  ✗ No rollout data collected. Retrying..."
+        fi
+        
+        if [ $retry_count -ge $MAX_RETRIES ]; then
+            echo "  ERROR: Failed to collect rollout data after $MAX_RETRIES attempts."
+            echo "  This may indicate that the policies are not working properly."
+            echo "  Stopping iteration loop."
+            break 2  # Break out of both loops
+        fi
+        
+        echo "  Waiting 2 seconds before retry..."
+        sleep 2
+    done
+    
+    # Final check if rollout data was collected
+    if [ ! -f "$ROLLOUT_A" ] || [ ! -f "$ROLLOUT_B" ]; then
+        echo "WARNING: Could not collect complete rollout data in iteration $iter"
         echo "Stopping iteration loop."
         break
     fi
@@ -197,6 +233,7 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
             --out "$POLICY_A_DIR" \
             --steps $STEPS_PER_ITER \
             --batch_size $BATCH_SIZE \
+            --n_action_steps $N_ACTION_STEPS \
             $INCLUDE_OBJ_POSE
         
         echo "✓ Policy A finetuning complete"
@@ -223,6 +260,7 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
             --out "$POLICY_B_DIR" \
             --steps $STEPS_PER_ITER \
             --batch_size $BATCH_SIZE \
+            --n_action_steps $N_ACTION_STEPS \
             $INCLUDE_OBJ_POSE
         
         echo "✓ Policy B finetuning complete"

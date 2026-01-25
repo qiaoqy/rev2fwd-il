@@ -77,8 +77,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rollout_data",
         type=str,
-        required=True,
-        help="Path to rollout data NPZ file from script 6 (e.g., data/rollout_A_circle_iter1.npz).",
+        default=None,
+        help="Path to rollout data NPZ file from script 6 (e.g., data/rollout_A_circle_iter1.npz). "
+             "If not provided, will finetune using only the original data.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -118,6 +119,12 @@ def _parse_args() -> argparse.Namespace:
         "--include_obj_pose",
         action="store_true",
         help="Include object pose in observation.state.",
+    )
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=16,
+        help="Number of action steps to execute per inference. Default: 16.",
     )
 
     # Logging
@@ -225,6 +232,7 @@ def finetune_from_checkpoint(
     steps: int = 5000,
     batch_size: int = 32,
     lr: float = 1e-4,
+    n_action_steps: int = 16,
     include_obj_pose: bool = True,
     wandb: bool = False,
     wandb_project: str = "rev2fwd-diffusion-finetune",
@@ -240,6 +248,7 @@ def finetune_from_checkpoint(
         steps: Number of training steps.
         batch_size: Batch size.
         lr: Learning rate.
+        n_action_steps: Number of action steps to execute per inference.
         include_obj_pose: Include object pose in observation.
         wandb: Enable WandB logging.
         wandb_project: WandB project name.
@@ -256,6 +265,7 @@ def finetune_from_checkpoint(
     print(f"  Steps: {steps}")
     print(f"  Batch size: {batch_size}")
     print(f"  Learning rate: {lr}")
+    print(f"  N action steps: {n_action_steps}")
     print(f"  Include obj pose: {include_obj_pose}")
     print(f"  WandB: {wandb}")
     
@@ -270,6 +280,7 @@ def finetune_from_checkpoint(
         "--steps", str(steps),
         "--batch_size", str(batch_size),
         "--lr", str(lr),
+        "--n_action_steps", str(n_action_steps),
         "--resume",  # Resume from checkpoint
         "--force_convert",  # Re-convert data since it changed
     ]
@@ -299,36 +310,51 @@ def main() -> None:
         print(f"ERROR: Original data not found: {args.original_data}")
         sys.exit(1)
     
-    if not Path(args.rollout_data).exists():
-        print(f"ERROR: Rollout data not found: {args.rollout_data}")
-        sys.exit(1)
+    # Check if rollout data is provided and exists
+    has_rollout_data = args.rollout_data is not None and Path(args.rollout_data).exists()
     
-    # Determine merged data path
-    if args.merged_output:
-        merged_data_path = args.merged_output
+    if args.rollout_data is not None and not Path(args.rollout_data).exists():
+        print(f"WARNING: Rollout data not found: {args.rollout_data}")
+        print("         Will finetune using only the original data.")
+    
+    # Determine what data to use for training
+    if has_rollout_data:
+        # Merge original data with rollout data
+        if args.merged_output:
+            merged_data_path = args.merged_output
+        else:
+            # Create temp file for merged data
+            original_dir = Path(args.original_data).parent
+            original_stem = Path(args.original_data).stem
+            merged_data_path = str(original_dir / f"{original_stem}_merged_temp.npz")
+        
+        training_data_path = merged_data_path
+        need_cleanup = not args.keep_merged and not args.merged_output
     else:
-        # Create temp file for merged data
-        # Use the same directory as original data for consistency
-        original_dir = Path(args.original_data).parent
-        original_stem = Path(args.original_data).stem
-        merged_data_path = str(original_dir / f"{original_stem}_merged_temp.npz")
+        # No rollout data, use original data directly
+        print(f"\nNo rollout data provided. Finetuning with original data only.")
+        training_data_path = args.original_data
+        merged_data_path = None
+        need_cleanup = False
     
     try:
-        # Step 1: Merge datasets
-        merged_data_path = merge_datasets(
-            original_npz=args.original_data,
-            rollout_npz=args.rollout_data,
-            output_npz=merged_data_path,
-        )
+        # Step 1: Merge datasets (only if rollout data exists)
+        if has_rollout_data:
+            training_data_path = merge_datasets(
+                original_npz=args.original_data,
+                rollout_npz=args.rollout_data,
+                output_npz=merged_data_path,
+            )
         
         # Step 2: Finetune from checkpoint
         return_code = finetune_from_checkpoint(
-            merged_data=merged_data_path,
+            merged_data=training_data_path,
             checkpoint_path=args.checkpoint,
             output_dir=args.out,
             steps=args.steps,
             batch_size=args.batch_size,
             lr=args.lr,
+            n_action_steps=args.n_action_steps,
             include_obj_pose=args.include_obj_pose,
             wandb=args.wandb,
             wandb_project=args.wandb_project,
@@ -344,7 +370,7 @@ def main() -> None:
         
     finally:
         # Cleanup merged data if not keeping
-        if not args.keep_merged and not args.merged_output:
+        if need_cleanup and merged_data_path is not None:
             merged_path = Path(merged_data_path)
             if merged_path.exists():
                 print(f"Cleaning up temporary merged file: {merged_data_path}")
