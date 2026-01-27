@@ -101,7 +101,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9 torchrun --nproc_per_node=10 \
     --enable_xyz_viz --viz_save_freq 4000 \
     --n_action_steps 16
 
-
 # Multi-GPU training (two jobs simultaneously - use different port and rdzv_id)
 CUDA_VISIBLE_DEVICES=2,3,7 torchrun --nproc_per_node=3 --master_port=29500 --rdzv_id=job1 \
     scripts/scripts_pick_place/4_train_diffusion.py \
@@ -316,7 +315,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume training from the latest checkpoint.",
+        help="Resume training from checkpoint: loads model weights, continues from checkpoint step, "
+             "but creates a NEW wandb run. Use --steps to specify the target total step (e.g., 10100, 10200...).",
     )
     parser.add_argument(
         "--overwrite",
@@ -779,8 +779,9 @@ def train_with_lerobot_api(
         is_main_process = (local_rank == 0)
     
     # Handle overwrite: remove existing checkpoints directory (only on main process)
+    # NOTE: Don't remove checkpoints when resuming OR finetuning (both need existing checkpoint)
     checkpoint_dir = out_dir / "checkpoints"
-    if is_main_process and args.overwrite and checkpoint_dir.exists() and not args.resume:
+    if is_main_process and args.overwrite and checkpoint_dir.exists() and not args.resume and not args.finetune:
         print(f"Removing existing checkpoints directory: {checkpoint_dir}")
         shutil.rmtree(checkpoint_dir)
     
@@ -882,16 +883,26 @@ def train_with_lerobot_api(
         )
     
     # Create WandB configuration
+    # --resume mode: loads weights, continues from checkpoint step, resumes existing wandb run
+    # The wandb run ID will be read from the filesystem by LeRobot's WandBLogger
+    wandb_run_id = None  # Let LeRobot find the existing wandb run ID from filesystem
+    if args.resume and args.wandb:
+        print(f"  [WandB] Resume mode: will resume existing wandb run from checkpoint")
+
     wandb_cfg = WandBConfig(
         enable=args.wandb,
         project=args.wandb_project,
+        run_id=wandb_run_id,  # None = let LeRobot find it from filesystem
+        mode=None,
     )
     
     # Create training pipeline configuration
     checkpoint_dir = out_dir / "checkpoints"
     
     # When resuming, load the config from checkpoint and update necessary fields
+    # --resume: loads model weights, continues from checkpoint step, creates NEW wandb run
     resume_config_path = None  # Track for sys.argv injection
+    
     if args.resume:
         checkpoints_subdir = checkpoint_dir / "checkpoints"
         if not checkpoints_subdir.exists():
@@ -899,13 +910,29 @@ def train_with_lerobot_api(
                 f"Cannot resume: checkpoint directory {checkpoints_subdir} does not exist. "
                 f"Please run training without --resume first."
             )
-        checkpoint_dirs = sorted([d for d in checkpoints_subdir.iterdir() if d.is_dir()])
+        checkpoint_dirs = [d for d in checkpoints_subdir.iterdir() if d.is_dir()]
         if not checkpoint_dirs:
             raise FileNotFoundError(
                 f"Cannot resume: no checkpoints found in {checkpoints_subdir}. "
                 f"Please run training without --resume first."
             )
-        latest_checkpoint = checkpoint_dirs[-1]
+        # Prefer 'last' checkpoint if it exists
+        last_checkpoint = checkpoints_subdir / "last"
+        if last_checkpoint.exists() and last_checkpoint.is_dir():
+            latest_checkpoint = last_checkpoint
+        else:
+            # Otherwise, find numeric directories and pick the one with largest number
+            numeric_dirs = []
+            for d in checkpoint_dirs:
+                if d.name.isdigit():
+                    numeric_dirs.append((int(d.name), d))
+            if numeric_dirs:
+                # Sort by number and pick the largest
+                numeric_dirs.sort(key=lambda x: x[0])
+                latest_checkpoint = numeric_dirs[-1][1]
+            else:
+                # Fallback: sort alphabetically
+                latest_checkpoint = sorted(checkpoint_dirs, key=lambda x: x.name)[-1]
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         
         # LeRobot requires loading config from checkpoint when resuming
@@ -920,14 +947,26 @@ def train_with_lerobot_api(
         # Load the saved config from checkpoint
         train_cfg = TrainPipelineConfig.from_pretrained(str(resume_config_path.parent))
         
-        # Update fields that should change on resume
-        train_cfg.resume = True
-        train_cfg.steps = args.steps  # Allow extending training steps
-        train_cfg.wandb = wandb_cfg  # Update wandb config
+        # Update fields for resume:
+        # - resume=True: load training state (step count, optimizer) from checkpoint
+        # - wandb: use our new wandb_cfg which creates a NEW run (not resuming old one)
+        # - steps: target step count (e.g., 10100, 10200, ...)
+        train_cfg.resume = True  # Load training state to continue from checkpoint step
+        train_cfg.steps = args.steps  # Target total step (e.g., 10100)
+        train_cfg.wandb = wandb_cfg  # New wandb run (not resuming)
         train_cfg.checkpoint_path = latest_checkpoint
         train_cfg.policy.pretrained_path = latest_checkpoint / "pretrained_model"
         
-        print(f"  Loaded config, will continue training to {args.steps} steps")
+        # IMPORTANT: Update dataset root if --lerobot_dataset_dir is specified
+        # This allows training on a different/merged dataset
+        train_cfg.dataset.root = str(lerobot_dataset_dir)
+        
+        # Also update output_dir to match --out
+        train_cfg.output_dir = checkpoint_dir
+        
+        print(f"  Will continue training to step {args.steps}")
+        print(f"  Dataset root updated to: {lerobot_dataset_dir}")
+        print(f"  Creating NEW wandb run (not resuming old one)")
     else:
         train_cfg = TrainPipelineConfig(
             dataset=dataset_cfg,
@@ -947,7 +986,7 @@ def train_with_lerobot_api(
     
     # Print training info
     print("\n" + "=" * 60)
-    print("Starting Diffusion Policy Training (Task B - Goal Actions)")
+    print("Starting Diffusion Policy Training")
     print("=" * 60)
     print(f"  Dataset: {args.dataset}")
     print(f"  LeRobot dataset: {lerobot_dataset_dir}")
@@ -1115,30 +1154,59 @@ def main() -> None:
             has_wrist = meta["has_wrist"]
             overfit_env_init = meta.get("overfit_env_init", None)
     else:
-        # Load episodes to get image shape and check for wrist camera
-        episodes = load_episodes_from_npz(args.dataset, num_episodes=args.num_episodes)
-        image_shape = episodes[0]["images"].shape[1:]  # (H, W, 3)
-        image_height, image_width = image_shape[0], image_shape[1]
-        has_wrist = "wrist_images" in episodes[0]
-        
-        # Extract overfit env init params if in overfit mode
-        if args.overfit and len(episodes) > 0:
-            ep0 = episodes[0]
-            overfit_env_init = {
-                "initial_obj_pose": ep0["obj_pose"][0].tolist(),
-                "initial_ee_pose": ep0["ee_pose"][0].tolist(),
-                "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
-                "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
-            }
-            if isinstance(overfit_env_init["place_pose"], np.ndarray):
-                overfit_env_init["place_pose"] = overfit_env_init["place_pose"].tolist()
-            if isinstance(overfit_env_init["goal_pose"], np.ndarray):
-                overfit_env_init["goal_pose"] = overfit_env_init["goal_pose"].tolist()
+        # Skip conversion mode - read config from existing LeRobot dataset or NPZ
+        meta_path = lerobot_dataset_dir / "meta" / "info.json"
+        if meta_path.exists():
+            # Read from existing LeRobot dataset metadata
+            print(f"[Skip Convert] Reading config from existing LeRobot dataset: {lerobot_dataset_dir}")
+            with open(meta_path, "r") as f:
+                info = json.load(f)
+            features = info.get("features", {})
             
-            overfit_init_path = out_dir / "overfit_env_init.json"
-            with open(overfit_init_path, "w") as f:
-                json.dump(overfit_env_init, f, indent=2)
-            print(f"\n[Overfit Mode] Saved env init params to: {overfit_init_path}")
+            # Get image shape from features
+            if "observation.image" in features:
+                img_shape = features["observation.image"]["shape"]  # (C, H, W)
+                image_height = img_shape[1]
+                image_width = img_shape[2]
+            else:
+                raise ValueError("observation.image not found in dataset features")
+            
+            # Check for wrist camera
+            has_wrist = "observation.wrist_image" in features
+            
+            print(f"  Image size: {image_height}x{image_width}")
+            print(f"  Has wrist camera: {has_wrist}")
+            print(f"  Total episodes: {info.get('total_episodes', 'unknown')}")
+            print(f"  Total frames: {info.get('total_frames', 'unknown')}")
+        else:
+            # Fallback: Load episodes from NPZ to get image shape
+            print(f"[Skip Convert] LeRobot dataset not found, loading NPZ: {args.dataset}")
+            episodes = load_episodes_from_npz(args.dataset, num_episodes=args.num_episodes)
+            image_shape = episodes[0]["images"].shape[1:]  # (H, W, 3)
+            image_height, image_width = image_shape[0], image_shape[1]
+            has_wrist = "wrist_images" in episodes[0]
+        
+        # Extract overfit env init params if in overfit mode (requires NPZ)
+        if args.overfit:
+            if 'episodes' not in dir():
+                episodes = load_episodes_from_npz(args.dataset, num_episodes=args.num_episodes)
+            if len(episodes) > 0:
+                ep0 = episodes[0]
+                overfit_env_init = {
+                    "initial_obj_pose": ep0["obj_pose"][0].tolist(),
+                    "initial_ee_pose": ep0["ee_pose"][0].tolist(),
+                    "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                    "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                }
+                if isinstance(overfit_env_init["place_pose"], np.ndarray):
+                    overfit_env_init["place_pose"] = overfit_env_init["place_pose"].tolist()
+                if isinstance(overfit_env_init["goal_pose"], np.ndarray):
+                    overfit_env_init["goal_pose"] = overfit_env_init["goal_pose"].tolist()
+                
+                overfit_init_path = out_dir / "overfit_env_init.json"
+                with open(overfit_init_path, "w") as f:
+                    json.dump(overfit_env_init, f, indent=2)
+                print(f"\n[Overfit Mode] Saved env init params to: {overfit_init_path}")
     
     if args.convert_only:
         if is_main_process:

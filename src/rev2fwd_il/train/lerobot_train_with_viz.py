@@ -636,8 +636,8 @@ def train_with_xyz_visualization(
                 batch["observation.state"] = batch["observation.state"][..., :state_slice_end]
             return batch
         
-        # Store original transform if any
-        original_transform = dataset.transform
+        # Store original transform if any (use getattr for compatibility with different LeRobot versions)
+        original_transform = getattr(dataset, 'transform', None)
         
         # Compose transforms
         if original_transform is not None:
@@ -805,7 +805,8 @@ def train_with_xyz_visualization(
                     batch["observation.state"] = batch["observation.state"][..., :state_slice_end]
                 return batch
             
-            original_val_transform = val_dataset.transform
+            # Use getattr for compatibility with different LeRobot versions
+            original_val_transform = getattr(val_dataset, 'transform', None)
             if original_val_transform is not None:
                 def combined_val_transform(batch):
                     batch = original_val_transform(batch)
