@@ -1666,6 +1666,91 @@ def main() -> None:
         print("Saving rollout data...")
         print(f"{'='*60}")
         tester.save_data(args.out_A, args.out_B)
+        
+        # =====================================================================
+        # Save rollout statistics to JSON
+        # =====================================================================
+        print(f"\n{'='*60}")
+        print("Saving rollout statistics...")
+        print(f"{'='*60}")
+        
+        # Build detailed statistics
+        import json
+        from datetime import datetime
+        
+        rollout_stats = {
+            "timestamp": datetime.now().isoformat(),
+            "config": {
+                "policy_A": args.policy_A,
+                "policy_B": args.policy_B,
+                "max_cycles": args.max_cycles,
+                "horizon": args.horizon,
+                "height_threshold": args.height_threshold,
+                "distance_threshold": args.distance_threshold,
+                "n_action_steps": args.n_action_steps,
+                "goal_xy": args.goal_xy,
+            },
+            "summary": {
+                "consecutive_successes": results['consecutive_success'],
+                "total_task_A_episodes": results['total_A_episodes'],
+                "total_task_B_episodes": results['total_B_episodes'],
+                "task_A_success_count": sum(1 for ep in tester.episodes_A if ep["success"]),
+                "task_B_success_count": sum(1 for ep in tester.episodes_B if ep["success"]),
+                "task_A_success_rate": results['A_success_rate'],
+                "task_B_success_rate": results['B_success_rate'],
+                "total_elapsed_seconds": elapsed,
+            },
+            "episodes_A": [],
+            "episodes_B": [],
+        }
+        
+        # Add detailed per-episode statistics for Task A
+        for i, ep in enumerate(tester.episodes_A):
+            ep_stats = {
+                "episode_index": i,
+                "cycle": i + 1,  # 1-indexed cycle number
+                "success": ep["success"],
+                "success_step": ep.get("success_step"),
+                "total_steps": len(ep["images"]),
+                "total_actions": len(ep["action"]),
+            }
+            # Add initial and final positions if available
+            if "ee_pose" in ep and len(ep["ee_pose"]) > 0:
+                ep_stats["initial_ee_position"] = ep["ee_pose"][0][:3].tolist()
+                ep_stats["final_ee_position"] = ep["ee_pose"][-1][:3].tolist()
+            if "obj_pose" in ep and len(ep["obj_pose"]) > 0:
+                ep_stats["initial_obj_position"] = ep["obj_pose"][0][:3].tolist()
+                ep_stats["final_obj_position"] = ep["obj_pose"][-1][:3].tolist()
+            if "place_pose" in ep and ep["place_pose"] is not None:
+                ep_stats["target_place_position"] = ep["place_pose"][:3].tolist()
+            rollout_stats["episodes_A"].append(ep_stats)
+        
+        # Add detailed per-episode statistics for Task B
+        for i, ep in enumerate(tester.episodes_B):
+            ep_stats = {
+                "episode_index": i,
+                "cycle": i + 1,  # 1-indexed cycle number
+                "success": ep["success"],
+                "success_step": ep.get("success_step"),
+                "total_steps": len(ep["images"]),
+                "total_actions": len(ep["action"]),
+            }
+            # Add initial and final positions if available
+            if "ee_pose" in ep and len(ep["ee_pose"]) > 0:
+                ep_stats["initial_ee_position"] = ep["ee_pose"][0][:3].tolist()
+                ep_stats["final_ee_position"] = ep["ee_pose"][-1][:3].tolist()
+            if "obj_pose" in ep and len(ep["obj_pose"]) > 0:
+                ep_stats["initial_obj_position"] = ep["obj_pose"][0][:3].tolist()
+                ep_stats["final_obj_position"] = ep["obj_pose"][-1][:3].tolist()
+            if "place_pose" in ep and ep["place_pose"] is not None:
+                ep_stats["target_place_position"] = ep["place_pose"][:3].tolist()
+            rollout_stats["episodes_B"].append(ep_stats)
+        
+        # Save stats to JSON (same directory as out_A, with _stats.json suffix)
+        stats_path = Path(args.out_A).with_suffix(".stats.json")
+        with open(stats_path, 'w') as f:
+            json.dump(rollout_stats, f, indent=2)
+        print(f"  Saved rollout statistics to: {stats_path}")
 
         # =====================================================================
         # Save video

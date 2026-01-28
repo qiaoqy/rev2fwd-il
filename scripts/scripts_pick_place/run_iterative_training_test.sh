@@ -239,62 +239,60 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
     # =========================================================================
     # Step 1: Alternating Test (with retry until at least one task collects data)
     # =========================================================================
-    # [DEBUG SKIP] Commented out for debugging - data already collected
-    # print_section "[Step 1] Running alternating test (TEST MODE)..."
-    # 
-    # echo "  Checkpoint A: $CHECKPOINT_A"
-    # echo "  Checkpoint B: $CHECKPOINT_B"
-    # echo "  Output A: $ROLLOUT_A"
-    # echo "  Output B: $ROLLOUT_B"
-    # 
-    # MAX_RETRIES=3  # Maximum number of retries for data collection (reduced from 10)
-    # retry_count=0
-    # 
-    # while true; do
-    #     retry_count=$((retry_count + 1))
-    #     echo ""
-    #     echo "  [Attempt $retry_count/$MAX_RETRIES] Running alternating test..."
-    #     
-    #     # Remove any existing partial data files before retry
-    #     rm -f "$ROLLOUT_A" "$ROLLOUT_B"
-    #     
-    #     CUDA_VISIBLE_DEVICES=$DATA_COLLECTION_GPU python scripts/scripts_pick_place/6_test_alternating.py \
-    #         --policy_A "$CHECKPOINT_A" \
-    #         --policy_B "$CHECKPOINT_B" \
-    #         --out_A "$ROLLOUT_A" \
-    #         --out_B "$ROLLOUT_B" \
-    #         --max_cycles $MAX_CYCLES \
-    #         --horizon $HORIZON \
-    #         --distance_threshold $DISTANCE_THRESHOLD \
-    #         --n_action_steps $N_ACTION_STEPS \
-    #         --goal_xy $GOAL_X $GOAL_Y \
-    #         $SAVE_VIDEO $VISUALIZE_ACTION_CHUNK \
-    #         $HEADLESS
-    #     
-    #     # Check if AT LEAST ONE rollout data file was collected
-    #     if [ -f "$ROLLOUT_A" ] || [ -f "$ROLLOUT_B" ]; then
-    #         if [ -f "$ROLLOUT_A" ] && [ -f "$ROLLOUT_B" ]; then
-    #             echo "  ✓ Both Task A and Task B rollout data collected!"
-    #         elif [ -f "$ROLLOUT_A" ]; then
-    #             echo "  ✓ Task A rollout data collected (Task B missing)"
-    #         else
-    #             echo "  ✓ Task B rollout data collected (Task A missing)"
-    #         fi
-    #         break
-    #     else
-    #         echo "  ✗ No rollout data collected."
-    #     fi
-    #     
-    #     if [ $retry_count -ge $MAX_RETRIES ]; then
-    #         echo "  WARNING: Failed to collect any rollout data after $MAX_RETRIES attempts."
-    #         echo "  Will continue with finetuning using original data only."
-    #         break
-    #     fi
-    #     
-    #     echo "  Waiting 2 seconds before retry..."
-    #     sleep 2
-    # done
-    print_section "[Step 1] SKIPPED - using existing data"
+    print_section "[Step 1] Running alternating test (TEST MODE)..."
+    
+    echo "  Checkpoint A: $CHECKPOINT_A"
+    echo "  Checkpoint B: $CHECKPOINT_B"
+    echo "  Output A: $ROLLOUT_A"
+    echo "  Output B: $ROLLOUT_B"
+    
+    MAX_RETRIES=3  # Maximum number of retries for data collection (reduced from 10)
+    retry_count=0
+    
+    while true; do
+        retry_count=$((retry_count + 1))
+        echo ""
+        echo "  [Attempt $retry_count/$MAX_RETRIES] Running alternating test..."
+        
+        # Remove any existing partial data files before retry
+        rm -f "$ROLLOUT_A" "$ROLLOUT_B"
+        
+        CUDA_VISIBLE_DEVICES=$DATA_COLLECTION_GPU python scripts/scripts_pick_place/6_test_alternating.py \
+            --policy_A "$CHECKPOINT_A" \
+            --policy_B "$CHECKPOINT_B" \
+            --out_A "$ROLLOUT_A" \
+            --out_B "$ROLLOUT_B" \
+            --max_cycles $MAX_CYCLES \
+            --horizon $HORIZON \
+            --distance_threshold $DISTANCE_THRESHOLD \
+            --n_action_steps $N_ACTION_STEPS \
+            --goal_xy $GOAL_X $GOAL_Y \
+            $SAVE_VIDEO $VISUALIZE_ACTION_CHUNK \
+            $HEADLESS
+        
+        # Check if AT LEAST ONE rollout data file was collected
+        if [ -f "$ROLLOUT_A" ] || [ -f "$ROLLOUT_B" ]; then
+            if [ -f "$ROLLOUT_A" ] && [ -f "$ROLLOUT_B" ]; then
+                echo "  ✓ Both Task A and Task B rollout data collected!"
+            elif [ -f "$ROLLOUT_A" ]; then
+                echo "  ✓ Task A rollout data collected (Task B missing)"
+            else
+                echo "  ✓ Task B rollout data collected (Task A missing)"
+            fi
+            break
+        else
+            echo "  ✗ No rollout data collected."
+        fi
+        
+        if [ $retry_count -ge $MAX_RETRIES ]; then
+            echo "  WARNING: Failed to collect any rollout data after $MAX_RETRIES attempts."
+            echo "  Will continue with finetuning using original data only."
+            break
+        fi
+        
+        echo "  Waiting 2 seconds before retry..."
+        sleep 2
+    done
     
     # =========================================================================
     # Step 2: Finetune Policy A (always finetune, with or without rollout data)
