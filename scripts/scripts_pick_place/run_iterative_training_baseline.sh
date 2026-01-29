@@ -562,10 +562,10 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
     echo "  Copying ORIGINAL dataset to last directory..."
     cp -r "$LEROBOT_A" "$POLICY_A_DIR_LAST/lerobot_dataset"
     
-    # 复制 checkpoint
-    echo "  Copying checkpoint from temp to last..."
+    # 复制 checkpoint (使用 -L 跟随符号链接，复制实际内容而非符号链接本身)
+    echo "  Copying checkpoint from temp to last (following symlinks)..."
     mkdir -p "$POLICY_A_DIR_LAST/checkpoints/checkpoints"
-    cp -r "$POLICY_A_DIR_TEMP/checkpoints/checkpoints/last" "$POLICY_A_DIR_LAST/checkpoints/checkpoints/last"
+    cp -rL "$POLICY_A_DIR_TEMP/checkpoints/checkpoints/last" "$POLICY_A_DIR_LAST/checkpoints/checkpoints/last"
     
     # Step 2b: 复制 wandb 目录并更新 metadata
     echo ""
@@ -667,10 +667,10 @@ for iter in $(seq 1 $MAX_ITERATIONS); do
     echo "  Copying ORIGINAL dataset to last directory..."
     cp -r "$LEROBOT_B" "$POLICY_B_DIR_LAST/lerobot_dataset"
     
-    # 复制 checkpoint
-    echo "  Copying checkpoint from temp to last..."
+    # 复制 checkpoint (使用 -L 跟随符号链接，复制实际内容而非符号链接本身)
+    echo "  Copying checkpoint from temp to last (following symlinks)..."
     mkdir -p "$POLICY_B_DIR_LAST/checkpoints/checkpoints"
-    cp -r "$POLICY_B_DIR_TEMP/checkpoints/checkpoints/last" "$POLICY_B_DIR_LAST/checkpoints/checkpoints/last"
+    cp -rL "$POLICY_B_DIR_TEMP/checkpoints/checkpoints/last" "$POLICY_B_DIR_LAST/checkpoints/checkpoints/last"
     
     # Step 3b: 复制 wandb 目录并更新 metadata
     echo ""
