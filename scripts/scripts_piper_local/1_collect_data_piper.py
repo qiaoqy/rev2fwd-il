@@ -77,6 +77,14 @@ from scipy.spatial.transform import Rotation as R
 # Piper SDK
 from piper_sdk import C_PiperInterface_V2
 
+# Force estimator
+try:
+    from rev2fwd_il.real import PiperForceEstimator
+    FORCE_ESTIMATOR_AVAILABLE = True
+except ImportError:
+    FORCE_ESTIMATOR_AVAILABLE = False
+    print("[Warning] Force estimator not available. Install rev2fwd_il package.")
+
 
 # =============================================================================
 # Constants and Parameters (Calibrated from 0_system_test.py)
@@ -844,6 +852,10 @@ class EpisodeData:
     timestamp: list     # List of Unix timestamps
     place_pose: np.ndarray  # Target place position (7,)
     goal_pose: np.ndarray   # Plate center position (7,)
+    # Force/torque data
+    joint_angles: list = field(default_factory=list)   # List of (6,) arrays in radians
+    joint_torques: list = field(default_factory=list)  # List of (6,) arrays in N·m
+    ee_force: list = field(default_factory=list)       # List of (6,) arrays [Fx,Fy,Fz,Mx,My,Mz]
     success: bool = False
 
 
@@ -871,6 +883,11 @@ def save_episode(episode: EpisodeData, out_dir: Path):
     fsm_arr = np.array(episode.fsm_state, dtype=np.int32)
     timestamp_arr = np.array(episode.timestamp, dtype=np.float64)
     
+    # Convert force data to arrays
+    joint_angles_arr = np.array(episode.joint_angles, dtype=np.float32) if episode.joint_angles else np.zeros((T, 6), dtype=np.float32)
+    joint_torques_arr = np.array(episode.joint_torques, dtype=np.float32) if episode.joint_torques else np.zeros((T, 6), dtype=np.float32)
+    ee_force_arr = np.array(episode.ee_force, dtype=np.float32) if episode.ee_force else np.zeros((T, 6), dtype=np.float32)
+    
     # Save NPZ
     np.savez(
         episode_dir / "episode_data.npz",
@@ -881,6 +898,10 @@ def save_episode(episode: EpisodeData, out_dir: Path):
         timestamp=timestamp_arr,
         place_pose=episode.place_pose,
         goal_pose=episode.goal_pose,
+        # Force/torque data
+        joint_angles=joint_angles_arr,
+        joint_torques=joint_torques_arr,
+        ee_force=ee_force_arr,
         success=episode.success,
         episode_id=episode.episode_id,
         num_timesteps=T,
@@ -1338,6 +1359,20 @@ def main():
         orientation_rad=DEFAULT_ORIENTATION_RAD
     )
     
+    # Initialize force estimator
+    force_estimator = None
+    if FORCE_ESTIMATOR_AVAILABLE:
+        print("\n[Init] Initializing force estimator...")
+        force_estimator = PiperForceEstimator(dh_is_offset=0x01)
+        # Calibrate gravity baseline at home position
+        time.sleep(0.5)  # Wait for arm to settle
+        if force_estimator.calibrate_gravity_from_piper(piper.piper):
+            print("[Init] ✓ Force estimator gravity baseline calibrated")
+        else:
+            print("[Init] ✗ Force estimator calibration failed, continuing without gravity compensation")
+    else:
+        print("\n[Init] Force estimator not available, skipping force recording")
+    
     # Control loop parameters
     control_period = 1.0 / args.control_freq
     
@@ -1453,6 +1488,21 @@ def main():
                                        target_quat[0], target_quat[1], target_quat[2], target_quat[3],
                                        target_gripper], dtype=np.float32)
                     
+                    # Get force/torque data
+                    joint_angles = np.zeros(6)
+                    joint_torques = np.zeros(6)
+                    ee_force = np.zeros(6)
+                    
+                    if force_estimator is not None and piper.piper is not None:
+                        joint_state = force_estimator.get_joint_state_from_piper(piper.piper)
+                        if joint_state is not None:
+                            joint_angles, joint_torques = joint_state
+                            ee_force = force_estimator.estimate_force(
+                                joint_angles, joint_torques,
+                                use_filter=True,
+                                use_gravity_comp=True
+                            )
+                    
                     # Record (handle optional wrist camera)
                     if fixed_img is not None:
                         current_episode.fixed_images.append(fixed_img)
@@ -1466,6 +1516,10 @@ def main():
                         current_episode.action.append(action)
                         current_episode.fsm_state.append(fsm.state.value)
                         current_episode.timestamp.append(time.time())
+                        # Record force data
+                        current_episode.joint_angles.append(joint_angles)
+                        current_episode.joint_torques.append(joint_torques)
+                        current_episode.ee_force.append(ee_force)
                 
                 # Handle episode completion
                 if done:
@@ -1525,6 +1579,7 @@ def main():
             "front_camera": str(front_cam_id),
             "wrist_camera": str(wrist_cam_id),
             "wrist_camera_enabled": wrist_cam_enabled,
+            "force_estimation_enabled": FORCE_ESTIMATOR_AVAILABLE and force_estimator is not None,
         }
         
         with open(out_dir / "metadata.json", "w") as f:
