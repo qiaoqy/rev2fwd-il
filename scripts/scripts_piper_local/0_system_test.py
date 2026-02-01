@@ -17,8 +17,6 @@ Script 0: System Test & Calibration Tool
 - Q: 退出程序
 - R: 重置/使能机械臂
 
-Author: Auto-generated
-Date: 2024
 """
 
 import os
@@ -26,7 +24,7 @@ import sys
 import time
 import threading
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -39,8 +37,8 @@ class TestConfig:
     can_interface: str = "can0"  # Linux: "can0", Windows 虚拟: "vcan0"
     
     # 相机设备 ID
-    front_camera_id: int = 0
-    wrist_camera_id: int = 2  # 如果没有腕部相机，设为 -1
+    front_camera_id: Union[int, str] = "Orbbec_Gemini_335L"
+    wrist_camera_id: Union[int, str] = "Dabai_DC1"  # 如果没有腕部相机，设为 -1, if the writs camera is present, set to its ID(2).
     
     # 机械臂参数
     enable_timeout: float = 5.0
@@ -49,22 +47,41 @@ class TestConfig:
     # 安全限制 (米)
     z_min: float = 0.05  # 最低高度
     z_max: float = 0.50  # 最高高度
+
+    # 运动完成判定
+    motion_timeout_s: float = 10.0
+    pose_tolerance_pos_m: float = 0.01  # 位置容差 (米)
+    pose_tolerance_rot_deg: float = 3.0  # 姿态容差 (度)
+
+    # 运动模式 (0x00=MOVE_P, 0x01=MOVE_J, 0x02=MOVE_L)
+    move_mode: int = 0x00
+
+    # 夹爪完成判定
+    gripper_timeout_s: float = 3.0
+    gripper_tolerance_deg: float = 2.0
     
     # 测试位置 (米, 弧度) - 需要根据实际情况校准
-    home_position: tuple = (0.2, 0.0, 0.35)  # X, Y, Z
-    home_orientation: tuple = (3.14159, 0.0, 0.0)  # RX, RY, RZ (弧度)
+    # 注意: 姿态需要与机械臂当前构型兼容，否则会报 TARGET_POS_EXCEEDS_LIMIT
+    home_position: tuple = (0.054, 0.0, 0.175)  # X, Y, Z
+    home_orientation: tuple = (3.1, 1.2, 3.1)  # RX, RY, RZ (弧度) ~= (177°, 69°, 177°)
+    desk_center_position: tuple = (0.355, -0.0213, 0.1757)  # X, Y, Z
+    desk_center_orientation: tuple = (-3.139, 0.339, 3.060)  # RX, RY, RZ (弧度) ~= (-179.8°, 19.4°, 175.3°)
     
     # 测试点位 (用于运动测试)
     test_positions: list = None
     
     def __post_init__(self):
         if self.test_positions is None:
+            cx, cy, cz = self.desk_center_position
             self.test_positions = [
-                # (X, Y, Z) in meters
-                (0.25, 0.0, 0.30),
-                (0.25, 0.1, 0.30),
-                (0.25, -0.1, 0.30),
-                (0.20, 0.0, 0.25),
+                # (X, Y, Z) in meters - around desk center
+                (cx, cy, cz + 0.08),
+                (cx + 0.05, cy, cz + 0.08),
+                (cx - 0.05, cy, cz + 0.08),
+                (cx, cy + 0.05, cz + 0.08),
+                (cx, cy - 0.05, cz + 0.08),
+                (cx, cy, cz + 0.03),
+                (cx, cy, cz),
             ]
 
 
@@ -121,8 +138,16 @@ class PiperController:
             print("[Piper] 正在使能机械臂...")
             
             # 发送使能命令
-            self.piper.EnableArm(7)  # 7 = 使能所有关节
-            self.piper.GripperCtrl(0x01, 1000, 0x01, 0)  # 使能夹爪
+            self.piper.EnableArm(7)
+
+            # 退出示教/拖动模式，并恢复控制模式
+            self._ensure_control_mode()
+
+            # 设置运动模式（MOVE_L）
+            self.piper.MotionCtrl_2(0x01, self.config.move_mode, self.config.motion_speed_percent, 0)
+
+            # 使能夹爪
+            self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
             
             # 等待使能完成
             start_time = time.time()
@@ -134,26 +159,115 @@ class PiperController:
                 time.sleep(0.1)
             
             print("[Piper] ✗ 使能超时")
+            self._print_arm_status(prefix="[Piper][Debug][EnableTimeout]")
+            self._print_enable_status(prefix="[Piper][Debug][EnableTimeout]")
             return False
             
         except Exception as e:
             print(f"[Piper] ✗ 使能失败: {e}")
             return False
+
+    def _ensure_control_mode(self):
+        """确保退出示教模式并进入控制模式"""
+        try:
+            status = self._read_arm_status()
+            if not status:
+                return
+
+            ctrl_mode_val = status.get('ctrl_mode_val')
+        except Exception as e:
+            print(f"[Piper][Debug] 控制模式恢复失败: {e}")
     
     def _check_enabled(self) -> bool:
         """检查是否已使能"""
         try:
-            arm_status = self.piper.GetArmStatus()
-            # 检查各个关节的使能状态
-            return arm_status.arm_status.ctrl_mode_feedback != 0
+            status = self._read_arm_status()
+            if status is None:
+                return False
+
+            ctrl_mode_val = status.get('ctrl_mode_val')
+            arm_state_val = status.get('arm_state_val')
+
+            if ctrl_mode_val is not None:
+                print(
+                    f"[Piper][Debug] ctrl_mode={status.get('ctrl_mode')}({ctrl_mode_val}) "
+                    f"arm_status={status.get('arm_state')}({arm_state_val})"
+                )
+
+            # ctrl_mode != 0 表示进入控制模式（CAN/以太网等）
+            ctrl_ok = ctrl_mode_val is not None and ctrl_mode_val != 0
+            enable_list = self._get_enable_status()
+            enable_ok = bool(enable_list) and all(enable_list)
+            if not enable_ok:
+                self._print_enable_status(prefix="[Piper][Debug][Enable]")
+            return ctrl_ok and enable_ok
         except:
             return False
+
+    def _get_enable_status(self) -> Optional[list]:
+        """获取各关节使能状态"""
+        try:
+            return self.piper.GetArmEnableStatus()
+        except Exception:
+            return None
+
+    def _print_enable_status(self, prefix: str = "[Piper][Debug]"):
+        """打印各关节使能状态"""
+        status = self._get_enable_status()
+        if status is None:
+            print(f"{prefix} 无法读取关节使能状态")
+            return
+        enable_str = ", ".join([f"J{i+1}={'ON' if v else 'OFF'}" for i, v in enumerate(status)])
+        print(f"{prefix} EnableStatus: {enable_str}")
+
+    def _read_arm_status(self) -> Optional[Dict[str, Any]]:
+        """读取机械臂状态（调试用）"""
+        try:
+            arm_status = self.piper.GetArmStatus()
+            status = arm_status.arm_status
+            ctrl_mode = getattr(status, 'ctrl_mode', None)
+            arm_state = getattr(status, 'arm_status', None)
+            mode_feed = getattr(status, 'mode_feed', None)
+            teach_status = getattr(status, 'teach_status', None)
+            motion_status = getattr(status, 'motion_status', None)
+
+            return {
+                'ctrl_mode': ctrl_mode,
+                'arm_state': arm_state,
+                'mode_feed': mode_feed,
+                'teach_status': teach_status,
+                'motion_status': motion_status,
+                'ctrl_mode_val': int(ctrl_mode) if ctrl_mode is not None else None,
+                'arm_state_val': int(arm_state) if arm_state is not None else None,
+                'mode_feed_val': int(mode_feed) if mode_feed is not None else None,
+                'teach_status_val': int(teach_status) if teach_status is not None else None,
+                'motion_status_val': int(motion_status) if motion_status is not None else None,
+            }
+        except Exception:
+            return None
+
+    def _print_arm_status(self, prefix: str = "[Piper][Debug]"):
+        """打印完整机械臂状态（调试用）"""
+        status = self._read_arm_status()
+        if not status:
+            print(f"{prefix} 无法读取机械臂状态")
+            return
+        print(
+            f"{prefix} ctrl_mode={status.get('ctrl_mode')}({status.get('ctrl_mode_val')}) "
+            f"arm_status={status.get('arm_state')}({status.get('arm_state_val')}) "
+            f"mode_feed={status.get('mode_feed')}({status.get('mode_feed_val')}) "
+            f"teach_status={status.get('teach_status')}({status.get('teach_status_val')}) "
+            f"motion_status={status.get('motion_status')}({status.get('motion_status_val')})"
+        )
     
     def disable(self):
         """失能机械臂"""
         if self.piper is not None:
             try:
-                self.piper.DisableArm(7)
+                if hasattr(self.piper, "DisablePiper"):
+                    self.piper.DisablePiper()
+                else:
+                    self.piper.DisableArm(7)
                 self.enabled = False
                 print("[Piper] 已失能")
             except Exception as e:
@@ -236,11 +350,15 @@ class PiperController:
             
         try:
             gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_state = gripper_msgs.gripper_state
+            status_code = getattr(gripper_state, 'grippers_code', None)
+            if status_code is None:
+                status_code = getattr(gripper_state, 'status_code', None)
             
             return {
-                'angle': gripper_msgs.gripper_state.grippers_angle / 1000.0,  # 度
-                'effort': gripper_msgs.gripper_state.grippers_effort / 1000.0,
-                'code': gripper_msgs.gripper_state.grippers_code,
+                'angle': gripper_state.grippers_angle / 1000.0,  # 度
+                'effort': gripper_state.grippers_effort / 1000.0,
+                'code': status_code,
             }
         except Exception as e:
             print(f"[Piper] 读取夹爪状态失败: {e}")
@@ -275,6 +393,18 @@ class PiperController:
         speed = speed_percent if speed_percent else self.config.motion_speed_percent
         
         try:
+            # 确保处于控制模式
+            self._ensure_control_mode()
+
+            enable_list = self._get_enable_status()
+            if enable_list is not None and not all(enable_list):
+                self._print_enable_status(prefix="[Piper][Debug][BeforeMove]")
+                print("[Piper] ✗ 关节未全部使能，取消运动")
+                return False
+
+            # 运动前状态快照
+            self._print_arm_status(prefix="[Piper][Debug][BeforeMove]")
+
             # 转换单位
             # 米 -> 0.001mm
             X = int(x * 1_000_000)
@@ -288,19 +418,75 @@ class PiperController:
             
             print(f"[Piper] 移动到: X={x:.3f}m, Y={y:.3f}m, Z={z:.3f}m")
             print(f"        姿态: RX={np.rad2deg(rx):.1f}°, RY={np.rad2deg(ry):.1f}°, RZ={np.rad2deg(rz):.1f}°")
+            print(
+                "[Piper][Debug] 原始指令值: "
+                f"X={X} Y={Y} Z={Z} RX={RX} RY={RY} RZ={RZ} speed={speed}"
+            )
             
-            # 设置运动模式: MOVE L (直线运动)
-            self.piper.MotionCtrl_2(0x01, 0x02, speed, 0)
+            # 设置运动模式: MOVE_P/MOVE_J/MOVE_L
+            print(f"[Piper][Debug] MotionCtrl_2(cmd=0x01, mode={self.config.move_mode:#04x}, speed, 0)")
+            self.piper.MotionCtrl_2(0x01, self.config.move_mode, speed, 0)
             time.sleep(0.05)
             
             # 发送目标位姿
+            print("[Piper][Debug] EndPoseCtrl(X, Y, Z, RX, RY, RZ)")
             self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+
+            # 运动后状态快照
+            self._print_arm_status(prefix="[Piper][Debug][AfterMoveCmd]")
             
             return True
             
         except Exception as e:
             print(f"[Piper] 移动失败: {e}")
             return False
+
+    def wait_until_pose(self, target: Dict[str, float], timeout_s: float,
+                        pos_tol_m: float, rot_tol_deg: float) -> bool:
+        """等待末端到达目标位姿（基于反馈位姿）"""
+        start = time.time()
+        last_pose = None
+        last_debug = 0.0
+        while time.time() - start < timeout_s:
+            if self._emergency_stop:
+                return False
+            pose = self.get_tcp_pose()
+            if pose is None:
+                time.sleep(0.1)
+                continue
+
+            last_pose = pose
+            dx = abs(pose['x'] - target['x'])
+            dy = abs(pose['y'] - target['y'])
+            dz = abs(pose['z'] - target['z'])
+            drx = abs(pose['rx_deg'] - target['rx_deg'])
+            dry = abs(pose['ry_deg'] - target['ry_deg'])
+            drz = abs(pose['rz_deg'] - target['rz_deg'])
+
+            if (dx <= pos_tol_m and dy <= pos_tol_m and dz <= pos_tol_m and
+                    drx <= rot_tol_deg and dry <= rot_tol_deg and drz <= rot_tol_deg):
+                return True
+
+            # 每 1 秒打印一次调试信息
+            now = time.time()
+            if now - last_debug >= 1.0:
+                print(
+                    "[Piper][Debug][Tracking] "
+                    f"Δx={dx:.3f} Δy={dy:.3f} Δz={dz:.3f} "
+                    f"Δrx={drx:.1f} Δry={dry:.1f} Δrz={drz:.1f}"
+                )
+                self._print_arm_status(prefix="[Piper][Debug][Tracking]")
+                last_debug = now
+
+            time.sleep(0.1)
+
+        if last_pose:
+            print(
+                "[Piper][Debug] 运动超时，当前位姿: "
+                f"X={last_pose['x']:.3f} Y={last_pose['y']:.3f} Z={last_pose['z']:.3f} "
+                f"RX={last_pose['rx_deg']:.1f} RY={last_pose['ry_deg']:.1f} RZ={last_pose['rz_deg']:.1f}"
+            )
+        return False
     
     def set_gripper(self, angle_deg: float, effort: int = 500) -> bool:
         """设置夹爪开度
@@ -318,17 +504,53 @@ class PiperController:
             return False
         
         try:
+            # 确保处于控制模式
+            self._ensure_control_mode()
+
             angle_raw = int(angle_deg * 1000)
             effort_raw = int(effort)
             
             print(f"[Piper] 设置夹爪: 角度={angle_deg}°, 力度={effort}")
             self.piper.GripperCtrl(angle_raw, effort_raw, 0x01, 0)
-            
-            return True
+
+            # 闭环等待到位
+            reached = self.wait_until_gripper(
+                target_angle_deg=angle_deg,
+                timeout_s=self.config.gripper_timeout_s,
+                tol_deg=self.config.gripper_tolerance_deg,
+            )
+            if not reached:
+                print("[Piper][Debug] 夹爪未在超时内到达目标")
+            return reached
             
         except Exception as e:
             print(f"[Piper] 夹爪控制失败: {e}")
             return False
+
+    def wait_until_gripper(self, target_angle_deg: float, timeout_s: float,
+                           tol_deg: float) -> bool:
+        """等待夹爪到达目标角度"""
+        start = time.time()
+        last_status = None
+        while time.time() - start < timeout_s:
+            if self._emergency_stop:
+                return False
+            status = self.get_gripper_status()
+            if status is None:
+                time.sleep(0.05)
+                continue
+            last_status = status
+            err = abs(status['angle'] - target_angle_deg)
+            if err <= tol_deg:
+                return True
+            time.sleep(0.05)
+
+        if last_status is not None:
+            print(
+                "[Piper][Debug] 夹爪超时，当前角度: "
+                f"{last_status['angle']:.1f}° (目标 {target_angle_deg:.1f}°)"
+            )
+        return False
     
     def open_gripper(self) -> bool:
         """打开夹爪"""
@@ -357,6 +579,83 @@ class CameraTest:
         self.front_cam = None
         self.wrist_cam = None
     
+    def _resolve_camera_source(self, camera_id: Union[int, str]):
+        """将相机标识解析为可用的 VideoCapture 源
+
+        支持:
+        - 整数索引 (如 8)
+        - /dev/videoX 路径
+        - /dev/v4l/by-id/ 下的设备名或其子串 (如 Orbbec_Gemini_335L, Dabai_DC1)
+        """
+        if isinstance(camera_id, int):
+            return camera_id
+
+        if isinstance(camera_id, str):
+            cam_str = camera_id.strip()
+            if cam_str.isdigit():
+                return int(cam_str)
+
+            if cam_str.startswith("/dev/video") or cam_str.startswith("/dev/v4l/"):
+                return cam_str
+
+            try:
+                import os
+                from pathlib import Path
+
+                by_id_dir = Path("/dev/v4l/by-id")
+                if by_id_dir.exists():
+                    matches = []
+                    for p in by_id_dir.iterdir():
+                        if cam_str in p.name:
+                            matches.append(p)
+
+                    # 优先选择 video-index0
+                    matches.sort(key=lambda p: (
+                        0 if "video-index0" in p.name else 1,
+                        0 if "video-index1" in p.name else 1,
+                        p.name,
+                    ))
+
+                    if matches:
+                        return str(matches[0].resolve())
+            except Exception:
+                pass
+
+        return camera_id
+
+    def _is_camera_enabled(self, camera_id: Union[int, str]) -> bool:
+        """判断相机是否启用（支持 -1 或 "-1"）"""
+        if isinstance(camera_id, int):
+            return camera_id >= 0
+        if isinstance(camera_id, str):
+            return camera_id.strip() != "-1"
+        return False
+
+    def _open_camera(self, camera_id: Union[int, str]):
+        """优先使用 V4L2 打开，必要时回退到 obsensor 后端"""
+        import cv2
+
+        source = self._resolve_camera_source(camera_id)
+
+        # 首选 V4L2，避免 OpenCV 走 Orbbec obsensor 后端
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        if cap.isOpened():
+            return cap
+
+        # 尝试 Orbbec obsensor 后端（如 Dabai / Gemini）
+        obsensor_backend = getattr(cv2, "CAP_OBSENSOR", None)
+        if obsensor_backend is not None:
+            cap = cv2.VideoCapture(source, obsensor_backend)
+            if cap.isOpened():
+                return cap
+
+        # 回退 CAP_ANY
+        cap = cv2.VideoCapture(source)
+        if cap.isOpened():
+            return cap
+
+        return cap
+
     def test_camera(self, camera_id: int, name: str) -> bool:
         """测试单个相机"""
         try:
@@ -364,7 +663,7 @@ class CameraTest:
             
             print(f"[Camera] 测试 {name} (ID={camera_id})...")
             
-            cap = cv2.VideoCapture(camera_id)
+            cap = self._open_camera(camera_id)
             if not cap.isOpened():
                 print(f"[Camera] ✗ 无法打开 {name}")
                 return False
@@ -404,7 +703,7 @@ class CameraTest:
         )
         
         # 测试腕部相机 (如果配置了)
-        if self.config.wrist_camera_id >= 0:
+        if self._is_camera_enabled(self.config.wrist_camera_id):
             results['wrist'] = self.test_camera(
                 self.config.wrist_camera_id,
                 "腕部相机"
@@ -423,7 +722,7 @@ class CameraTest:
             print(f"[Camera] 显示 {name} 预览 ({duration}秒)...")
             print("         按 Q 提前退出预览")
             
-            cap = cv2.VideoCapture(camera_id)
+            cap = self._open_camera(camera_id)
             if not cap.isOpened():
                 print(f"[Camera] ✗ 无法打开 {name}")
                 return
@@ -456,48 +755,17 @@ class CameraTest:
 # ==================== 键盘处理 ====================
 
 class KeyboardHandler:
-    """键盘输入处理"""
+    """键盘输入处理（仅在终端输入时响应）"""
     
     def __init__(self):
         self._running = True
         self._last_key: Optional[str] = None
         self._key_lock = threading.Lock()
         self._keyboard_available = False
-        self._listener = None
         
     def start(self):
-        """启动键盘监听"""
-        try:
-            from pynput import keyboard
-            
-            def on_press(key):
-                try:
-                    if hasattr(key, 'char') and key.char:
-                        with self._key_lock:
-                            self._last_key = key.char.lower()
-                    elif key == keyboard.Key.space:
-                        with self._key_lock:
-                            self._last_key = 'space'
-                    elif key == keyboard.Key.esc:
-                        with self._key_lock:
-                            self._last_key = 'esc'
-                except:
-                    pass
-            
-            self._listener = keyboard.Listener(on_press=on_press)
-            self._listener.start()
-            self._keyboard_available = True
-            print("[Keyboard] ✓ 键盘监听已启动 (pynput)")
-            
-        except ImportError:
-            print("[Keyboard] ⚠ pynput 未安装，尝试使用备用方案...")
-            print("           可以安装: pip install pynput")
-            self._keyboard_available = False
-            self._start_fallback()
-    
-    def _start_fallback(self):
-        """备用方案：使用 input()"""
-        print("[Keyboard] 使用 input() 模式 - 输入命令后按回车")
+        """启动键盘监听（使用 input() 模式，仅响应终端输入）"""
+        print("[Keyboard] 使用终端输入模式 - 输入命令后按回车")
         self._keyboard_available = True
         
         def input_thread():
@@ -507,8 +775,7 @@ class KeyboardHandler:
                     with self._key_lock:
                         if cmd:
                             self._last_key = cmd[0].lower()
-                        elif cmd == '':
-                            self._last_key = 'space'
+                        # 空输入忽略
                 except EOFError:
                     break
                 except:
@@ -518,7 +785,7 @@ class KeyboardHandler:
         t.start()
     
     def get_key(self) -> Optional[str]:
-        """获取最近按下的键"""
+        """获取最近输入的命令"""
         with self._key_lock:
             key = self._last_key
             self._last_key = None
@@ -527,11 +794,6 @@ class KeyboardHandler:
     def stop(self):
         """停止键盘监听"""
         self._running = False
-        if self._listener:
-            try:
-                self._listener.stop()
-            except:
-                pass
 
 
 # ==================== 主测试程序 ====================
@@ -689,7 +951,7 @@ class SystemTester:
             duration=10.0
         )
         
-        if self.config.wrist_camera_id >= 0:
+        if self.camera_test._is_camera_enabled(self.config.wrist_camera_id):
             self.camera_test.show_camera_preview(
                 self.config.wrist_camera_id,
                 "腕部相机", 
@@ -744,6 +1006,33 @@ class SystemTester:
         print(f"[Motion] Home 位置: ({x:.3f}, {y:.3f}, {z:.3f})m")
         print(f"[Motion] Home 姿态: ({np.rad2deg(rx):.1f}, {np.rad2deg(ry):.1f}, {np.rad2deg(rz):.1f})°")
         print()
+        # Debug: 当前实时位姿与目标位姿对比
+        current_pose = self.piper.get_tcp_pose()
+        if current_pose is not None:
+            dx = x - current_pose['x']
+            dy = y - current_pose['y']
+            dz = z - current_pose['z']
+            drx = np.rad2deg(rx) - current_pose['rx_deg']
+            dry = np.rad2deg(ry) - current_pose['ry_deg']
+            drz = np.rad2deg(rz) - current_pose['rz_deg']
+            print(
+                "[Motion][Debug] 目标Home: "
+                f"X={x:.3f} Y={y:.3f} Z={z:.3f} "
+                f"RX={np.rad2deg(rx):.1f} RY={np.rad2deg(ry):.1f} RZ={np.rad2deg(rz):.1f}"
+            )
+            print(
+                "[Motion][Debug] 当前TCP: "
+                f"X={current_pose['x']:.3f} Y={current_pose['y']:.3f} Z={current_pose['z']:.3f} "
+                f"RX={current_pose['rx_deg']:.1f} RY={current_pose['ry_deg']:.1f} RZ={current_pose['rz_deg']:.1f}"
+            )
+            print(
+                "[Motion][Debug] 差值(Target-Current): "
+                f"ΔX={dx:.3f} ΔY={dy:.3f} ΔZ={dz:.3f} "
+                f"ΔRX={drx:.1f} ΔRY={dry:.1f} ΔRZ={drz:.1f}"
+            )
+        else:
+            print("[Motion][Debug] 当前TCP位姿读取失败")
+        print()
         print("⚠ 警告: 机械臂即将移动！")
         print("  按 Space 紧急停止")
         print()
@@ -753,7 +1042,21 @@ class SystemTester:
         
         # 等待到达
         print("[Motion] 等待到达目标...")
-        time.sleep(3.0)
+        target = {
+            'x': x, 'y': y, 'z': z,
+            'rx_deg': np.rad2deg(rx),
+            'ry_deg': np.rad2deg(ry),
+            'rz_deg': np.rad2deg(rz),
+        }
+        reached = self.piper.wait_until_pose(
+            target,
+            timeout_s=self.config.motion_timeout_s,
+            pos_tol_m=self.config.pose_tolerance_pos_m,
+            rot_tol_deg=self.config.pose_tolerance_rot_deg,
+        )
+        if not reached:
+            print("[Motion] ✗ 未在超时内到达目标")
+            return False
         
         if self.piper.is_emergency_stopped():
             return False
@@ -770,9 +1073,12 @@ class SystemTester:
             print("[Test] ✗ 请先使能机械臂 (按 2)")
             return False
         
-        rx, ry, rz = self.config.home_orientation
+        # 使用 desk_center_orientation，让夹爪指向下方
+        rx, ry, rz = self.config.desk_center_orientation
         
         print(f"[Motion] 将依次移动到 {len(self.config.test_positions)} 个测试点")
+        cx, cy, cz = self.config.desk_center_position
+        print(f"[Motion] 桌面中心参考: ({cx:.3f}, {cy:.3f}, {cz:.3f})m")
         print()
         print("⚠ 警告: 机械臂即将移动！")
         print("  按 Space 紧急停止")
@@ -787,14 +1093,39 @@ class SystemTester:
             
             if not self.piper.move_to_pose(x, y, z, rx, ry, rz):
                 return False
-            
-            time.sleep(2.0)
+
+            target = {
+                'x': x, 'y': y, 'z': z,
+                'rx_deg': np.rad2deg(rx),
+                'ry_deg': np.rad2deg(ry),
+                'rz_deg': np.rad2deg(rz),
+            }
+            reached = self.piper.wait_until_pose(
+                target,
+                timeout_s=self.config.motion_timeout_s,
+                pos_tol_m=self.config.pose_tolerance_pos_m,
+                rot_tol_deg=self.config.pose_tolerance_rot_deg,
+            )
+            if not reached:
+                print("[Motion] ✗ 未在超时内到达目标")
+                return False
         
         # 返回 Home
         print("[Motion] 返回 Home...")
         x, y, z = self.config.home_position
         self.piper.move_to_pose(x, y, z, rx, ry, rz)
-        time.sleep(2.0)
+        target = {
+            'x': x, 'y': y, 'z': z,
+            'rx_deg': np.rad2deg(rx),
+            'ry_deg': np.rad2deg(ry),
+            'rz_deg': np.rad2deg(rz),
+        }
+        self.piper.wait_until_pose(
+            target,
+            timeout_s=self.config.motion_timeout_s,
+            pos_tol_m=self.config.pose_tolerance_pos_m,
+            rot_tol_deg=self.config.pose_tolerance_rot_deg,
+        )
         
         print("[Motion] ✓ 多点位运动测试完成")
         return True
@@ -893,6 +1224,8 @@ class SystemTester:
                     
                     elif key == 'q':
                         print("\n退出程序...")
+                        self._return_home_before_exit()
+                        self.piper.disable()
                         return
                     
                     elif key == 'r':
@@ -941,6 +1274,8 @@ class SystemTester:
                     
                     elif key == 'esc':
                         print("\n退出程序...")
+                        self._return_home_before_exit()
+                        self.piper.disable()
                         return
                     
                     time.sleep(0.05)
@@ -951,8 +1286,39 @@ class SystemTester:
                 
         except KeyboardInterrupt:
             print("\n\n收到中断信号，退出...")
+            self._return_home_before_exit()
         finally:
             self.cleanup()
+    
+    def _return_home_before_exit(self):
+        """退出前返回 Home 位置"""
+        if not self.piper.enabled or self.piper.is_emergency_stopped():
+            print("[Exit] 机械臂未使能或已紧急停止，跳过返回 Home")
+            return
+        
+        print("[Exit] 返回 Home 位置...")
+        x, y, z = self.config.home_position
+        rx, ry, rz = self.config.home_orientation
+        
+        if self.piper.move_to_pose(x, y, z, rx, ry, rz):
+            target = {
+                'x': x, 'y': y, 'z': z,
+                'rx_deg': np.rad2deg(rx),
+                'ry_deg': np.rad2deg(ry),
+                'rz_deg': np.rad2deg(rz),
+            }
+            reached = self.piper.wait_until_pose(
+                target,
+                timeout_s=self.config.motion_timeout_s,
+                pos_tol_m=self.config.pose_tolerance_pos_m,
+                rot_tol_deg=self.config.pose_tolerance_rot_deg,
+            )
+            if reached:
+                print("[Exit] ✓ 已返回 Home 位置")
+            else:
+                print("[Exit] ⚠ 返回 Home 位置超时")
+        else:
+            print("[Exit] ⚠ 无法移动到 Home 位置")
     
     def cleanup(self):
         """清理资源"""
@@ -979,15 +1345,13 @@ def main():
     )
     parser.add_argument(
         '--front-cam', '-f',
-        type=int,
-        default=0,
-        help='前置相机 ID (默认: 0)'
+        default='Orbbec_Gemini_335L',
+        help='前置相机 ID/名称 (默认: Orbbec_Gemini_335L)'
     )
     parser.add_argument(
         '--wrist-cam', '-w',
-        type=int,
-        default=-1,
-        help='腕部相机 ID (默认: -1, 表示无腕部相机)'
+        default='Dabai_DC1',
+        help='腕部相机 ID/名称 (默认: Dabai_DC1; 使用 -1 表示无腕部相机)'
     )
     parser.add_argument(
         '--speed', '-s',
@@ -999,10 +1363,20 @@ def main():
     args = parser.parse_args()
     
     # 创建配置
+    def _normalize_cam_value(value):
+        if isinstance(value, str):
+            v = value.strip()
+            if v == "-1":
+                return -1
+            if v.isdigit():
+                return int(v)
+            return v
+        return value
+
     config = TestConfig(
         can_interface=args.can,
-        front_camera_id=args.front_cam,
-        wrist_camera_id=args.wrist_cam,
+        front_camera_id=_normalize_cam_value(args.front_cam),
+        wrist_camera_id=_normalize_cam_value(args.wrist_cam),
         motion_speed_percent=args.speed,
     )
     
@@ -1010,7 +1384,12 @@ def main():
     print("\n配置:")
     print(f"  CAN 接口: {config.can_interface}")
     print(f"  前置相机: {config.front_camera_id}")
-    print(f"  腕部相机: {config.wrist_camera_id if config.wrist_camera_id >= 0 else '未配置'}")
+    def _format_cam_value(value):
+        if isinstance(value, int):
+            return value if value >= 0 else '未配置'
+        return value
+
+    print(f"  腕部相机: {_format_cam_value(config.wrist_camera_id)}")
     print(f"  运动速度: {config.motion_speed_percent}%")
     
     # 运行测试

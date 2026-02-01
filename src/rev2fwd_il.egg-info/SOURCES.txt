@@ -12,8 +12,11 @@ src/rev2fwd_il/data/io_npz.py
 src/rev2fwd_il/data/normalize.py
 src/rev2fwd_il/data/recorder.py
 src/rev2fwd_il/data/reverse_time.py
+src/rev2fwd_il/data/visualize_action_chunk.py
+src/rev2fwd_il/data/visualize_xyz_curve.py
 src/rev2fwd_il/eval/__init__.py
 src/rev2fwd_il/eval/rollout.py
+src/rev2fwd_il/eval/waypoint_executor.py
 src/rev2fwd_il/experts/__init__.py
 src/rev2fwd_il/experts/pickplace_expert_b.py
 src/rev2fwd_il/models/__init__.py
@@ -26,4 +29,5 @@ src/rev2fwd_il/sim/scene_api.py
 src/rev2fwd_il/sim/task_spec.py
 src/rev2fwd_il/train/__init__.py
 src/rev2fwd_il/train/bc_trainer.py
+src/rev2fwd_il/train/lerobot_train_with_viz.py
 src/rev2fwd_il/utils/seed.py

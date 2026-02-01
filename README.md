@@ -12,9 +12,25 @@ conda create -n rev2fwd_il python=3.11
 conda activate rev2fwd_il
 pip install -U torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install isaaclab[isaacsim,all]==2.3.0 --extra-index-url https://pypi.nvidia.com
-pip install wandb==0.24.0 lerobot==0.4.2
+pip install wandb==0.24.0 
+pip install lerobot==0.4.2
+# pip install numpy==1.26.0
 pip install -e ./isaaclab_tasks
 pip install -e .
+```
+
+### (Optional) Piper SDK for Real-Robot Experiments
+
+If you plan to run the real Piper arm scripts under [scripts/scripts_piper_local](scripts/scripts_piper_local), install the Piper SDK and its dependencies:
+
+```bash
+pip install -e ./piper_sdk
+pip install piper_sdk>=0.1.9
+pip install python-can>=4.3.1
+pip install opencv-python==4.9.0.80
+pip install scipy
+pip install keyboard
+# pip install numpy==1.26.0
 ```
 
 ---
