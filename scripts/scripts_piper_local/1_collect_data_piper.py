@@ -2,59 +2,73 @@
 """Script 1: Data Collection for Piper Pick & Place Task.
 
 This script collects Task B trajectories using a finite state machine (FSM) expert:
-- Task B: Pick from **plate center** → Place at **random table position**
+- Task B: Pick from **desk center** → Place at **random table position**
 
 The collected trajectories will later be time-reversed to generate Task A training data.
+
+Configuration calibrated from 0_system_test.py:
+- Home position: (0.054, 0.0, 0.175)m with orientation (180°, 68.8°, 180°)
+- Desk center (pick): (0.25, 0.0, 0.16)m with orientation (180°, 17.2°, 180°)
+- Random place offset: ±0.15m in X and Y directions
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-# Basic usage
+# Basic usage with default cameras (Orbbec_Gemini_335L + Dabai_DC1)
 python 1_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
 
-# Full options
-python 1_collect_data_piper.py \
-    --can_interface can0 \
-    --num_episodes 100 \
-    --out_dir data/piper_pick_place \
-    --control_freq 30 \
-    --image_width 640 \
-    --image_height 480 \
-    --fixed_cam_id 0 \
-    --wrist_cam_id 1 \
+# Specify cameras by device name
+python 1_collect_data_piper.py -f Orbbec_Gemini_335L -w Dabai_DC1
+
+# Disable wrist camera
+python 1_collect_data_piper.py --wrist_cam -1
+
+# Custom workspace parameters
+python 1_collect_data_piper.py \\
+    --can_interface can0 \\
+    --num_episodes 100 \\
+    --out_dir data/piper_pick_place \\
+    --plate_x 0.25 --plate_y 0.0 \\
+    --grasp_height 0.16 --hover_height 0.25 \\
+    --speed 20 \\
     --seed 42
 
+python scripts/scripts_piper_local/1_collect_data_piper.py --num_episodes 1 --out_dir data/piper_pick_place
+
+
 =============================================================================
-KEYBOARD CONTROLS
+KEYBOARD CONTROLS (Terminal Input Mode)
 =============================================================================
-| Key   | Action                              |
-|-------|-------------------------------------|
-| SPACE | Start new episode                   |
-| ESC   | Emergency stop (freeze arm)         |
-| Q     | Quit and save all data              |
-| R     | Reset to home position              |
-| S     | Skip current episode (discard)      |
+| Input         | Action                              |
+|---------------|-------------------------------------|
+| ENTER / start | Start new episode                   |
+| e / esc       | Emergency stop (freeze arm)         |
+| q / quit      | Quit and save all data              |
+| r / reset     | Reset to home position              |
+| s / skip      | Skip current episode (discard)      |
 
 =============================================================================
 FSM STATES
 =============================================================================
 IDLE → GO_TO_HOME → HOVER_PLATE → LOWER_GRASP → CLOSE_GRIP → LIFT_OBJECT 
-     → HOVER_PLACE → LOWER_PLACE → OPEN_GRIP → LIFT_RETREAT → DONE → IDLE
+     → HOVER_PLACE → LOWER_PLACE → OPEN_GRIP → LIFT_RETREAT → RETURN_HOME → DONE → IDLE
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import platform
 import random
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -65,40 +79,57 @@ from piper_sdk import C_PiperInterface_V2
 
 
 # =============================================================================
-# Constants and Parameters
+# Constants and Parameters (Calibrated from 0_system_test.py)
 # =============================================================================
 
-# === Workspace Parameters ===
-PLATE_CENTER = (0.0, 0.15, 0.0)       # Pick position (fixed) in meters
-GRASP_HEIGHT = 0.15                    # Z height for grasping (meters)
-HOVER_HEIGHT = 0.25                    # Safe height for movement (meters)
-RANDOM_RANGE_X = (-0.1, 0.1)           # Random X offset from plate center
-RANDOM_RANGE_Y = (-0.1, 0.1)           # Random Y offset from plate center
+# === Home Position (calibrated from script 0) ===
+HOME_POSITION = (0.054, 0.0, 0.175)     # X, Y, Z in meters
+HOME_ORIENTATION = (3.14, 1.2, 3.14)    # RX, RY, RZ in radians (~180°, 68.8°, 180°)
+
+# === Workspace Parameters (calibrated from script 0) ===
+# Pick position: desk center (same as script 0)
+PLATE_CENTER = (0.25, 0.0, 0.16)        # Pick position (X, Y, Z) in meters
+GRASP_HEIGHT = 0.16                      # Z height for grasping (meters)
+HOVER_HEIGHT = 0.25                      # Safe height for movement (meters)
+
+# === Place offset (random range from pick position) ===
+# From script 0: place_offset = (-0.15, -0.15, 0.0) as max random range
+RANDOM_RANGE_X = (-0.15, 0.15)           # Random X offset from plate center
+RANDOM_RANGE_Y = (-0.15, 0.15)           # Random Y offset from plate center
+
+# === Grasp Orientation (calibrated from script 0) ===
+# desk_center_orientation: (3.14, 0.3, 3.14) radians (~180°, 17.2°, 180°)
+DEFAULT_ORIENTATION_RAD = (3.14, 0.3, 3.14)  # RX, RY, RZ in radians
+DEFAULT_ORIENTATION_EULER = tuple(np.rad2deg(r) for r in DEFAULT_ORIENTATION_RAD)  # in degrees
 
 # === Control Parameters ===
-CONTROL_FREQ = 30                      # Hz
-POSITION_TOLERANCE = 0.005             # 5mm position tolerance
-ORIENTATION_TOLERANCE = 2.0            # 2 degrees tolerance
-GRIPPER_OPEN_POS = 70000               # Gripper open position (0.001mm = 70mm)
-GRIPPER_CLOSE_POS = 0                  # Gripper closed position
-GRIPPER_SPEED = 1000                   # Gripper speed
-GRIPPER_EFFORT = 500                   # Gripper force (0.001 N/m)
+CONTROL_FREQ = 30                        # Hz
+POSITION_TOLERANCE = 0.015               # 15mm position tolerance (from script 0)
+ORIENTATION_TOLERANCE = 5.0              # 5 degrees tolerance (from script 0)
+GRIPPER_OPEN_ANGLE = 70.0                # Gripper open angle in degrees
+GRIPPER_CLOSE_ANGLE = 0.0                # Gripper closed angle in degrees
+GRIPPER_EFFORT = 500                     # Gripper force (0-1000)
+GRIPPER_TOLERANCE = 50.0                 # Gripper angle tolerance in degrees
 
 # === Motion Parameters ===
-MOTION_SPEED_PERCENT = 20              # Conservative speed (0-100%)
-SETTLE_TIME = 0.5                      # Seconds to wait after reaching position
-GRIPPER_WAIT_TIME = 0.5                # Seconds to wait for gripper action
+MOTION_SPEED_PERCENT = 20                # Conservative speed (0-100%)
+MOVE_MODE = 0x00                         # Motion mode: 0x00=MOVE_P, 0x01=MOVE_J, 0x02=MOVE_L
+SETTLE_TIME = 0.5                        # Seconds to wait after reaching position
+GRIPPER_WAIT_TIME = 0.5                  # Seconds to wait for gripper action
+MOTION_TIMEOUT = 10.0                    # Motion timeout in seconds
+GRIPPER_TIMEOUT = 3.0                    # Gripper operation timeout
+ENABLE_TIMEOUT = 5.0                     # Arm enable timeout
 
-# === Workspace Limits (Safety) ===
+# === Workspace Limits (Safety, from script 0) ===
 WORKSPACE_LIMITS = {
-    "x_min": -0.3,  "x_max": 0.3,
-    "y_min": 0.0,   "y_max": 0.4,
-    "z_min": 0.05,  "z_max": 0.4,
+    "x_min": -0.3,  "x_max": 0.5,
+    "y_min": -0.3,  "y_max": 0.3,
+    "z_min": 0.05,  "z_max": 0.50,
 }
 
-# === Default Orientation (gripper pointing down) ===
-# You may need to calibrate this for your setup
-DEFAULT_ORIENTATION_EULER = (180.0, 0.0, 0.0)  # RX, RY, RZ in degrees
+# === Camera Settings (from script 0) ===
+DEFAULT_FRONT_CAMERA = "Orbbec_Gemini_335L"  # Front camera name/ID
+DEFAULT_WRIST_CAMERA = "Dabai_DC1"           # Wrist camera name/ID (-1 to disable)
 
 
 # =============================================================================
@@ -117,6 +148,7 @@ class FSMState(Enum):
     LOWER_PLACE = auto()
     OPEN_GRIP = auto()
     LIFT_RETREAT = auto()
+    RETURN_HOME = auto()
     DONE = auto()
 
 
@@ -158,27 +190,104 @@ def sdk_to_degrees(value_sdk: int) -> float:
 
 
 # =============================================================================
-# Camera Wrapper
+# Camera Wrapper (Enhanced from script 0)
 # =============================================================================
 
 class CameraCapture:
-    """Wrapper for USB camera capture."""
+    """Wrapper for USB camera capture with device name resolution."""
     
-    def __init__(self, camera_id: int, width: int = 640, height: int = 480):
+    def __init__(self, camera_id: Union[int, str], width: int = 640, height: int = 480, name: str = ""):
         self.camera_id = camera_id
         self.width = width
         self.height = height
+        self.name = name or str(camera_id)
         self.cap = None
         self._lock = threading.Lock()
         self._latest_frame = None
         self._running = False
         self._thread = None
+        self._resolved_source = None
+    
+    def _resolve_camera_source(self, camera_id: Union[int, str]):
+        """Resolve camera identifier to VideoCapture source.
+        
+        Supports:
+        - Integer index (e.g., 8)
+        - /dev/videoX path
+        - Device name substring from /dev/v4l/by-id/ (e.g., Orbbec_Gemini_335L, Dabai_DC1)
+        
+        For cameras with multiple video nodes (e.g., Orbbec depth cameras), 
+        prioritizes video-index0 which is typically the RGB stream.
+        """
+        if isinstance(camera_id, int):
+            return camera_id
+        
+        if isinstance(camera_id, str):
+            cam_str = camera_id.strip()
+            
+            # Check if it's a numeric string
+            if cam_str.isdigit():
+                return int(cam_str)
+            
+            # Check if it's a direct path
+            if cam_str.startswith("/dev/video") or cam_str.startswith("/dev/v4l/"):
+                return cam_str
+            
+            # Try to find by name in /dev/v4l/by-id/
+            try:
+                from pathlib import Path
+                by_id_dir = Path("/dev/v4l/by-id")
+                if by_id_dir.exists():
+                    matches = []
+                    for p in by_id_dir.iterdir():
+                        if cam_str in p.name:
+                            matches.append(p)
+                    
+                    # Prioritize video-index0 (RGB stream), then video-index1, then others
+                    # This is critical for Orbbec/Dabai cameras with multiple video nodes
+                    matches.sort(key=lambda p: (
+                        0 if "video-index0" in p.name else 1,
+                        0 if "video-index1" in p.name else 1,
+                        p.name,
+                    ))
+                    
+                    if matches:
+                        real_path = str(matches[0].resolve())
+                        print(f"[Camera] Resolved '{camera_id}' -> {real_path}")
+                        return real_path
+            except Exception:
+                pass
+        
+        return camera_id
+    
+    def _open_camera(self, source):
+        """Open camera with V4L2 backend first, fallback to others."""
+        # Try V4L2 backend first (preferred for Linux)
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        if cap.isOpened():
+            return cap
+        
+        # Try Orbbec obsensor backend if available
+        obsensor_backend = getattr(cv2, "CAP_OBSENSOR", None)
+        if obsensor_backend is not None:
+            cap = cv2.VideoCapture(source, obsensor_backend)
+            if cap.isOpened():
+                return cap
+        
+        # Fallback to CAP_ANY
+        cap = cv2.VideoCapture(source)
+        if cap.isOpened():
+            return cap
+        
+        return None
         
     def start(self):
         """Start camera capture in background thread."""
-        self.cap = cv2.VideoCapture(self.camera_id)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {self.camera_id}")
+        self._resolved_source = self._resolve_camera_source(self.camera_id)
+        self.cap = self._open_camera(self._resolved_source)
+        
+        if self.cap is None or not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open camera {self.camera_id} (resolved: {self._resolved_source})")
         
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
@@ -194,9 +303,9 @@ class CameraCapture:
             time.sleep(0.1)
         
         if self._latest_frame is None:
-            raise RuntimeError(f"Camera {self.camera_id} not returning frames")
+            raise RuntimeError(f"Camera {self.name} not returning frames")
         
-        print(f"[Camera {self.camera_id}] Started ({self.width}x{self.height})")
+        print(f"[Camera {self.name}] Started ({self.width}x{self.height})")
         
     def _capture_loop(self):
         """Background thread for continuous capture."""
@@ -223,60 +332,196 @@ class CameraCapture:
             self._thread.join(timeout=1.0)
         if self.cap is not None:
             self.cap.release()
-        print(f"[Camera {self.camera_id}] Stopped")
+        print(f"[Camera {self.name}] Stopped")
+
+
+def is_camera_enabled(camera_id: Union[int, str]) -> bool:
+    """Check if camera is enabled (not -1 or "-1")."""
+    if isinstance(camera_id, int):
+        return camera_id >= 0
+    if isinstance(camera_id, str):
+        return camera_id.strip() != "-1"
+    return False
 
 
 # =============================================================================
-# Piper Arm Controller
+# Piper Arm Controller (Enhanced from script 0)
 # =============================================================================
 
 class PiperController:
-    """High-level controller for Piper robotic arm."""
+    """High-level controller for Piper robotic arm (verified from script 0)."""
     
     def __init__(self, can_interface: str = "can0"):
         self.can_interface = can_interface
-        self.piper = None
+        self.piper: Optional[Any] = None
         self._emergency_stop = False
-        self._home_position = None
+        self._home_position = HOME_POSITION
+        self._home_orientation = HOME_ORIENTATION
+        self.connected = False
+        self.enabled = False
         
-    def connect(self):
+    def connect(self) -> bool:
         """Connect to the Piper arm."""
-        print(f"[Piper] Connecting via {self.can_interface}...")
-        self.piper = C_PiperInterface_V2(self.can_interface)
-        self.piper.ConnectPort()
+        try:
+            print(f"[Piper] Connecting via {self.can_interface}...")
+            self.piper = C_PiperInterface_V2(self.can_interface)
+            self.piper.ConnectPort()
+            
+            # Wait for connection to stabilize
+            time.sleep(0.5)
+            self.connected = True
+            print("[Piper] ✓ Connected")
+            return True
+        except Exception as e:
+            print(f"[Piper] ✗ Connection failed: {e}")
+            print(f"[Piper] If CAN interface is not UP, run:")
+            print(f"       sudo ip link set {self.can_interface} up type can bitrate 1000000")
+            return False
+    
+    def enable(self) -> bool:
+        """Enable the arm (verified method from script 0)."""
+        if not self.connected or self.piper is None:
+            print("[Piper] ✗ Not connected, cannot enable")
+            return False
         
-        # Enable the arm
-        print("[Piper] Enabling arm...")
-        while not self.piper.EnablePiper():
-            time.sleep(0.01)
-        
-        # Set motion mode: CAN command control, MOVE L (linear), conservative speed
-        self.piper.MotionCtrl_2(0x01, 0x02, MOTION_SPEED_PERCENT, 0x00)
-        
-        # Enable gripper
-        self.piper.GripperCtrl(GRIPPER_OPEN_POS, GRIPPER_SPEED, 0x01, 0)
-        
-        print("[Piper] Connected and enabled!")
+        try:
+            print("[Piper] Enabling arm...")
+            
+            # Send enable command (EnableArm with parameter 7)
+            self.piper.EnableArm(7)
+            
+            # Ensure control mode (exit teaching mode)
+            self._ensure_control_mode()
+            
+            # Set motion mode (verified from script 0)
+            self.piper.MotionCtrl_2(0x01, MOVE_MODE, MOTION_SPEED_PERCENT, 0)
+            
+            # Enable gripper
+            self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
+            
+            # Wait for enable completion
+            start_time = time.time()
+            while time.time() - start_time < ENABLE_TIMEOUT:
+                if self._check_enabled():
+                    self.enabled = True
+                    print("[Piper] ✓ Enabled")
+                    return True
+                time.sleep(0.1)
+            
+            print("[Piper] ✗ Enable timeout")
+            self._print_arm_status()
+            return False
+        except Exception as e:
+            print(f"[Piper] ✗ Enable failed: {e}")
+            return False
+    
+    def _ensure_control_mode(self):
+        """Ensure exit teaching mode and enter control mode."""
+        try:
+            status = self._read_arm_status()
+            if not status:
+                return
+            ctrl_mode_val = status.get('ctrl_mode_val')
+            # If in teaching mode (ctrl_mode == 0), we need to exit it
+        except Exception as e:
+            print(f"[Piper][Debug] Control mode recovery failed: {e}")
+    
+    def _check_enabled(self) -> bool:
+        """Check if arm is enabled."""
+        try:
+            status = self._read_arm_status()
+            if status is None:
+                return False
+            
+            ctrl_mode_val = status.get('ctrl_mode_val')
+            # ctrl_mode != 0 means in control mode (CAN/Ethernet etc.)
+            ctrl_ok = ctrl_mode_val is not None and ctrl_mode_val != 0
+            
+            enable_list = self._get_enable_status()
+            enable_ok = bool(enable_list) and all(enable_list)
+            
+            return ctrl_ok and enable_ok
+        except:
+            return False
+    
+    def _get_enable_status(self) -> Optional[list]:
+        """Get joint enable status."""
+        try:
+            return self.piper.GetArmEnableStatus()
+        except:
+            return None
+    
+    def _read_arm_status(self) -> Optional[Dict[str, Any]]:
+        """Read arm status for debugging."""
+        try:
+            arm_status = self.piper.GetArmStatus()
+            status = arm_status.arm_status
+            ctrl_mode = getattr(status, 'ctrl_mode', None)
+            arm_state = getattr(status, 'arm_status', None)
+            mode_feed = getattr(status, 'mode_feed', None)
+            teach_status = getattr(status, 'teach_status', None)
+            motion_status = getattr(status, 'motion_status', None)
+            
+            return {
+                'ctrl_mode': ctrl_mode,
+                'arm_state': arm_state,
+                'mode_feed': mode_feed,
+                'teach_status': teach_status,
+                'motion_status': motion_status,
+                'ctrl_mode_val': int(ctrl_mode) if ctrl_mode is not None else None,
+                'arm_state_val': int(arm_state) if arm_state is not None else None,
+                'mode_feed_val': int(mode_feed) if mode_feed is not None else None,
+                'teach_status_val': int(teach_status) if teach_status is not None else None,
+                'motion_status_val': int(motion_status) if motion_status is not None else None,
+            }
+        except:
+            return None
+    
+    def _print_arm_status(self, prefix: str = "[Piper][Debug]"):
+        """Print arm status for debugging."""
+        status = self._read_arm_status()
+        if not status:
+            print(f"{prefix} Cannot read arm status")
+            return
+        print(
+            f"{prefix} ctrl_mode={status.get('ctrl_mode')}({status.get('ctrl_mode_val')}) "
+            f"arm_status={status.get('arm_state')}({status.get('arm_state_val')}) "
+            f"mode_feed={status.get('mode_feed')}({status.get('mode_feed_val')}) "
+            f"teach_status={status.get('teach_status')}({status.get('teach_status_val')}) "
+            f"motion_status={status.get('motion_status')}({status.get('motion_status_val')})"
+        )
         
     def disconnect(self):
         """Disable and disconnect from the arm."""
-        if self.piper is not None:
+        if self.piper is not None and self.enabled:
             print("[Piper] Disabling arm...")
-            self.piper.DisablePiper()
+            try:
+                self.piper.DisableArm(7)
+                self.enabled = False
+            except Exception as e:
+                print(f"[Piper] Disable error: {e}")
+        self.connected = False
+        self.piper = None
             
     def emergency_stop(self):
         """Trigger emergency stop (freeze arm)."""
         self._emergency_stop = True
         if self.piper is not None:
-            # Send current position to freeze
-            pose = self.get_ee_pose_sdk()
-            if pose is not None:
-                self.piper.EndPoseCtrl(*pose)
+            try:
+                # Stop motion
+                self.piper.MotionCtrl_2(0x02, MOVE_MODE, 0, 0)  # 0x02 = stop
+            except Exception as e:
+                print(f"[Piper] Emergency stop error: {e}")
         print("[Piper] EMERGENCY STOP ACTIVATED!")
         
     def clear_emergency_stop(self):
-        """Clear emergency stop flag."""
+        """Clear emergency stop flag and re-enable."""
         self._emergency_stop = False
+        if self.piper is not None:
+            try:
+                self.piper.MotionCtrl_2(0x01, MOVE_MODE, MOTION_SPEED_PERCENT, 0)
+            except:
+                pass
         print("[Piper] Emergency stop cleared.")
         
     def get_ee_pose_sdk(self) -> Optional[Tuple[int, int, int, int, int, int]]:
@@ -292,14 +537,40 @@ class PiperController:
             print(f"[Piper] Error reading pose: {e}")
             return None
     
-    def get_ee_pose_meters(self) -> Optional[Tuple[float, float, float, float, float, float]]:
-        """Get current end-effector pose in meters and degrees."""
-        pose_sdk = self.get_ee_pose_sdk()
-        if pose_sdk is None:
+    def get_ee_pose_meters(self) -> Optional[Dict[str, float]]:
+        """Get current end-effector pose in meters and radians (consistent with script 0)."""
+        if not self.connected or self.piper is None:
             return None
-        x, y, z = sdk_to_meters(pose_sdk[0]), sdk_to_meters(pose_sdk[1]), sdk_to_meters(pose_sdk[2])
-        rx, ry, rz = sdk_to_degrees(pose_sdk[3]), sdk_to_degrees(pose_sdk[4]), sdk_to_degrees(pose_sdk[5])
-        return (x, y, z, rx, ry, rz)
+        
+        try:
+            end_pose = self.piper.GetArmEndPoseMsgs()
+            
+            # SDK unit: 0.001mm -> meters
+            x = end_pose.end_pose.X_axis / 1_000_000.0
+            y = end_pose.end_pose.Y_axis / 1_000_000.0
+            z = end_pose.end_pose.Z_axis / 1_000_000.0
+            
+            # SDK unit: 0.001° -> radians
+            rx = np.deg2rad(end_pose.end_pose.RX_axis / 1000.0)
+            ry = np.deg2rad(end_pose.end_pose.RY_axis / 1000.0)
+            rz = np.deg2rad(end_pose.end_pose.RZ_axis / 1000.0)
+            
+            return {
+                'x': x, 'y': y, 'z': z,
+                'rx': rx, 'ry': ry, 'rz': rz,
+                'x_mm': x * 1000, 'y_mm': y * 1000, 'z_mm': z * 1000,
+                'rx_deg': np.rad2deg(rx), 'ry_deg': np.rad2deg(ry), 'rz_deg': np.rad2deg(rz),
+            }
+        except Exception as e:
+            print(f"[Piper] Error reading pose: {e}")
+            return None
+    
+    def get_ee_pose_tuple(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """Get current end-effector pose as tuple (x, y, z, rx_deg, ry_deg, rz_deg)."""
+        pose = self.get_ee_pose_meters()
+        if pose is None:
+            return None
+        return (pose['x'], pose['y'], pose['z'], pose['rx_deg'], pose['ry_deg'], pose['rz_deg'])
     
     def get_ee_pose_quat(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Get current end-effector pose as position (xyz) and quaternion (wxyz)."""
@@ -315,40 +586,106 @@ class PiperController:
         if self.piper is None:
             return None
         try:
-            msg = self.piper.GetArmGripperMsgs()
-            gripper_pos = msg.gripper_state.grippers_angle  # in 0.001mm
-            # Normalize: GRIPPER_CLOSE_POS=0 → 0, GRIPPER_OPEN_POS=70000 → 1
-            normalized = gripper_pos / GRIPPER_OPEN_POS
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_state = gripper_msgs.gripper_state
+            # SDK unit: 0.001° -> degrees
+            gripper_angle = gripper_state.grippers_angle / 1000.0
+            # Normalize: 0° → 0, 70° → 1
+            normalized = gripper_angle / GRIPPER_OPEN_ANGLE
             return max(0.0, min(1.0, normalized))
         except Exception as e:
             print(f"[Piper] Error reading gripper: {e}")
             return None
     
+    def get_gripper_status(self) -> Optional[Dict[str, Any]]:
+        """Get detailed gripper status."""
+        if not self.connected or self.piper is None:
+            return None
+        try:
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_state = gripper_msgs.gripper_state
+            return {
+                'angle': gripper_state.grippers_angle / 1000.0,  # degrees
+                'effort': gripper_state.grippers_effort / 1000.0,
+                'code': getattr(gripper_state, 'grippers_code', None),
+            }
+        except Exception as e:
+            print(f"[Piper] Error reading gripper status: {e}")
+            return None
+    
+    def move_to_pose(self, x: float, y: float, z: float,
+                     rx: float, ry: float, rz: float,
+                     speed_percent: int = None) -> bool:
+        """Move to specified pose (verified method from script 0).
+        
+        Args:
+            x, y, z: Position in meters
+            rx, ry, rz: Orientation in radians
+            speed_percent: Speed percentage (1-100)
+        
+        Returns:
+            True if command was sent successfully
+        """
+        if not self.enabled or self.piper is None:
+            print("[Piper] ✗ Not enabled, cannot move")
+            return False
+        
+        if self._emergency_stop:
+            print("[Piper] ✗ Emergency stop active, cannot move")
+            return False
+        
+        # Safety check
+        if z < WORKSPACE_LIMITS["z_min"]:
+            print(f"[Piper] ✗ Z={z:.3f}m below safety limit {WORKSPACE_LIMITS['z_min']}m")
+            return False
+        if z > WORKSPACE_LIMITS["z_max"]:
+            print(f"[Piper] ✗ Z={z:.3f}m above safety limit {WORKSPACE_LIMITS['z_max']}m")
+            return False
+        
+        # Clamp to workspace limits
+        x = max(WORKSPACE_LIMITS["x_min"], min(WORKSPACE_LIMITS["x_max"], x))
+        y = max(WORKSPACE_LIMITS["y_min"], min(WORKSPACE_LIMITS["y_max"], y))
+        
+        speed = speed_percent if speed_percent else MOTION_SPEED_PERCENT
+        
+        try:
+            # Ensure control mode
+            self._ensure_control_mode()
+            
+            # Check enable status
+            enable_list = self._get_enable_status()
+            if enable_list is not None and not all(enable_list):
+                print("[Piper] Re-enabling joints...")
+                self.piper.EnableArm(7)
+                time.sleep(0.2)
+            
+            # Convert to SDK units: meters -> 0.001mm, radians -> 0.001°
+            X = int(x * 1_000_000)
+            Y = int(y * 1_000_000)
+            Z = int(z * 1_000_000)
+            RX = int(np.rad2deg(rx) * 1000)
+            RY = int(np.rad2deg(ry) * 1000)
+            RZ = int(np.rad2deg(rz) * 1000)
+            
+            self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+            return True
+        except Exception as e:
+            print(f"[Piper] Move failed: {e}")
+            return False
+    
     def send_ee_pose(self, x: float, y: float, z: float, 
                      rx: float, ry: float, rz: float):
-        """Send target end-effector pose (meters and degrees).
+        """Send target end-effector pose (meters and degrees, legacy API).
         
         Args:
             x, y, z: Position in meters
             rx, ry, rz: Orientation in degrees (Euler XYZ)
         """
-        if self._emergency_stop:
-            return
-        
-        # Apply workspace limits for safety
-        x = max(WORKSPACE_LIMITS["x_min"], min(WORKSPACE_LIMITS["x_max"], x))
-        y = max(WORKSPACE_LIMITS["y_min"], min(WORKSPACE_LIMITS["y_max"], y))
-        z = max(WORKSPACE_LIMITS["z_min"], min(WORKSPACE_LIMITS["z_max"], z))
-        
-        # Convert to SDK units
-        X = meters_to_sdk(x)
-        Y = meters_to_sdk(y)
-        Z = meters_to_sdk(z)
-        RX = degrees_to_sdk(rx)
-        RY = degrees_to_sdk(ry)
-        RZ = degrees_to_sdk(rz)
-        
-        self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+        # Convert degrees to radians for move_to_pose
+        rx_rad = np.deg2rad(rx)
+        ry_rad = np.deg2rad(ry)
+        rz_rad = np.deg2rad(rz)
+        self.move_to_pose(x, y, z, rx_rad, ry_rad, rz_rad)
     
     def send_ee_pose_quat(self, pos: np.ndarray, quat: np.ndarray):
         """Send target end-effector pose with quaternion orientation.
@@ -361,44 +698,122 @@ class PiperController:
         self.send_ee_pose(pos[0], pos[1], pos[2], rx, ry, rz)
     
     def set_gripper(self, gripper_value: float):
-        """Set gripper position.
+        """Set gripper position (normalized 0-1).
         
         Args:
             gripper_value: Normalized gripper position (0=close, 1=open)
         """
         if self._emergency_stop:
-            return
+            return False
         
         gripper_value = max(0.0, min(1.0, gripper_value))
-        gripper_pos = int(gripper_value * GRIPPER_OPEN_POS)
-        self.piper.GripperCtrl(gripper_pos, GRIPPER_SPEED, 0x01, 0)
+        angle_deg = gripper_value * GRIPPER_OPEN_ANGLE
+        return self.set_gripper_angle(angle_deg, GRIPPER_EFFORT)
     
-    def open_gripper(self):
-        """Fully open the gripper."""
-        self.set_gripper(1.0)
-    
-    def close_gripper(self):
-        """Fully close the gripper."""
-        self.set_gripper(0.0)
-    
-    def go_to_home(self):
-        """Move to home position (all joints zero)."""
-        if self._emergency_stop:
-            return
-        print("[Piper] Going to home position...")
-        # Set joint control mode
-        self.piper.MotionCtrl_2(0x01, 0x01, MOTION_SPEED_PERCENT, 0x00)
-        # All joints to zero
-        self.piper.JointCtrl(0, 0, 0, 0, 0, 0)
-        time.sleep(2.0)  # Wait for motion
-        # Switch back to end pose control mode (MOVE L)
-        self.piper.MotionCtrl_2(0x01, 0x02, MOTION_SPEED_PERCENT, 0x00)
+    def set_gripper_angle(self, angle_deg: float, effort: int = 500) -> bool:
+        """Set gripper angle (verified method from script 0).
         
-        # Record home position
-        self._home_position = self.get_ee_pose_meters()
-        if self._home_position:
-            print(f"[Piper] Home position: x={self._home_position[0]:.3f}, "
-                  f"y={self._home_position[1]:.3f}, z={self._home_position[2]:.3f}")
+        Args:
+            angle_deg: Gripper angle in degrees (0=close, 70=open)
+            effort: Gripper force (0-1000)
+        """
+        if not self.enabled or self.piper is None:
+            return False
+        
+        if self._emergency_stop:
+            return False
+        
+        try:
+            angle_sdk = int(angle_deg * 1000)  # degrees -> 0.001°
+            self.piper.GripperCtrl(angle_sdk, effort, 0x01, 0)
+            return True
+        except Exception as e:
+            print(f"[Piper] Gripper control failed: {e}")
+            return False
+    
+    def open_gripper(self) -> bool:
+        """Fully open the gripper."""
+        return self.set_gripper_angle(GRIPPER_OPEN_ANGLE, GRIPPER_EFFORT)
+    
+    def close_gripper(self) -> bool:
+        """Fully close the gripper."""
+        return self.set_gripper_angle(GRIPPER_CLOSE_ANGLE, GRIPPER_EFFORT)
+    
+    def go_to_home(self) -> bool:
+        """Move to calibrated home position (verified from script 0)."""
+        if self._emergency_stop:
+            return False
+        if not self.enabled:
+            return False
+        
+        print("[Piper] Going to home position...")
+        x, y, z = self._home_position
+        rx, ry, rz = self._home_orientation
+        
+        if not self.move_to_pose(x, y, z, rx, ry, rz):
+            return False
+        
+        # Wait for motion to complete
+        target = {'x': x, 'y': y, 'z': z, 'rx_deg': np.rad2deg(rx), 'ry_deg': np.rad2deg(ry), 'rz_deg': np.rad2deg(rz)}
+        reached = self.wait_until_pose(target, MOTION_TIMEOUT, POSITION_TOLERANCE, ORIENTATION_TOLERANCE)
+        
+        if reached:
+            print(f"[Piper] Home position reached: ({x:.3f}, {y:.3f}, {z:.3f})m")
+        return reached
+    
+    def wait_until_pose(self, target: Dict[str, float], timeout_s: float,
+                        pos_tol_m: float, rot_tol_deg: float) -> bool:
+        """Wait until end-effector reaches target pose."""
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if self._emergency_stop:
+                return False
+            
+            pose = self.get_ee_pose_meters()
+            if pose is None:
+                time.sleep(0.05)
+                continue
+            
+            # Check position
+            pos_err = np.sqrt(
+                (pose['x'] - target['x'])**2 +
+                (pose['y'] - target['y'])**2 +
+                (pose['z'] - target['z'])**2
+            )
+            
+            # Check orientation
+            rot_err = max(
+                abs(pose['rx_deg'] - target['rx_deg']),
+                abs(pose['ry_deg'] - target['ry_deg']),
+                abs(pose['rz_deg'] - target['rz_deg'])
+            )
+            
+            if pos_err < pos_tol_m and rot_err < rot_tol_deg:
+                return True
+            
+            time.sleep(0.05)
+        
+        return False
+    
+    def wait_until_gripper(self, target_angle_deg: float, timeout_s: float,
+                           tol_deg: float) -> bool:
+        """Wait until gripper reaches target angle."""
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if self._emergency_stop:
+                return False
+            
+            status = self.get_gripper_status()
+            if status is None:
+                time.sleep(0.05)
+                continue
+            
+            if abs(status['angle'] - target_angle_deg) < tol_deg:
+                return True
+            
+            time.sleep(0.05)
+        
+        return False
     
     def is_position_reached(self, target_pos: Tuple[float, float, float], 
                             tolerance: float = POSITION_TOLERANCE) -> bool:
@@ -406,7 +821,7 @@ class PiperController:
         pose = self.get_ee_pose_meters()
         if pose is None:
             return False
-        current_pos = np.array(pose[:3])
+        current_pos = np.array([pose['x'], pose['y'], pose['z']])
         target = np.array(target_pos)
         distance = np.linalg.norm(current_pos - target)
         return distance < tolerance
@@ -475,22 +890,25 @@ def save_episode(episode: EpisodeData, out_dir: Path):
 
 
 # =============================================================================
-# Finite State Machine
+# Finite State Machine (Updated for script 0 compatibility)
 # =============================================================================
 
 class PickPlaceFSM:
-    """FSM expert for Task B: Pick from plate → Place at random."""
+    """FSM expert for Task B: Pick from plate → Place at random.
+    
+    Updated to use radians for orientation (consistent with script 0).
+    """
     
     def __init__(self, piper: PiperController, 
                  plate_center: Tuple[float, float, float] = PLATE_CENTER,
                  grasp_height: float = GRASP_HEIGHT,
                  hover_height: float = HOVER_HEIGHT,
-                 orientation: Tuple[float, float, float] = DEFAULT_ORIENTATION_EULER):
+                 orientation_rad: Tuple[float, float, float] = DEFAULT_ORIENTATION_RAD):
         self.piper = piper
         self.plate_center = plate_center
         self.grasp_height = grasp_height
         self.hover_height = hover_height
-        self.orientation = orientation  # (rx, ry, rz) in degrees
+        self.orientation_rad = orientation_rad  # (rx, ry, rz) in radians
         
         self.state = FSMState.IDLE
         self.place_position = None  # Random target (x, y, z)
@@ -501,18 +919,18 @@ class PickPlaceFSM:
         """Sample a random placement position."""
         x = self.plate_center[0] + random.uniform(*RANDOM_RANGE_X)
         y = self.plate_center[1] + random.uniform(*RANDOM_RANGE_Y)
-        z = self.plate_center[2]  # Same table height
+        z = self.grasp_height  # Use grasp height for Z
         return (x, y, z)
     
-    def get_target_pose(self) -> Tuple[float, float, float, float, float, float]:
-        """Get target pose for current state (x, y, z, rx, ry, rz)."""
-        rx, ry, rz = self.orientation
+    def get_target_pose_rad(self) -> Tuple[float, float, float, float, float, float]:
+        """Get target pose for current state (x, y, z, rx, ry, rz) in meters and radians."""
+        rx, ry, rz = self.orientation_rad
         
         if self.state == FSMState.GO_TO_HOME:
-            # Use home position if available, otherwise plate hover
-            if self.piper._home_position is not None:
-                return self.piper._home_position
-            return (self.plate_center[0], self.plate_center[1], self.hover_height, rx, ry, rz)
+            # Use calibrated home position
+            hx, hy, hz = self.piper._home_position
+            hrx, hry, hrz = self.piper._home_orientation
+            return (hx, hy, hz, hrx, hry, hrz)
         
         elif self.state == FSMState.HOVER_PLATE:
             return (self.plate_center[0], self.plate_center[1], self.hover_height, rx, ry, rz)
@@ -538,12 +956,29 @@ class PickPlaceFSM:
         elif self.state == FSMState.LIFT_RETREAT:
             return (self.place_position[0], self.place_position[1], self.hover_height, rx, ry, rz)
         
+        elif self.state == FSMState.RETURN_HOME:
+            # Return to calibrated home position
+            hx, hy, hz = self.piper._home_position
+            hrx, hry, hrz = self.piper._home_orientation
+            return (hx, hy, hz, hrx, hry, hrz)
+        
         else:
             # IDLE or DONE - hold current position
             pose = self.piper.get_ee_pose_meters()
             if pose:
-                return pose
+                return (pose['x'], pose['y'], pose['z'], pose['rx'], pose['ry'], pose['rz'])
             return (self.plate_center[0], self.plate_center[1], self.hover_height, rx, ry, rz)
+    
+    def get_target_pose(self) -> Tuple[float, float, float, float, float, float]:
+        """Get target pose for current state (x, y, z, rx, ry, rz) in meters and degrees.
+        
+        For backward compatibility with legacy code.
+        """
+        pose_rad = self.get_target_pose_rad()
+        return (
+            pose_rad[0], pose_rad[1], pose_rad[2],
+            np.rad2deg(pose_rad[3]), np.rad2deg(pose_rad[4]), np.rad2deg(pose_rad[5])
+        )
     
     def get_target_gripper(self) -> float:
         """Get target gripper state for current state (0=close, 1=open)."""
@@ -559,7 +994,7 @@ class PickPlaceFSM:
         self.state = FSMState.GO_TO_HOME
         self._settle_start_time = None
         self._gripper_start_time = None
-        print(f"[FSM] Starting episode. Place position: {self.place_position}")
+        print(f"[FSM] Starting episode. Place position: ({self.place_position[0]:.3f}, {self.place_position[1]:.3f}, {self.place_position[2]:.3f})m")
     
     def step(self) -> bool:
         """Execute one step of the FSM.
@@ -573,16 +1008,16 @@ class PickPlaceFSM:
         if self.state == FSMState.DONE:
             return True
         
-        # Get and send target pose
-        target = self.get_target_pose()
-        self.piper.send_ee_pose(*target)
+        # Get target pose in radians and send
+        target_rad = self.get_target_pose_rad()
+        self.piper.move_to_pose(*target_rad)
         
         # Handle gripper
         gripper_target = self.get_target_gripper()
         self.piper.set_gripper(gripper_target)
         
         # Check transition conditions
-        self._check_transition(target[:3])
+        self._check_transition(target_rad[:3])
         
         return self.state == FSMState.DONE
     
@@ -593,7 +1028,7 @@ class PickPlaceFSM:
         # Handle settling time for movement states
         movement_states = [FSMState.GO_TO_HOME, FSMState.HOVER_PLATE, FSMState.LOWER_GRASP,
                           FSMState.LIFT_OBJECT, FSMState.HOVER_PLACE, FSMState.LOWER_PLACE,
-                          FSMState.LIFT_RETREAT]
+                          FSMState.LIFT_RETREAT, FSMState.RETURN_HOME]
         
         if self.state in movement_states:
             if position_reached:
@@ -631,7 +1066,8 @@ class PickPlaceFSM:
             FSMState.HOVER_PLACE: FSMState.LOWER_PLACE,
             FSMState.LOWER_PLACE: FSMState.OPEN_GRIP,
             FSMState.OPEN_GRIP: FSMState.LIFT_RETREAT,
-            FSMState.LIFT_RETREAT: FSMState.DONE,
+            FSMState.LIFT_RETREAT: FSMState.RETURN_HOME,
+            FSMState.RETURN_HOME: FSMState.DONE,
         }
         
         old_state = self.state
@@ -640,11 +1076,11 @@ class PickPlaceFSM:
 
 
 # =============================================================================
-# Keyboard Input Handler
+# Keyboard Input Handler (Updated from script 0)
 # =============================================================================
 
 class KeyboardHandler:
-    """Non-blocking keyboard input handler."""
+    """Keyboard input handler using terminal input mode (verified from script 0)."""
     
     def __init__(self):
         self.start_requested = False
@@ -654,48 +1090,39 @@ class KeyboardHandler:
         self.emergency_stop_requested = False
         self._lock = threading.Lock()
         self._keyboard_available = False
+        self._running = True
+        self._last_key: Optional[str] = None
+    
+    def start(self):
+        """Start keyboard listening using terminal input mode."""
+        print("[Keyboard] Using terminal input mode - type command and press Enter")
+        print("[Keyboard] Commands: SPACE=start, ESC=e-stop, Q=quit, R=reset, S=skip")
+        self._keyboard_available = True
         
-        # Try to import keyboard module
-        # Note: On Linux, keyboard module requires root privileges
-        # On Windows, it may require admin privileges
-        try:
-            import keyboard
-            self._keyboard_available = True
-            
-            # Register hotkeys
-            keyboard.on_press_key('space', lambda _: self._on_space())
-            keyboard.on_press_key('escape', lambda _: self._on_escape())
-            keyboard.on_press_key('q', lambda _: self._on_quit())
-            keyboard.on_press_key('r', lambda _: self._on_reset())
-            keyboard.on_press_key('s', lambda _: self._on_skip())
-            
-            print("[Keyboard] Handler initialized. Controls: SPACE=start, ESC=e-stop, Q=quit, R=reset, S=skip")
-        except ImportError:
-            print("[Keyboard] WARNING: 'keyboard' module not available. Install with: pip install keyboard")
-            print("[Keyboard] Falling back to terminal input (press Enter after each command).")
-        except Exception as e:
-            print(f"[Keyboard] WARNING: keyboard module failed ({e}). May need root/admin privileges.")
-            print("[Keyboard] Falling back to terminal input (press Enter after each command).")
-    
-    def _on_space(self):
-        with self._lock:
-            self.start_requested = True
-    
-    def _on_escape(self):
-        with self._lock:
-            self.emergency_stop_requested = True
-    
-    def _on_quit(self):
-        with self._lock:
-            self.quit_requested = True
-    
-    def _on_reset(self):
-        with self._lock:
-            self.reset_requested = True
-    
-    def _on_skip(self):
-        with self._lock:
-            self.skip_requested = True
+        def input_thread():
+            while self._running:
+                try:
+                    user_input = input().strip().lower()
+                    with self._lock:
+                        self._last_key = user_input
+                        # Map common inputs to commands
+                        if user_input in ['', ' ', 'space', 'start']:
+                            self.start_requested = True
+                        elif user_input in ['q', 'quit', 'exit']:
+                            self.quit_requested = True
+                        elif user_input in ['r', 'reset']:
+                            self.reset_requested = True
+                        elif user_input in ['s', 'skip']:
+                            self.skip_requested = True
+                        elif user_input in ['esc', 'escape', 'stop', 'e']:
+                            self.emergency_stop_requested = True
+                except EOFError:
+                    break
+                except Exception:
+                    break
+        
+        t = threading.Thread(target=input_thread, daemon=True)
+        t.start()
     
     def poll(self) -> dict:
         """Poll for keyboard events.
@@ -718,6 +1145,10 @@ class KeyboardHandler:
             self.skip_requested = False
             self.emergency_stop_requested = False
         return events
+    
+    def stop(self):
+        """Stop keyboard listening."""
+        self._running = False
 
 
 # =============================================================================
@@ -725,34 +1156,72 @@ class KeyboardHandler:
 # =============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Collect pick-and-place data with Piper arm.")
+    parser = argparse.ArgumentParser(
+        description="Collect pick-and-place data with Piper arm.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with default cameras
+  python 1_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
+  
+  # Specify camera by name (recommended)
+  python 1_collect_data_piper.py --front_cam Orbbec_Gemini_335L --wrist_cam Dabai_DC1
+  
+  # Disable wrist camera
+  python 1_collect_data_piper.py --wrist_cam -1
+  
+  # Custom plate center position
+  python 1_collect_data_piper.py --plate_x 0.25 --plate_y 0.0 --grasp_height 0.16
+"""
+    )
     
-    parser.add_argument("--can_interface", type=str, default="can0",
+    # Hardware settings
+    parser.add_argument("--can_interface", "-c", type=str, default="can0",
                         help="CAN interface name (default: can0)")
-    parser.add_argument("--num_episodes", type=int, default=50,
+    parser.add_argument("--front_cam", "-f", type=str, default=DEFAULT_FRONT_CAMERA,
+                        help=f"Front camera ID/name (default: {DEFAULT_FRONT_CAMERA})")
+    parser.add_argument("--wrist_cam", "-w", type=str, default=DEFAULT_WRIST_CAMERA,
+                        help=f"Wrist camera ID/name, use -1 to disable (default: {DEFAULT_WRIST_CAMERA})")
+    
+    # Data collection settings
+    parser.add_argument("--num_episodes", "-n", type=int, default=50,
                         help="Number of episodes to collect (default: 50)")
-    parser.add_argument("--out_dir", type=str, default="data/piper_pick_place",
+    parser.add_argument("--out_dir", "-o", type=str, default="data/piper_pick_place",
                         help="Output directory for collected data")
-    parser.add_argument("--control_freq", type=int, default=30,
-                        help="Control frequency in Hz (default: 30)")
+    parser.add_argument("--control_freq", type=int, default=CONTROL_FREQ,
+                        help=f"Control frequency in Hz (default: {CONTROL_FREQ})")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default: 42)")
+    
+    # Image settings
     parser.add_argument("--image_width", type=int, default=640,
                         help="Camera image width (default: 640)")
     parser.add_argument("--image_height", type=int, default=480,
                         help="Camera image height (default: 480)")
-    parser.add_argument("--fixed_cam_id", type=int, default=0,
-                        help="Fixed camera device ID (default: 0)")
-    parser.add_argument("--wrist_cam_id", type=int, default=1,
-                        help="Wrist camera device ID (default: 1)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed (default: 42)")
-    parser.add_argument("--plate_x", type=float, default=0.0,
-                        help="Plate center X position in meters (default: 0.0)")
-    parser.add_argument("--plate_y", type=float, default=0.15,
-                        help="Plate center Y position in meters (default: 0.15)")
-    parser.add_argument("--plate_z", type=float, default=0.0,
-                        help="Plate center Z position in meters (default: 0.0)")
+    
+    # Workspace parameters (calibrated from script 0)
+    parser.add_argument("--plate_x", type=float, default=PLATE_CENTER[0],
+                        help=f"Pick position X in meters (default: {PLATE_CENTER[0]})")
+    parser.add_argument("--plate_y", type=float, default=PLATE_CENTER[1],
+                        help=f"Pick position Y in meters (default: {PLATE_CENTER[1]})")
+    parser.add_argument("--grasp_height", type=float, default=GRASP_HEIGHT,
+                        help=f"Grasp Z height in meters (default: {GRASP_HEIGHT})")
+    parser.add_argument("--hover_height", type=float, default=HOVER_HEIGHT,
+                        help=f"Hover Z height in meters (default: {HOVER_HEIGHT})")
+    parser.add_argument("--speed", "-s", type=int, default=MOTION_SPEED_PERCENT,
+                        help=f"Motion speed percentage (default: {MOTION_SPEED_PERCENT})")
     
     return parser.parse_args()
+
+
+def normalize_camera_value(value: str) -> Union[int, str]:
+    """Normalize camera value from command line."""
+    if value.strip() == "-1":
+        return -1
+    try:
+        return int(value)
+    except ValueError:
+        return value
 
 
 def main():
@@ -766,48 +1235,108 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    # Update plate center from args
-    plate_center = (args.plate_x, args.plate_y, args.plate_z)
+    # Normalize camera values
+    front_cam_id = normalize_camera_value(args.front_cam)
+    wrist_cam_id = normalize_camera_value(args.wrist_cam)
     
-    # Initialize components
-    print("=" * 60)
+    # Update parameters from args
+    plate_center = (args.plate_x, args.plate_y, args.grasp_height)
+    grasp_height = args.grasp_height
+    hover_height = args.hover_height
+    
+    # Print configuration
+    print("\n" + "=" * 60)
     print("Piper Pick & Place Data Collection")
     print("=" * 60)
+    print("\nConfiguration:")
+    print(f"  CAN Interface: {args.can_interface}")
+    print(f"  Front Camera:  {front_cam_id}")
+    print(f"  Wrist Camera:  {wrist_cam_id}" + (" (disabled)" if not is_camera_enabled(wrist_cam_id) else ""))
+    print(f"  Output Dir:    {out_dir}")
+    print(f"  Episodes:      {args.num_episodes}")
+    print(f"  Control Freq:  {args.control_freq} Hz")
+    print(f"  Motion Speed:  {args.speed}%")
+    print(f"\nWorkspace Parameters:")
+    print(f"  Pick Position: ({args.plate_x:.3f}, {args.plate_y:.3f})m")
+    print(f"  Grasp Height:  {grasp_height:.3f}m")
+    print(f"  Hover Height:  {hover_height:.3f}m")
+    print(f"  Random Range:  X={RANDOM_RANGE_X}, Y={RANDOM_RANGE_Y}")
+    print()
     
     # Initialize keyboard handler
     keyboard_handler = KeyboardHandler()
+    keyboard_handler.start()
     
     # Initialize cameras
     print("\n[Init] Starting cameras...")
-    fixed_cam = CameraCapture(args.fixed_cam_id, args.image_width, args.image_height)
-    wrist_cam = CameraCapture(args.wrist_cam_id, args.image_width, args.image_height)
+    fixed_cam = CameraCapture(front_cam_id, args.image_width, args.image_height, name="front")
+    wrist_cam = None
+    wrist_cam_enabled = is_camera_enabled(wrist_cam_id)
     
     try:
         fixed_cam.start()
-        wrist_cam.start()
+        if wrist_cam_enabled:
+            wrist_cam = CameraCapture(wrist_cam_id, args.image_width, args.image_height, name="wrist")
+            try:
+                wrist_cam.start()
+            except RuntimeError as e:
+                print(f"[Warning] Wrist camera initialization failed: {e}")
+                print("[Warning] Continuing without wrist camera...")
+                wrist_cam = None
+                wrist_cam_enabled = False
+        else:
+            print("[Camera] Wrist camera disabled")
     except RuntimeError as e:
-        print(f"[Error] Camera initialization failed: {e}")
+        print(f"[Error] Front camera initialization failed: {e}")
         print("Please check camera connections and device IDs.")
+        keyboard_handler.stop()
         return
     
-    # Initialize Piper arm
+    # Initialize Piper arm (using verified method from script 0)
     print("\n[Init] Connecting to Piper arm...")
     piper = PiperController(args.can_interface)
     
     try:
-        piper.connect()
+        if not piper.connect():
+            print("[Error] Piper connection failed")
+            keyboard_handler.stop()
+            fixed_cam.stop()
+            if wrist_cam:
+                wrist_cam.stop()
+            return
+        
+        if not piper.enable():
+            print("[Error] Piper enable failed")
+            keyboard_handler.stop()
+            fixed_cam.stop()
+            if wrist_cam:
+                wrist_cam.stop()
+            return
     except Exception as e:
-        print(f"[Error] Piper connection failed: {e}")
+        print(f"[Error] Piper initialization failed: {e}")
+        keyboard_handler.stop()
         fixed_cam.stop()
-        wrist_cam.stop()
+        if wrist_cam:
+            wrist_cam.stop()
         return
     
     # Go to home position
+    print("\n[Init] Going to home position...")
     piper.go_to_home()
     time.sleep(1.0)
     
-    # Initialize FSM
-    fsm = PickPlaceFSM(piper, plate_center=plate_center)
+    # Open gripper
+    piper.open_gripper()
+    time.sleep(0.5)
+    
+    # Initialize FSM with calibrated parameters
+    fsm = PickPlaceFSM(
+        piper,
+        plate_center=plate_center,
+        grasp_height=grasp_height,
+        hover_height=hover_height,
+        orientation_rad=DEFAULT_ORIENTATION_RAD
+    )
     
     # Control loop parameters
     control_period = 1.0 / args.control_freq
@@ -819,13 +1348,13 @@ def main():
     
     # Goal pose (fixed plate center in quaternion format)
     goal_quat = euler_to_quat(*DEFAULT_ORIENTATION_EULER)
-    goal_pose = np.array([plate_center[0], plate_center[1], plate_center[2],
+    goal_pose = np.array([plate_center[0], plate_center[1], grasp_height,
                           goal_quat[0], goal_quat[1], goal_quat[2], goal_quat[3]], dtype=np.float32)
     
     print("\n" + "=" * 60)
     print("Ready to collect data!")
-    print("Press SPACE to start an episode.")
-    print("Press Q to quit.")
+    print("Press ENTER or type 'start' to start an episode.")
+    print("Type 'q' to quit, 'r' to reset, 's' to skip, 'e' for emergency stop.")
     print("=" * 60 + "\n")
     
     try:
@@ -899,25 +1428,39 @@ def main():
                 if recording and current_episode is not None:
                     # Get observations
                     fixed_img = fixed_cam.get_frame()
-                    wrist_img = wrist_cam.get_frame()
-                    pos, quat = piper.get_ee_pose_quat() or (np.zeros(3), np.array([1, 0, 0, 0]))
+                    wrist_img = wrist_cam.get_frame() if wrist_cam else None
+                    
+                    # Get pose using the new dict-based method
+                    pose_dict = piper.get_ee_pose_meters()
+                    if pose_dict is not None:
+                        pos = np.array([pose_dict['x'], pose_dict['y'], pose_dict['z']])
+                        quat = euler_to_quat(pose_dict['rx_deg'], pose_dict['ry_deg'], pose_dict['rz_deg'])
+                        quat = np.array(quat)
+                    else:
+                        pos = np.zeros(3)
+                        quat = np.array([1, 0, 0, 0])
+                    
                     gripper = piper.get_gripper_state() or 0.0
                     
                     # Construct ee_pose [x, y, z, qw, qx, qy, qz]
                     ee_pose = np.concatenate([pos, quat])
                     
                     # Get action (target pose from FSM + target gripper)
-                    target = fsm.get_target_pose()
+                    target = fsm.get_target_pose()  # returns (x, y, z, rx_deg, ry_deg, rz_deg)
                     target_quat = euler_to_quat(target[3], target[4], target[5])
                     target_gripper = fsm.get_target_gripper()
                     action = np.array([target[0], target[1], target[2],
                                        target_quat[0], target_quat[1], target_quat[2], target_quat[3],
                                        target_gripper], dtype=np.float32)
                     
-                    # Record
-                    if fixed_img is not None and wrist_img is not None:
+                    # Record (handle optional wrist camera)
+                    if fixed_img is not None:
                         current_episode.fixed_images.append(fixed_img)
-                        current_episode.wrist_images.append(wrist_img)
+                        # Use placeholder if no wrist camera
+                        if wrist_img is not None:
+                            current_episode.wrist_images.append(wrist_img)
+                        else:
+                            current_episode.wrist_images.append(np.zeros_like(fixed_img))
                         current_episode.ee_pose.append(ee_pose)
                         current_episode.gripper_state.append(gripper)
                         current_episode.action.append(action)
@@ -952,13 +1495,18 @@ def main():
     finally:
         # Cleanup
         print("\n[Main] Cleaning up...")
-        piper.open_gripper()
-        time.sleep(0.5)
-        piper.go_to_home()
-        time.sleep(2.0)
+        keyboard_handler.stop()
+        
+        if piper.enabled and not piper._emergency_stop:
+            piper.open_gripper()
+            time.sleep(0.5)
+            piper.go_to_home()
+            time.sleep(2.0)
+        
         piper.disconnect()
         fixed_cam.stop()
-        wrist_cam.stop()
+        if wrist_cam:
+            wrist_cam.stop()
         
         # Save collection metadata
         metadata = {
@@ -966,11 +1514,17 @@ def main():
             "control_freq": args.control_freq,
             "image_size": [args.image_height, args.image_width],
             "plate_center": list(plate_center),
-            "grasp_height": GRASP_HEIGHT,
-            "hover_height": HOVER_HEIGHT,
+            "grasp_height": grasp_height,
+            "hover_height": hover_height,
             "random_range_x": list(RANDOM_RANGE_X),
             "random_range_y": list(RANDOM_RANGE_Y),
+            "home_position": list(HOME_POSITION),
+            "home_orientation_rad": list(HOME_ORIENTATION),
+            "grasp_orientation_rad": list(DEFAULT_ORIENTATION_RAD),
             "seed": args.seed,
+            "front_camera": str(front_cam_id),
+            "wrist_camera": str(wrist_cam_id),
+            "wrist_camera_enabled": wrist_cam_enabled,
         }
         
         with open(out_dir / "metadata.json", "w") as f:

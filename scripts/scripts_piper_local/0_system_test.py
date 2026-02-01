@@ -50,27 +50,49 @@ class TestConfig:
 
     # 运动完成判定
     motion_timeout_s: float = 10.0
-    pose_tolerance_pos_m: float = 0.01  # 位置容差 (米)
-    pose_tolerance_rot_deg: float = 3.0  # 姿态容差 (度)
+    pose_tolerance_pos_m: float = 0.015  # 位置容差 (米) - 15mm
+    pose_tolerance_rot_deg: float = 5.0  # 姿态容差 (度)
 
     # 运动模式 (0x00=MOVE_P, 0x01=MOVE_J, 0x02=MOVE_L)
     move_mode: int = 0x00
 
     # 夹爪完成判定
     gripper_timeout_s: float = 3.0
-    gripper_tolerance_deg: float = 2.0
+    gripper_tolerance_deg: float = 50.0  # 夹住物体时无法完全闭合，放宽容差
     
     # 测试位置 (米, 弧度) - 需要根据实际情况校准
     # 注意: 姿态需要与机械臂当前构型兼容，否则会报 TARGET_POS_EXCEEDS_LIMIT
     home_position: tuple = (0.054, 0.0, 0.175)  # X, Y, Z
-    home_orientation: tuple = (3.1, 1.2, 3.1)  # RX, RY, RZ (弧度) ~= (177°, 69°, 177°)
-    desk_center_position: tuple = (0.355, -0.0213, 0.1757)  # X, Y, Z
-    desk_center_orientation: tuple = (-3.139, 0.339, 3.060)  # RX, RY, RZ (弧度) ~= (-179.8°, 19.4°, 175.3°)
+    home_orientation: tuple = (3.14, 1.2, 3.14)  # RX, RY, RZ (弧度) ~= (180°, 68.8°, 180°)
+    desk_center_position: tuple = (0.25, 0.0, 0.16)  # X, Y, Z
+    desk_center_orientation: tuple = (3.14, 0.3, 3.14)  # RX, RY, RZ (弧度) ~= (180°, 17.2°, 180°)
     
-    # 测试点位 (用于运动测试)
+    # 抓取测试参数 (类似 1_collect_data_piper.py 的 FSM 逻辑)
+    # 抓取位置 (pick) - 使用 desk_center_position，在 __post_init__ 中初始化
+    pick_position: tuple = None
+    # 放置位置 (place) - 相对于 pick 有一定偏移
+    place_offset: tuple = (-0.15, -0.15, 0.0)  # 偏移量 (米) #最大随机范围是xy方向+—0.15m
+    # 抓取高度 - 默认使用 desk_center_position 的 Z 值，在 __post_init__ 中初始化
+    grasp_height: float = None
+    # 悬停高度 (比抓取高度高)
+    hover_height: float = 0.25  # 悬停时的 Z 高度 (米)
+    # 抓取朝向 (让夹爪指向下方) - 使用 desk_center_orientation
+    grasp_orientation: tuple = None
+    
+    # 测试点位 (用于运动测试) - 保留用于简单点位测试
     test_positions: list = None
     
     def __post_init__(self):
+        # 抓取位置默认使用桌面中心
+        if self.pick_position is None:
+            self.pick_position = self.desk_center_position
+        # 抓取高度默认使用桌面中心的 Z 值
+        if self.grasp_height is None:
+            self.grasp_height = self.desk_center_position[2]  # Z = 0.1757m
+        # 抓取朝向默认使用桌面中心朝向
+        if self.grasp_orientation is None:
+            self.grasp_orientation = self.desk_center_orientation
+        # 测试点位
         if self.test_positions is None:
             cx, cy, cz = self.desk_center_position
             self.test_positions = [
@@ -821,7 +843,7 @@ class SystemTester:
         print("  [5] 显示相机预览")
         print("  [6] 测试夹爪 (开->闭->开)")
         print("  [7] 移动到 Home 位置")
-        print("  [8] 运动测试 (多点位)")
+        print("  [8] 抓取放置测试 (Pick & Place FSM)")
         print("  [9] 运行全部测试")
         print()
         print("  [R] 重置/重新使能")
@@ -1065,35 +1087,42 @@ class SystemTester:
         return True
     
     def test_motion_sequence(self) -> bool:
-        """测试 8: 多点位运动"""
-        print("\n>>> 测试 8: 多点位运动测试")
+        """测试 8: 抓取放置流程测试 (模拟 Pick & Place FSM)
+        
+        流程参考 1_collect_data_piper.py:
+        HOVER_PICK → LOWER_GRASP → CLOSE_GRIP → LIFT_OBJECT 
+        → HOVER_PLACE → LOWER_PLACE → OPEN_GRIP → LIFT_RETREAT → HOME
+        """
+        print("\n>>> 测试 8: 抓取放置流程测试")
         print("-"*40)
         
         if not self.piper.enabled:
             print("[Test] ✗ 请先使能机械臂 (按 2)")
             return False
         
-        # 使用 desk_center_orientation，让夹爪指向下方
-        rx, ry, rz = self.config.desk_center_orientation
+        # 抓取参数
+        pick_x, pick_y, _ = self.config.pick_position
+        place_x = pick_x + self.config.place_offset[0]
+        place_y = pick_y + self.config.place_offset[1]
+        grasp_z = self.config.grasp_height
+        hover_z = self.config.hover_height
+        rx, ry, rz = self.config.grasp_orientation
         
-        print(f"[Motion] 将依次移动到 {len(self.config.test_positions)} 个测试点")
-        cx, cy, cz = self.config.desk_center_position
-        print(f"[Motion] 桌面中心参考: ({cx:.3f}, {cy:.3f}, {cz:.3f})m")
+        print(f"[FSM] 抓取位置: ({pick_x:.3f}, {pick_y:.3f})m")
+        print(f"[FSM] 放置位置: ({place_x:.3f}, {place_y:.3f})m")
+        print(f"[FSM] 悬停高度: {hover_z:.3f}m, 抓取高度: {grasp_z:.3f}m")
         print()
-        print("⚠ 警告: 机械臂即将移动！")
+        print("⚠ 警告: 机械臂即将执行抓取放置流程！")
         print("  按 Space 紧急停止")
         print()
         
-        for i, (x, y, z) in enumerate(self.config.test_positions):
+        # 辅助函数：移动到位姿并等待
+        def move_and_wait(x, y, z, state_name):
             if self.piper.is_emergency_stopped():
-                print("[Motion] 已紧急停止")
                 return False
-            
-            print(f"[Motion] 点 {i+1}/{len(self.config.test_positions)}: ({x:.3f}, {y:.3f}, {z:.3f})m")
-            
+            print(f"[FSM] {state_name}: ({x:.3f}, {y:.3f}, {z:.3f})m")
             if not self.piper.move_to_pose(x, y, z, rx, ry, rz):
                 return False
-
             target = {
                 'x': x, 'y': y, 'z': z,
                 'rx_deg': np.rad2deg(rx),
@@ -1107,18 +1136,73 @@ class SystemTester:
                 rot_tol_deg=self.config.pose_tolerance_rot_deg,
             )
             if not reached:
-                print("[Motion] ✗ 未在超时内到达目标")
+                print(f"[FSM] ✗ {state_name} 未在超时内到达")
                 return False
+            time.sleep(0.3)  # 稳定时间
+            return True
         
-        # 返回 Home
-        print("[Motion] 返回 Home...")
+        # ========== 抓取阶段 ==========
+        # 1. HOVER_PICK: 悬停在抓取位置上方
+        if not move_and_wait(pick_x, pick_y, hover_z, "HOVER_PICK"):
+            return False
+        
+        # 2. 确保夹爪打开
+        print("[FSM] OPEN_GRIP: 打开夹爪...")
+        if not self.piper.open_gripper():
+            print("[FSM] ✗ 打开夹爪失败")
+            return False
+        time.sleep(0.5)
+        
+        # 3. LOWER_GRASP: 下降到抓取高度
+        if not move_and_wait(pick_x, pick_y, grasp_z, "LOWER_GRASP"):
+            return False
+        
+        # 4. CLOSE_GRIP: 关闭夹爪抓取
+        print("[FSM] CLOSE_GRIP: 关闭夹爪...")
+        if self.piper.is_emergency_stopped():
+            return False
+        if not self.piper.close_gripper():
+            print("[FSM] ✗ 关闭夹爪失败")
+            return False
+        time.sleep(0.5)
+        
+        # 5. LIFT_OBJECT: 抬起物体
+        if not move_and_wait(pick_x, pick_y, hover_z, "LIFT_OBJECT"):
+            return False
+        
+        # ========== 放置阶段 ==========
+        # 6. HOVER_PLACE: 悬停在放置位置上方
+        if not move_and_wait(place_x, place_y, hover_z, "HOVER_PLACE"):
+            return False
+        
+        # 7. LOWER_PLACE: 下降到放置高度
+        if not move_and_wait(place_x, place_y, grasp_z, "LOWER_PLACE"):
+            return False
+        
+        # 8. OPEN_GRIP: 打开夹爪释放物体
+        print("[FSM] OPEN_GRIP: 打开夹爪释放...")
+        if self.piper.is_emergency_stopped():
+            return False
+        if not self.piper.open_gripper():
+            print("[FSM] ✗ 打开夹爪失败")
+            return False
+        time.sleep(0.5)
+        
+        # 9. LIFT_RETREAT: 抬起撤离
+        if not move_and_wait(place_x, place_y, hover_z, "LIFT_RETREAT"):
+            return False
+        
+        # ========== 返回 Home ==========
+        print("[FSM] GO_TO_HOME: 返回 Home...")
         x, y, z = self.config.home_position
-        self.piper.move_to_pose(x, y, z, rx, ry, rz)
+        home_rx, home_ry, home_rz = self.config.home_orientation
+        if not self.piper.move_to_pose(x, y, z, home_rx, home_ry, home_rz):
+            return False
         target = {
             'x': x, 'y': y, 'z': z,
-            'rx_deg': np.rad2deg(rx),
-            'ry_deg': np.rad2deg(ry),
-            'rz_deg': np.rad2deg(rz),
+            'rx_deg': np.rad2deg(home_rx),
+            'ry_deg': np.rad2deg(home_ry),
+            'rz_deg': np.rad2deg(home_rz),
         }
         self.piper.wait_until_pose(
             target,
@@ -1127,7 +1211,7 @@ class SystemTester:
             rot_tol_deg=self.config.pose_tolerance_rot_deg,
         )
         
-        print("[Motion] ✓ 多点位运动测试完成")
+        print("[FSM] ✓ 抓取放置流程测试完成")
         return True
     
     def run_all_tests(self) -> Dict[str, bool]:
