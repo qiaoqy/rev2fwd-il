@@ -31,6 +31,10 @@ pip install opencv-python==4.9.0.80
 pip install scipy
 pip install keyboard
 # pip install numpy==1.26.0
+pip install pygame==2.6.1
+pip install pydualsense 
+sudo apt-get install -y libhidapi-hidraw0 libhidapi-dev
+pip install hidapi
 ```
 
 ---
