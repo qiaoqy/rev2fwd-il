@@ -133,6 +133,10 @@ def load_episode_data(episode_dir: Path, is_teleop: bool = False) -> dict:
         - wrist_images: list of (H, W, 3) arrays
         - place_pose: (7,) array (optional)
         - goal_pose: (7,) array (optional)
+        - joint_angles: (T, 6) array (optional, scripted data only)
+        - joint_torques: (T, 6) array (optional, scripted data only)
+        - ee_force: (T, 6) array [Fx,Fy,Fz,Mx,My,Mz] (optional, scripted data only)
+        - has_force_data: bool - whether force data is available
         - success: bool
         - episode_id: int
         - is_teleop: bool
@@ -166,6 +170,29 @@ def load_episode_data(episode_dir: Path, is_teleop: bool = False) -> dict:
         result['place_pose'] = data['place_pose']
     if 'goal_pose' in data:
         result['goal_pose'] = data['goal_pose']
+    
+    # Load force/torque data (only available in scripted data from script 1)
+    result['has_force_data'] = False
+    if 'joint_angles' in data:
+        result['joint_angles'] = data['joint_angles']
+    else:
+        result['joint_angles'] = np.zeros((result['num_timesteps'], 6), dtype=np.float32)
+    
+    if 'joint_torques' in data:
+        result['joint_torques'] = data['joint_torques']
+        # Check if we have non-zero torque data
+        if np.any(np.abs(data['joint_torques']) > 1e-6):
+            result['has_force_data'] = True
+    else:
+        result['joint_torques'] = np.zeros((result['num_timesteps'], 6), dtype=np.float32)
+    
+    if 'ee_force' in data:
+        result['ee_force'] = data['ee_force']
+        # Check if we have non-zero force data
+        if np.any(np.abs(data['ee_force']) > 1e-6):
+            result['has_force_data'] = True
+    else:
+        result['ee_force'] = np.zeros((result['num_timesteps'], 6), dtype=np.float32)
     
     # For teleop data, integrate relative actions to get absolute trajectory
     if is_teleop:
@@ -267,10 +294,13 @@ def create_xyz_curve_frame(
     episode_id: int,
     fsm_state: int,
     is_teleop: bool = False,
+    joint_torques: np.ndarray = None,
+    ee_force: np.ndarray = None,
+    has_force_data: bool = False,
     figsize: Tuple[int, int] = (10, 6),
     dpi: int = 100,
 ) -> np.ndarray:
-    """Create a single frame showing XYZ curves.
+    """Create a single frame showing XYZ curves and optionally force data.
     
     Args:
         ee_pose_history: (T, 7) array of EE poses up to current timestep
@@ -281,18 +311,26 @@ def create_xyz_curve_frame(
         episode_id: Episode ID for title
         fsm_state: Current FSM state
         is_teleop: Whether this is teleop data (relative actions)
+        joint_torques: (T, 6) array of joint torques (optional)
+        ee_force: (T, 6) array of EE force/torque (optional)
+        has_force_data: Whether force data is available
         figsize: Figure size in inches
         dpi: Dots per inch for rendering
         
     Returns:
         RGB image array of shape (H, W, 3)
     """
-    fig, axes = plt.subplots(2, 2, figsize=figsize, dpi=dpi)
+    # Use 3x2 grid if force data available, otherwise 2x2
+    if has_force_data and not is_teleop:
+        fig, axes = plt.subplots(3, 2, figsize=(figsize[0], figsize[1] * 1.5), dpi=dpi)
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=figsize, dpi=dpi)
     
     fsm_name = FSM_STATE_NAMES.get(fsm_state, f"UNKNOWN({fsm_state})")
     mode_str = "TELEOP" if is_teleop else "SCRIPTED"
+    force_str = " | FORCE" if has_force_data else ""
     fig.suptitle(
-        f"Episode {episode_id} | Frame {current_t}/{total_t} | {mode_str} | {fsm_name}",
+        f"Episode {episode_id} | Frame {current_t}/{total_t} | {mode_str}{force_str} | {fsm_name}",
         fontsize=12, fontweight='bold'
     )
     
@@ -379,6 +417,45 @@ def create_xyz_curve_frame(
     ax.set_ylim(-0.1, 1.1)
     ax.set_xlim(0, total_t)
     ax.grid(True, alpha=0.3)
+    
+    # Force visualization (only for scripted data with force data)
+    if has_force_data and not is_teleop and ee_force is not None and joint_torques is not None:
+        joint_colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#a65628']
+        joint_labels = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
+        
+        # Subplot 5: Joint Torques
+        ax = axes[2, 0]
+        ax.set_title("Joint Torques", fontsize=10)
+        torques = joint_torques[:current_t + 1]
+        for i in range(6):
+            ax.plot(timesteps, torques[:, i], color=joint_colors[i], 
+                   label=joint_labels[i], linewidth=1.2, alpha=0.8)
+        ax.axvline(x=current_t, color='black', linestyle='--', alpha=0.5)
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Torque (N·m)")
+        ax.legend(loc='upper right', fontsize=7, ncol=2)
+        ax.set_xlim(0, total_t)
+        ax.grid(True, alpha=0.3)
+        
+        # Subplot 6: End-Effector Force/Torque
+        ax = axes[2, 1]
+        ax.set_title("EE Force/Torque", fontsize=10)
+        force = ee_force[:current_t + 1]
+        force_labels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz']
+        force_colors = ['r', 'g', 'b', 'r', 'g', 'b']
+        force_styles = ['-', '-', '-', '--', '--', '--']
+        for i in range(6):
+            ax.plot(timesteps, force[:, i], color=force_colors[i], 
+                   linestyle=force_styles[i], label=force_labels[i], 
+                   linewidth=1.2, alpha=0.8)
+        ax.axvline(x=current_t, color='black', linestyle='--', alpha=0.5)
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Force (N) / Torque (N·m)")
+        ax.legend(loc='upper right', fontsize=7, ncol=2)
+        ax.set_xlim(0, total_t)
+        ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
@@ -611,8 +688,10 @@ def create_visualization_video(
         
         episode_id = episode_data['episode_id']
         num_timesteps = episode_data['num_timesteps']
+        has_force = episode_data.get('has_force_data', False)
         
-        print(f"  Episode {episode_id}: {num_timesteps} timesteps")
+        force_str = " (with force data)" if has_force else ""
+        print(f"  Episode {episode_id}: {num_timesteps} timesteps{force_str}")
         
         for t in range(num_timesteps):
             fixed_img = episode_data['fixed_images'][t]
@@ -620,7 +699,7 @@ def create_visualization_video(
             fsm_state = episode_data['fsm_state'][t]
             
             if include_xyz_curves:
-                # Create XYZ curve frame
+                # Create XYZ curve frame (with optional force data)
                 xyz_img = create_xyz_curve_frame(
                     ee_pose_history=episode_data['ee_pose'],
                     action_history=episode_data['action'],
@@ -630,6 +709,9 @@ def create_visualization_video(
                     episode_id=episode_id,
                     fsm_state=fsm_state,
                     is_teleop=is_teleop,
+                    joint_torques=episode_data.get('joint_torques'),
+                    ee_force=episode_data.get('ee_force'),
+                    has_force_data=episode_data.get('has_force_data', False),
                 )
                 
                 # Compose final frame
@@ -684,14 +766,19 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Visualize all episodes
+  # Visualize all episodes (includes force data if available)
   python 3_visualize_collected_data.py --data_dir data/piper_pick_place
   
   # Visualize specific episodes
   python 3_visualize_collected_data.py --data_dir data/piper_pick_place --episodes 0 1 2
   
-  # Without XYZ curves (faster)
+  # Without XYZ curves (faster, no force visualization)
   python 3_visualize_collected_data.py --data_dir data/piper_pick_place --no_xyz_curves
+
+Note:
+  - Scripted data (script 1) includes force data: joint_torques, ee_force
+  - Teleop data (script 2) does NOT include force data
+  - Force data is automatically visualized if available
 """
     )
     
@@ -760,6 +847,7 @@ def main():
     print(f"Data directory: {data_dir}")
     print(f"Output video:   {output_path}")
     print(f"Data type:      {'TELEOP (relative delta)' if is_teleop else 'SCRIPTED (absolute)'}")
+    print(f"Force data:     {'Not available (teleop)' if is_teleop else 'Will be visualized if present'}")
     print(f"FPS:            {args.fps}")
     print(f"XYZ curves:     {'Disabled' if args.no_xyz_curves else 'Enabled'}")
     print(f"Camera height:  {args.height}px")

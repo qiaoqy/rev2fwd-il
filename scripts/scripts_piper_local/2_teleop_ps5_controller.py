@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Script 2: PS5 Controller Teleoperation for Piper Arm.
 
-This script allows teleoperation of the Piper robotic arm using a PS5 DualSense
-controller connected via Bluetooth.
+This script allows teleoperation of the Piper robotic arm using
+PS5 DualSense controller connected via Bluetooth.
 
 =============================================================================
 SETUP INSTRUCTIONS
 =============================================================================
+PS5 Controller Setup:
 1. Put PS5 controller in pairing mode:
    - Hold PS button + Create button until LED flashes rapidly
 2. On Linux, pair via Bluetooth:
@@ -15,7 +16,7 @@ SETUP INSTRUCTIONS
    - pip install pygame
 
 =============================================================================
-CONTROLLER MAPPING
+PS5 CONTROLLER MAPPING
 =============================================================================
 | Control           | Action                                              |
 |-------------------|-----------------------------------------------------|
@@ -54,13 +55,19 @@ python 2_teleop_ps5_controller.py --speed 30 --linear_scale 0.1 --angular_scale 
 # With camera display
 python 2_teleop_ps5_controller.py --show_camera
 
+# Teleoperation with data recording
+python 2_teleop_ps5_controller.py --record --out_dir data/teleop_data
+
 """
 
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
+import pwd
+import subprocess
 import sys
 import time
 import threading
@@ -69,6 +76,109 @@ import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+
+# =============================================================================
+# Input Group Permission Check (for PS5 controller access)
+# =============================================================================
+
+def check_and_setup_input_group():
+    """Check if user is in 'input' group for controller access.
+    
+    If not in group, offers to add user and re-executes script with proper permissions.
+    This avoids the need to manually run:
+        sudo usermod -a -G input $USER
+        newgrp input
+    """
+    username = pwd.getpwuid(os.getuid()).pw_name
+    
+    # Get user's current groups
+    try:
+        user_groups = [g.gr_name for g in grp.getgrall() if username in g.gr_mem]
+        # Also add primary group
+        primary_gid = pwd.getpwnam(username).pw_gid
+        primary_group = grp.getgrgid(primary_gid).gr_name
+        user_groups.append(primary_group)
+    except KeyError:
+        user_groups = []
+    
+    # Check if 'input' group exists
+    try:
+        input_gid = grp.getgrnam('input').gr_gid
+    except KeyError:
+        print("[Permission] 'input' group does not exist on this system")
+        return  # Continue anyway, might work without it
+    
+    # Check if user is in input group
+    if 'input' in user_groups:
+        # User is in input group, but check if current process has it active
+        current_groups = os.getgroups()
+        if input_gid in current_groups:
+            # All good, input group is active
+            return
+        else:
+            # User is in group but current session doesn't have it active
+            # Re-execute with sg to activate the group
+            print("[Permission] Activating 'input' group for this session...")
+            _reexec_with_input_group()
+    else:
+        # User is not in input group
+        print("\n" + "=" * 60)
+        print("[Permission] PS5 controller requires 'input' group membership")
+        print("=" * 60)
+        print(f"\nUser '{username}' is not in the 'input' group.")
+        print("This is required for controller access without root.\n")
+        
+        response = input("Add user to 'input' group now? [Y/n]: ").strip().lower()
+        if response in ('', 'y', 'yes'):
+            # Add user to input group
+            print(f"\n[Permission] Running: sudo usermod -a -G input {username}")
+            result = subprocess.run(
+                ['sudo', 'usermod', '-a', '-G', 'input', username],
+                capture_output=False
+            )
+            
+            if result.returncode == 0:
+                print("[Permission] ✓ User added to 'input' group")
+                print("[Permission] Re-executing script with new group...\n")
+                _reexec_with_input_group()
+            else:
+                print("[Permission] ✗ Failed to add user to group")
+                print("[Permission] You may need to run manually:")
+                print(f"    sudo usermod -a -G input {username}")
+                print("    newgrp input")
+                sys.exit(1)
+        else:
+            print("[Permission] Skipped. Controller may not work without proper permissions.")
+            print("[Permission] To fix later, run:")
+            print(f"    sudo usermod -a -G input {username}")
+            print("    newgrp input")
+
+
+def _reexec_with_input_group():
+    """Re-execute the current script with 'input' group active using sg."""
+    # Build the command to re-execute
+    python_exe = sys.executable
+    script_path = os.path.abspath(sys.argv[0])
+    args = sys.argv[1:]
+    
+    # Use sg to run with input group
+    # sg input -c "python script.py args..."
+    cmd_str = f'"{python_exe}" "{script_path}"'
+    if args:
+        # Escape args for shell
+        escaped_args = ' '.join(f'"{arg}"' for arg in args)
+        cmd_str += f' {escaped_args}'
+    
+    # Set environment variable to prevent infinite re-exec loop
+    if os.environ.get('_INPUT_GROUP_REEXEC'):
+        return  # Already re-executed, don't loop
+    
+    os.environ['_INPUT_GROUP_REEXEC'] = '1'
+    
+    # Execute with sg
+    os.execvp('sg', ['sg', 'input', '-c', cmd_str])
+
 
 # Suppress pygame pkg_resources deprecation warning
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
@@ -86,12 +196,7 @@ except ImportError:
     PYGAME_AVAILABLE = False
     print("[Error] pygame not installed. Please install: pip install pygame")
 
-# Try to import pydualsense for gyro support
-try:
-    from pydualsense import pydualsense
-    PYDUALSENSE_AVAILABLE = True
-except ImportError:
-    PYDUALSENSE_AVAILABLE = False
+# pydualsense removed - using RawIMUHandler for gyro instead
 
 # Try to import OpenCV for camera display
 try:
@@ -105,6 +210,9 @@ from piper_sdk import C_PiperInterface_V2
 
 # Scipy for rotations
 from scipy.spatial.transform import Rotation as R
+
+# RoboKit
+from robokit.controllers.imu_control import RawIMUHandler
 
 
 # =============================================================================
@@ -476,21 +584,12 @@ class PiperController:
 # =============================================================================
 
 class PS5Controller:
-    """Handler for PS5 DualSense controller using pygame + pydualsense for gyro."""
+    """Handler for PS5 DualSense controller using pygame."""
     
     def __init__(self):
         self.joystick: Optional[pygame.joystick.JoystickType] = None
         self.connected = False
         self.deadzone = 0.1
-        
-        # pydualsense for gyro/accelerometer
-        self._dualsense = None
-        self._gyro_available = False
-        
-        # Gyro calibration (offset to subtract)
-        self._gyro_offset = [0.0, 0.0, 0.0]  # [pitch, yaw, roll] baseline
-        self._gyro_calibrated = False
-        self._gyro_dynamic_deadzone = 1.5  # Will be set during calibration (rad/s)
         
         # Button states for edge detection
         self._prev_buttons = {}
@@ -536,15 +635,6 @@ class PS5Controller:
                 self.connected = True
                 print(f"[Controller] ✓ Using: {name}")
                 print(f"[Controller]   Buttons: {js.get_numbuttons()}, Axes: {js.get_numaxes()}, Hats: {js.get_numhats()}")
-                # Check for gyro support
-                if js.get_numaxes() >= 9:
-                    print(f"[Controller]   ✓ Extended axes detected (may include gyro)")
-                else:
-                    print(f"[Controller]   ⚠ Only {js.get_numaxes()} axes - gyro may not be exposed")
-                    print(f"[Controller]   Tip: Try setting SDL_JOYSTICK_HIDAPI_PS5=1 environment variable")
-                
-                # Initialize pydualsense for gyro if available
-                self._init_pydualsense()
                 return True
         
         # If no PS5 found, use first joystick
@@ -556,93 +646,6 @@ class PS5Controller:
             return True
         
         return False
-    
-    def _init_pydualsense(self):
-        """Initialize pydualsense for gyro support."""
-        if not PYDUALSENSE_AVAILABLE:
-            print("[Controller] pydualsense not installed - gyro disabled")
-            print("[Controller] To enable gyro: pip install pydualsense")
-            return
-        
-        try:
-            self._dualsense = pydualsense()
-            self._dualsense.init()
-            self._gyro_available = True
-            print("[Controller] ✓ pydualsense initialized - gyro enabled!")
-            
-            # Auto-calibrate gyro
-            self.calibrate_gyro()
-        except Exception as e:
-            print(f"[Controller] ⚠ pydualsense init failed: {e}")
-            print("[Controller] Gyro will not be available")
-            self._dualsense = None
-            self._gyro_available = False
-    
-    def calibrate_gyro(self, samples: int = 100):
-        """Calibrate gyro by measuring baseline angular velocity offset when stationary.
-        
-        The gyroscope returns ANGULAR VELOCITY (rate of rotation), not angle.
-        When stationary, ideal reading is 0, but real sensors have bias/offset.
-        This calibration measures that bias to subtract it during operation.
-        
-        Note: Large offset values (e.g., 8000) in raw units are normal - 
-        they represent small angular velocity bias (~500 deg/s worth of LSB,
-        but actual bias is much smaller due to sensor characteristics).
-        
-        Args:
-            samples: Number of samples to average for calibration.
-        """
-        if not self._gyro_available or self._dualsense is None:
-            return
-        
-        print("[Gyro] Calibrating angular velocity bias... keep controller COMPLETELY still!")
-        print("[Gyro] (Best results with USB connection)")
-        time.sleep(0.5)  # Give user time to stabilize
-        
-        readings = []
-        
-        for i in range(samples):
-            try:
-                # Read RAW values directly (no scaling)
-                pitch = self._dualsense.state.gyro.Pitch
-                yaw = self._dualsense.state.gyro.Yaw
-                roll = self._dualsense.state.gyro.Roll
-                readings.append((pitch, yaw, roll))
-                time.sleep(0.025)  # 40Hz sampling, ~2.5 seconds total
-            except:
-                pass
-        
-        if len(readings) < 10:
-            print("[Gyro] ✗ Calibration failed - not enough samples")
-            return
-        
-        # Use median instead of mean to reject outliers
-        readings = np.array(readings)
-        self._gyro_offset[0] = np.median(readings[:, 0])
-        self._gyro_offset[1] = np.median(readings[:, 1])
-        self._gyro_offset[2] = np.median(readings[:, 2])
-        
-        # Compute std to estimate noise level
-        std_pitch = np.std(readings[:, 0])
-        std_yaw = np.std(readings[:, 1])
-        std_roll = np.std(readings[:, 2])
-        max_std = max(std_pitch, std_yaw, std_roll)
-        
-        # Set deadzone based on noise (15 sigma for safety)
-        # USB: std ~10, so deadzone ~200 raw units
-        # Bluetooth: std ~4000, so deadzone ~60000 raw units
-        self._gyro_dynamic_deadzone = max(200.0, max_std * 15)
-        
-        self._gyro_calibrated = True
-        
-        print(f"[Gyro] ✓ Calibrated! Offset: pitch={self._gyro_offset[0]:.0f}, "
-              f"yaw={self._gyro_offset[1]:.0f}, roll={self._gyro_offset[2]:.0f} (raw)")
-        print(f"[Gyro] Noise std: {max_std:.1f}, deadzone: {self._gyro_dynamic_deadzone:.0f} (raw)")
-        
-        if max_std > 500:
-            print(f"[Gyro] ⚠ HIGH NOISE ({max_std:.0f})! Use USB cable for better results.")
-        elif max_std < 50:
-            print(f"[Gyro] ✓ Low noise - good connection!")
     
     def update(self):
         """Process pygame events (call this each frame)."""
@@ -696,65 +699,8 @@ class PS5Controller:
         except:
             return (0, 0)
     
-    def get_gyro_raw(self, debug: bool = False) -> Optional[Tuple[float, float, float]]:
-        """Get calibrated gyroscope ANGULAR VELOCITY data (pitch, yaw, roll).
-        
-        IMPORTANT: Returns ANGULAR VELOCITY (rate of rotation), NOT angle!
-        Values are in RAW units with bias offset removed and deadzone applied.
-        To convert to deg/s: raw_value / 16.4 (approx DualSense sensitivity)
-        To get angle change: angular_velocity * dt
-        
-        Typical range: -10000 to +10000 raw units for moderate rotation speed.
-        
-        Returns:
-            Tuple of (pitch, yaw, roll) angular velocities in raw units, or None.
-        """
-        if not self._gyro_available or self._dualsense is None:
-            if debug:
-                print("[Gyro] ✗ pydualsense not available")
-            return None
-        
-        try:
-            # Read RAW values and subtract calibrated offset
-            gyro_pitch = self._dualsense.state.gyro.Pitch - self._gyro_offset[0]
-            gyro_yaw = self._dualsense.state.gyro.Yaw - self._gyro_offset[1]
-            gyro_roll = self._dualsense.state.gyro.Roll - self._gyro_offset[2]
-            
-            # Clamp extreme values (likely noise spikes)
-            max_valid = 20000.0  # Max reasonable rotation
-            gyro_pitch = np.clip(gyro_pitch, -max_valid, max_valid)
-            gyro_yaw = np.clip(gyro_yaw, -max_valid, max_valid)
-            gyro_roll = np.clip(gyro_roll, -max_valid, max_valid)
-            
-            # Apply dynamic deadzone from calibration
-            dz = self._gyro_dynamic_deadzone
-            if abs(gyro_pitch) < dz:
-                gyro_pitch = 0.0
-            if abs(gyro_yaw) < dz:
-                gyro_yaw = 0.0
-            if abs(gyro_roll) < dz:
-                gyro_roll = 0.0
-            
-            if debug:
-                print(f"[Gyro] pitch={gyro_pitch:+8.0f}  yaw={gyro_yaw:+8.0f}  roll={gyro_roll:+8.0f} (raw)")
-            
-            return (gyro_pitch, gyro_yaw, gyro_roll)
-        except Exception as e:
-            if debug:
-                print(f"[Gyro] Error reading: {e}")
-            return None
-    
-    def get_gyro(self, debug: bool = False) -> Optional[Tuple[float, float, float]]:
-        """Get raw gyroscope data. Alias for get_gyro_raw for compatibility."""
-        return self.get_gyro_raw(debug)
-    
     def close(self):
-        """Close pygame and pydualsense."""
-        if self._dualsense is not None:
-            try:
-                self._dualsense.close()
-            except:
-                pass
+        """Close pygame."""
         if self.joystick is not None:
             self.joystick.quit()
         pygame.quit()
@@ -875,7 +821,8 @@ class TeleoperationController:
     Action is stored as RELATIVE pose change (delta) per frame.
     """
     
-    def __init__(self, piper: PiperController, ps5: PS5Controller,
+    def __init__(self, piper: PiperController, 
+                 ps5: PS5Controller,
                  linear_scale: float = LINEAR_VEL_SCALE,
                  angular_scale: float = ANGULAR_VEL_SCALE,
                  control_freq: float = 30.0,
@@ -893,23 +840,15 @@ class TeleoperationController:
         self._gripper_open = True
         self._gripper_target_angle = GRIPPER_OPEN_ANGLE  # Track target gripper angle
         self._gripper_speed = 3.0  # Degrees per control cycle when trigger pressed
-        # Gyro returns ANGULAR VELOCITY (rate of rotation), not angle!
-        # DualSense gyro: ~16.4 LSB per deg/s, so raw_value / 16.4 ≈ deg/s
-        # Convert to rad/s: (raw / 16.4) * (π/180) = raw * 0.00106
-        # Then multiply by dt to get angle change: Δθ = ω * dt
-        self._gyro_lsb_per_deg_s = 16.4  # DualSense gyro sensitivity
         self._gyro_sensitivity = 1.5  # User-adjustable sensitivity multiplier
         self._running = False
         self._recorded_poses = []  # Store recorded poses
         
-        # Low-pass filter for gyro (exponential moving average)
-        self._gyro_alpha = 0.15  # Smoothing factor (higher = more responsive, lower = smoother)
-        self._gyro_filtered = [0.0, 0.0, 0.0]  # [pitch, yaw, roll]
-        
-        # Dynamic gyro calibration: re-calibrate when entering gyro mode
+        # Gyro mode tracking
         self._gyro_mode_active = False
-        self._gyro_recal_samples = []  # Samples for dynamic recalibration
-        self._gyro_recal_frames = 15   # Number of frames to collect for recalibration
+
+        # RoboKit IMU handler for gyroscope
+        self._imu_handler = RawIMUHandler()
         
         # Data recording
         self._record_data = record_data
@@ -956,6 +895,89 @@ class TeleoperationController:
         self._current_episode = None
         self._prev_pose = None
         return episode
+    
+    def _record_frame(self, pose: dict, target_x: float = None, target_y: float = None, 
+                      target_z: float = None, target_rx: float = None, 
+                      target_ry: float = None, target_rz: float = None):
+        """Record a single frame of data during teleoperation.
+        
+        Args:
+            pose: Current end-effector pose dict from piper.get_ee_pose_meters()
+            target_*: Target pose values (if not provided, uses current pose values)
+        """
+        if not self._recording or self._current_episode is None:
+            return
+        
+        # Use current pose if targets not specified
+        if target_x is None:
+            target_x = pose['x']
+        if target_y is None:
+            target_y = pose['y']
+        if target_z is None:
+            target_z = pose['z']
+        if target_rx is None:
+            target_rx = pose['rx']
+        if target_ry is None:
+            target_ry = pose['ry']
+        if target_rz is None:
+            target_rz = pose['rz']
+        
+        # Get current pose as observation
+        current_pos = np.array([pose['x'], pose['y'], pose['z']])
+        current_quat = np.array(euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg']))
+        ee_pose = np.concatenate([current_pos, current_quat])  # [x, y, z, qw, qx, qy, qz]
+        
+        # Get gripper state (normalized 0-1)
+        gripper_angle = self.piper.get_gripper_angle() or self._gripper_target_angle
+        gripper_state = gripper_angle / GRIPPER_OPEN_ANGLE  # Normalize to [0, 1]
+        
+        # Compute action as RELATIVE pose change (delta)
+        if self._prev_pose is not None:
+            delta_x = target_x - self._prev_pose['x']
+            delta_y = target_y - self._prev_pose['y']
+            delta_z = target_z - self._prev_pose['z']
+            
+            delta_rx = target_rx - self._prev_pose['rx']
+            delta_ry = target_ry - self._prev_pose['ry']
+            delta_rz = target_rz - self._prev_pose['rz']
+            delta_quat = np.array(euler_to_quat(
+                np.rad2deg(delta_rx), np.rad2deg(delta_ry), np.rad2deg(delta_rz)
+            ))
+        else:
+            # First frame: no delta, set to zero
+            delta_x, delta_y, delta_z = 0.0, 0.0, 0.0
+            delta_quat = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+        
+        # Gripper target (normalized)
+        gripper_target = self._gripper_target_angle / GRIPPER_OPEN_ANGLE
+        
+        action = np.array([delta_x, delta_y, delta_z,
+                           delta_quat[0], delta_quat[1], delta_quat[2], delta_quat[3],
+                           gripper_target], dtype=np.float32)
+        
+        # Get camera frames
+        fixed_img = self._fixed_cam.get_frame_rgb() if self._fixed_cam else None
+        wrist_img = self._wrist_cam.get_frame_rgb() if self._wrist_cam else None
+        
+        # Handle missing camera data
+        if fixed_img is None:
+            fixed_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        if wrist_img is None:
+            wrist_img = np.zeros_like(fixed_img)
+        
+        # Record data
+        self._current_episode.fixed_images.append(fixed_img)
+        self._current_episode.wrist_images.append(wrist_img)
+        self._current_episode.ee_pose.append(ee_pose)
+        self._current_episode.gripper_state.append(gripper_state)
+        self._current_episode.action.append(action)
+        self._current_episode.timestamp.append(time.time())
+        
+        # Update previous pose for next delta computation
+        self._prev_pose = {
+            'x': target_x, 'y': target_y, 'z': target_z,
+            'rx': target_rx, 'ry': target_ry, 'rz': target_rz,
+        }
         
     def start(self):
         """Start teleoperation."""
@@ -976,6 +998,7 @@ class TeleoperationController:
         print("  Square:        Print & record pose")
         print("  Share:         Emergency stop/Resume")
         print("  PS Button:     Quit")
+        
         if self._record_data:
             print("\nData Recording:")
             print("  L3 (Left Stick Press):  Start/Stop recording episode")
@@ -984,6 +1007,14 @@ class TeleoperationController:
     
     def step(self) -> bool:
         """Execute one control step.
+        
+        Returns:
+            False if should quit, True otherwise.
+        """
+        return self._step_ps5()
+    
+    def _step_ps5(self) -> bool:
+        """Execute one control step using PS5 controller.
         
         Returns:
             False if should quit, True otherwise.
@@ -1095,28 +1126,23 @@ class TeleoperationController:
         # Circle button held - gyro mode for orientation control
         circle_held = self.ps5.get_button(PS5Buttons.CIRCLE)
         
-        # Handle gyro mode activation/deactivation with dynamic recalibration
+        # Handle gyro mode activation/deactivation
         if circle_held and not self._gyro_mode_active:
-            # Just entered gyro mode - start recalibration
+            # Just entered gyro mode - reset IMU pose
             self._gyro_mode_active = True
-            self._gyro_recal_samples = []
-            self._gyro_filtered = [0.0, 0.0, 0.0]  # Reset filter
-            print("[Gyro] 🎯 Entering gyro mode - hold still for calibration...")
+            self._imu_handler.reset_pose() 
+            # debug the vr gyro instead
+            # self._quest_handler.reset_pose()
+
+            print("[Gyro] 🎯 Entering gyro mode - IMU pose reset")
         elif not circle_held and self._gyro_mode_active:
             # Exited gyro mode
             self._gyro_mode_active = False
-            self._gyro_recal_samples = []
         
         # Debug: print gyro status when Circle is first pressed
         if circle_held and not getattr(self, '_gyro_debug_printed', False):
-            print("[Teleop] 🎮 Gyro mode activated - checking gyro availability...")
-            gyro = self.ps5.get_gyro(debug=True)  # Print debug info
-            if gyro is None:
-                print("[Teleop] ⚠ Gyro not available!")
-                print("[Teleop] To enable gyro: pip install pydualsense libhidapi-hidraw0")
-                print("[Teleop] Fallback: using right stick X for yaw rotation")
-            else:
-                print(f"[Teleop] ✓ Gyro working! Tilt controller to rotate end-effector")
+            print("[Teleop] 🎮 Gyro mode activated - using RawIMUHandler")
+            print(f"[Teleop] ✓ IMU ready! Tilt controller to rotate end-effector")
             self._gyro_debug_printed = True
         elif not circle_held:
             self._gyro_debug_printed = False
@@ -1129,87 +1155,47 @@ class TeleoperationController:
         
         # Rotation control
         if circle_held:
-            # Gyro mode: use controller's gyroscope for orientation
-            # IMPORTANT: Gyro returns ANGULAR VELOCITY (deg/s in raw units), not angle!
-            # We need to integrate: Δangle = angular_velocity × dt
-            gyro = self.ps5.get_gyro_raw()
-            if gyro is not None:
-                gyro_pitch, gyro_yaw, gyro_roll = gyro
-                
-                # Dynamic recalibration: collect samples for first N frames
-                # This compensates for gyro drift since initial calibration
-                if len(self._gyro_recal_samples) < self._gyro_recal_frames:
-                    self._gyro_recal_samples.append((gyro_pitch, gyro_yaw, gyro_roll))
-                    if len(self._gyro_recal_samples) == self._gyro_recal_frames:
-                        # Calculate and apply dynamic offset correction
-                        samples = np.array(self._gyro_recal_samples)
-                        recal_offset = np.median(samples, axis=0)
-                        # Update the PS5 controller's offset directly
-                        self.ps5._gyro_offset[0] += recal_offset[0]
-                        self.ps5._gyro_offset[1] += recal_offset[1]
-                        self.ps5._gyro_offset[2] += recal_offset[2]
-                        print(f"[Gyro] ✓ Recalibrated! Drift correction: "
-                              f"({recal_offset[0]:+.0f}, {recal_offset[1]:+.0f}, {recal_offset[2]:+.0f})")
-                    # Skip control during calibration
-                    target_rx = pose['rx']
-                    target_ry = pose['ry']
-                    target_rz = pose['rz']
-                else:
-                    # Normal gyro control after recalibration
-                    # Apply low-pass filter (exponential moving average)
-                    self._gyro_filtered[0] = self._gyro_alpha * gyro_pitch + (1 - self._gyro_alpha) * self._gyro_filtered[0]
-                    self._gyro_filtered[1] = self._gyro_alpha * gyro_yaw + (1 - self._gyro_alpha) * self._gyro_filtered[1]
-                    self._gyro_filtered[2] = self._gyro_alpha * gyro_roll + (1 - self._gyro_alpha) * self._gyro_filtered[2]
-                    
-                    # Use filtered values (still in raw units = angular velocity)
-                    filtered_pitch = self._gyro_filtered[0]
-                    filtered_yaw = self._gyro_filtered[1]
-                    filtered_roll = self._gyro_filtered[2]
-                    
-                    # Convert raw gyro (angular velocity) to angle change:
-                    # 1. raw_value / 16.4 = deg/s
-                    # 2. deg/s * (π/180) = rad/s  
-                    # 3. rad/s * dt = rad (angle change)
-                    # Combined: raw * (1/16.4) * (π/180) * dt * sensitivity
-                    gyro_to_rad = (1.0 / self._gyro_lsb_per_deg_s) * (np.pi / 180.0) * self._control_dt * self._gyro_sensitivity
-                    
-                    # Map controller gyro to arm rotation (incremental)
-                    # Controller pitch (tilt forward/back) -> arm RX or RY
-                    # Controller yaw (rotate horizontally) -> arm RZ
-                    # Controller roll (tilt left/right) -> arm RX or RY
-                    delta_rx = filtered_pitch * gyro_to_rad
-                    delta_ry = -filtered_roll * gyro_to_rad  # Negated for correct direction
-                    delta_rz = filtered_yaw * gyro_to_rad
-                    
-                    target_rx = pose['rx'] + delta_rx
-                    target_ry = pose['ry'] + delta_ry
-                    target_rz = pose['rz'] + delta_rz
-                    
-                    # Periodic debug print (every ~1 second at 30Hz)
-                    if not hasattr(self, '_gyro_print_counter'):
-                        self._gyro_print_counter = 0
-                    self._gyro_print_counter += 1
-                    if self._gyro_print_counter % 30 == 0:
-                        # Show angular velocity in deg/s for intuition
-                        vel_pitch = filtered_pitch / self._gyro_lsb_per_deg_s
-                        vel_yaw = filtered_yaw / self._gyro_lsb_per_deg_s
-                        vel_roll = filtered_roll / self._gyro_lsb_per_deg_s
-                        print(f"[Gyro] vel=({vel_pitch:+.1f}, {vel_yaw:+.1f}, {vel_roll:+.1f}) deg/s  "
-                              f"Δ=({np.rad2deg(delta_rx):+.2f}, {np.rad2deg(delta_ry):+.2f}, {np.rad2deg(delta_rz):+.2f}) deg")
-            else:
-                # Gyro not available, use right stick X for yaw as fallback
-                target_rx = pose['rx']
-                target_ry = pose['ry']
-                target_rz = pose['rz'] + right_x * self.angular_scale  # Fallback: right stick for yaw
+            # Gyro mode: use RawIMUHandler for orientation control
+            # get_latest_euler returns: {'euler': [rpy_real(3), rpy_rel(3)], 'quat': [4]}
+
+            # debug the vr gyro instead
+            imu_data = self._imu_handler.get_latest_euler() 
+            euler = imu_data['euler']  # [roll_real, pitch_real, yaw_real, roll_rel, pitch_rel, yaw_rel] in degrees
+            
+            # Use relative euler angles (change since last query)
+            # euler[3:6] = rpy_rel (degrees)
+            roll_rel = euler[3]   # Roll change
+            pitch_rel = euler[4]  # Pitch change  
+            yaw_rel = euler[5]    # Yaw change
+
+            # vr_data = self._quest_handler.get_new_data()
+            
+            # Convert degrees to radians and apply sensitivity
+            # Mapping: controller roll -> robot RX, controller pitch -> robot RY, controller yaw -> robot RZ
+            delta_rx = -np.deg2rad(roll_rel) * self._gyro_sensitivity   # Controller roll -> robot RX
+            delta_ry = np.deg2rad(pitch_rel) * self._gyro_sensitivity   # Controller pitch -> robot RY
+            delta_rz = np.deg2rad(yaw_rel) * self._gyro_sensitivity     # Controller yaw -> robot RZ
+            
+            target_rx = pose['rx'] + delta_rx
+            target_ry = pose['ry'] + delta_ry
+            target_rz = pose['rz'] + delta_rz
+            
+            # Periodic debug print (every ~1 second at 30Hz)
+            if not hasattr(self, '_gyro_print_counter'):
+                self._gyro_print_counter = 0
+            self._gyro_print_counter += 1
+            if self._gyro_print_counter % 30 == 0:
+                print(f"[Gyro] rpy_rel=({roll_rel:+.1f}, {pitch_rel:+.1f}, {yaw_rel:+.1f}) deg  "
+                      f"Δ=({np.rad2deg(delta_rx):+.2f}, {np.rad2deg(delta_ry):+.2f}, {np.rad2deg(delta_rz):+.2f}) deg")
         else:
-            # Normal mode: D-pad and right stick for rotation
+            # Normal mode: D-pad for rotation
             target_rx = pose['rx'] + dpad_roll * self.angular_scale * 0.5
             target_ry = pose['ry'] + dpad_pitch * self.angular_scale * 0.5
-            target_rz = pose['rz'] + right_x * self.angular_scale
+            target_rz = pose['rz']
         
         # Apply movement if any input is active
         has_position_input = any(abs(v) > 0.01 for v in [left_stick_x, left_stick_y, right_y])
-        has_rotation_input = circle_held or any(abs(v) > 0.01 for v in [right_x, dpad_pitch, dpad_roll])
+        has_rotation_input = circle_held or any(abs(v) > 0.01 for v in [dpad_pitch, dpad_roll])
         
         if has_position_input or has_rotation_input:
             self.piper.move_to_pose(target_x, target_y, target_z, target_rx, target_ry, target_rz)
@@ -1294,8 +1280,11 @@ class TeleoperationController:
         return True
     
     def stop(self):
-        """Stop teleoperation."""
+        """Stop teleoperation and cleanup resources."""
         self._running = False
+        # Stop IMU handler subprocess
+        if self._imu_handler is not None:
+            self._imu_handler.stop()
 
 
 # =============================================================================
@@ -1368,11 +1357,10 @@ def normalize_camera_value(value: str) -> Union[int, str]:
 
 
 def main():
-    args = parse_args()
+    # Check input group permissions before anything else
+    check_and_setup_input_group()
     
-    if not PYGAME_AVAILABLE:
-        print("[Error] pygame is required. Install with: pip install pygame")
-        sys.exit(1)
+    args = parse_args()
     
     print("\n" + "=" * 60)
     print("Piper PS5 Teleoperation")
@@ -1388,12 +1376,20 @@ def main():
         print(f"\nData will be saved to: {out_dir}")
     
     # Initialize PS5 controller
+    ps5 = None
+    # Initialize PS5 controller
     print("\n[Init] Initializing PS5 controller...")
+    if not PYGAME_AVAILABLE:
+        print("[Error] pygame not available. Please install: pip install pygame")
+        sys.exit(1)
+    
     ps5 = PS5Controller()
     ps5.deadzone = args.deadzone
     
     if not ps5.initialize():
-        print("[Error] Failed to initialize controller")
+        print("[Error] No PS5 controller found")
+        print("[Error] Make sure PS5 controller is connected via Bluetooth")
+        ps5.close()
         sys.exit(1)
     
     # Initialize Piper arm
@@ -1458,7 +1454,8 @@ def main():
     
     # Create teleoperation controller
     teleop = TeleoperationController(
-        piper, ps5,
+        piper, 
+        ps5=ps5,
         linear_scale=args.linear_scale,
         angular_scale=args.angular_scale,
         control_freq=args.control_freq,
@@ -1560,6 +1557,8 @@ def main():
             time.sleep(2.0)
         
         piper.disconnect()
+        
+        # Close controllers
         ps5.close()
         
         # Stop cameras
@@ -1577,6 +1576,7 @@ def main():
         if args.record and out_dir:
             metadata = {
                 "collection_type": "teleop",
+                "control_mode": "ps5",
                 "action_type": "relative_delta",
                 "action_description": "action[0:3] = delta_xyz (meters), action[3:7] = delta_quat (wxyz), action[7] = gripper_target (0-1)",
                 "ee_pose_description": "ee_pose[0:3] = xyz (meters), ee_pose[3:7] = quat (wxyz)",
