@@ -14,25 +14,21 @@ Supports both:
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-# Basic usage - visualize all episodes
+# Visualize a specific episode (tar.gz archive)
 python scripts/scripts_piper_local/3_visualize_collected_data.py \
-    --data_dir data/piper_pick_place
+    --episode data/teleop_data/episode_0000.tar.gz
 
-# Visualize teleop data (auto-detected from metadata)
+# Visualize a specific episode (directory format)
 python scripts/scripts_piper_local/3_visualize_collected_data.py \
-    --data_dir data/teleop_data
-
-# Visualize specific episodes
-python scripts/scripts_piper_local/3_visualize_collected_data.py \
-    --data_dir data/piper_pick_place --episodes 0 1 2
+    --episode data/piper_pick_place/episode_0000
 
 # Custom output path and fps
 python scripts/scripts_piper_local/3_visualize_collected_data.py \
-    --data_dir data/piper_pick_place --output data/viz_output.mp4 --fps 15
+    --episode data/teleop_data/episode_0000.tar.gz --output data/viz_output.mp4 --fps 15
 
 # Skip XYZ curves (faster rendering)
 python scripts/scripts_piper_local/3_visualize_collected_data.py \
-    --data_dir data/piper_pick_place --no_xyz_curves
+    --episode data/teleop_data/episode_0000.tar.gz --no_xyz_curves
 
 =============================================================================
 """
@@ -41,8 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import tarfile
+import tempfile
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import cv2
 import imageio
@@ -114,11 +113,15 @@ def is_teleop_data(metadata: dict) -> bool:
 # Data Loading Functions
 # =============================================================================
 
-def load_episode_data(episode_dir: Path, is_teleop: bool = False) -> dict:
-    """Load episode data from directory.
+def load_episode_data(episode_path: Union[Path, str], is_teleop: bool = False) -> dict:
+    """Load episode data from directory or tar.gz archive.
+    
+    Supports two formats:
+    - Directory format: episode_XXXX/ (from script 1)
+    - Archive format: episode_XXXX.tar.gz (from script 2)
     
     Args:
-        episode_dir: Path to episode directory (e.g., episode_0000/)
+        episode_path: Path to episode directory or tar.gz archive
         is_teleop: Whether this is teleop data (no fsm_state, relative actions)
         
     Returns:
@@ -140,6 +143,60 @@ def load_episode_data(episode_dir: Path, is_teleop: bool = False) -> dict:
         - success: bool
         - episode_id: int
         - is_teleop: bool
+    """
+    episode_path = Path(episode_path)
+    
+    # Check if it's a tar.gz archive
+    if episode_path.suffix == '.gz' and episode_path.stem.endswith('.tar'):
+        return _load_episode_from_archive(episode_path, is_teleop)
+    elif episode_path.is_dir():
+        return _load_episode_from_directory(episode_path, is_teleop)
+    else:
+        raise FileNotFoundError(f"Episode not found: {episode_path}")
+
+
+def _load_episode_from_archive(archive_path: Path, is_teleop: bool = False) -> dict:
+    """Load episode data from tar.gz archive.
+    
+    Args:
+        archive_path: Path to tar.gz archive (e.g., episode_0000.tar.gz)
+        is_teleop: Whether this is teleop data
+        
+    Returns:
+        Dictionary containing episode data
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        
+        # Extract archive
+        with tarfile.open(archive_path, 'r:gz') as tar:
+            tar.extractall(temp_path)
+        
+        # Find the episode directory inside the extracted content
+        extracted_dirs = list(temp_path.iterdir())
+        if len(extracted_dirs) == 1 and extracted_dirs[0].is_dir():
+            episode_dir = extracted_dirs[0]
+        else:
+            # Assume the episode name matches the archive name
+            episode_name = archive_path.stem.replace('.tar', '')
+            episode_dir = temp_path / episode_name
+        
+        if not episode_dir.exists():
+            raise FileNotFoundError(f"Could not find episode directory in archive: {archive_path}")
+        
+        # Load using the directory loader
+        return _load_episode_from_directory(episode_dir, is_teleop)
+
+
+def _load_episode_from_directory(episode_dir: Path, is_teleop: bool = False) -> dict:
+    """Load episode data from directory.
+    
+    Args:
+        episode_dir: Path to episode directory (e.g., episode_0000/)
+        is_teleop: Whether this is teleop data
+        
+    Returns:
+        Dictionary containing episode data
     """
     npz_path = episode_dir / "episode_data.npz"
     if not npz_path.exists():
@@ -173,26 +230,44 @@ def load_episode_data(episode_dir: Path, is_teleop: bool = False) -> dict:
     
     # Load force/torque data (only available in scripted data from script 1)
     result['has_force_data'] = False
+    
+    # DEBUG: Print all keys in the npz file
+    print(f"[DEBUG Load] NPZ file keys: {list(data.keys())}")
+    
     if 'joint_angles' in data:
         result['joint_angles'] = data['joint_angles']
+        print(f"[DEBUG Load] joint_angles: shape={data['joint_angles'].shape}")
     else:
         result['joint_angles'] = np.zeros((result['num_timesteps'], 6), dtype=np.float32)
+        print(f"[DEBUG Load] joint_angles: NOT FOUND in npz")
     
     if 'joint_torques' in data:
         result['joint_torques'] = data['joint_torques']
+        torques = data['joint_torques']
+        has_nonzero_torques = np.any(np.abs(torques) > 1e-6)
+        print(f"[DEBUG Load] joint_torques: shape={torques.shape}, has_nonzero={has_nonzero_torques}")
+        print(f"  torques range: [{torques.min():.6f}, {torques.max():.6f}]")
         # Check if we have non-zero torque data
-        if np.any(np.abs(data['joint_torques']) > 1e-6):
+        if has_nonzero_torques:
             result['has_force_data'] = True
     else:
         result['joint_torques'] = np.zeros((result['num_timesteps'], 6), dtype=np.float32)
+        print(f"[DEBUG Load] joint_torques: NOT FOUND in npz")
     
     if 'ee_force' in data:
         result['ee_force'] = data['ee_force']
+        force = data['ee_force']
+        has_nonzero_force = np.any(np.abs(force) > 1e-6)
+        print(f"[DEBUG Load] ee_force: shape={force.shape}, has_nonzero={has_nonzero_force}")
+        print(f"  force range: [{force.min():.6f}, {force.max():.6f}]")
         # Check if we have non-zero force data
-        if np.any(np.abs(data['ee_force']) > 1e-6):
+        if has_nonzero_force:
             result['has_force_data'] = True
     else:
         result['ee_force'] = np.zeros((result['num_timesteps'], 6), dtype=np.float32)
+        print(f"[DEBUG Load] ee_force: NOT FOUND in npz")
+    
+    print(f"[DEBUG Load] Final has_force_data = {result['has_force_data']}")
     
     # For teleop data, integrate relative actions to get absolute trajectory
     if is_teleop:
@@ -260,23 +335,54 @@ def integrate_relative_actions(ee_pose: np.ndarray, action: np.ndarray) -> np.nd
     return integrated
 
 
-def get_episode_dirs(data_dir: Path, episode_indices: Optional[List[int]] = None) -> List[Path]:
-    """Get list of episode directories.
+def get_episode_paths(data_dir: Path, episode_indices: Optional[List[int]] = None) -> List[Path]:
+    """Get list of episode paths (directories or tar.gz archives).
+    
+    Supports both formats:
+    - Directory format: episode_XXXX/ (from script 1)
+    - Archive format: episode_XXXX.tar.gz (from script 2)
     
     Args:
-        data_dir: Root data directory containing episode folders.
+        data_dir: Root data directory containing episode folders/archives.
         episode_indices: Optional list of specific episode indices to load.
         
     Returns:
-        List of episode directory paths, sorted by episode index.
+        List of episode paths, sorted by episode index.
     """
-    episode_dirs = sorted(data_dir.glob("episode_*"))
+    # Find both directories and tar.gz archives
+    episode_dirs = list(data_dir.glob("episode_*/"))  # Directories
+    episode_archives = list(data_dir.glob("episode_*.tar.gz"))  # Archives
     
+    # Combine and deduplicate (prefer archives if both exist)
+    episode_map = {}
+    
+    for d in episode_dirs:
+        try:
+            idx = int(d.name.split("_")[1])
+            episode_map[idx] = d
+        except (IndexError, ValueError):
+            continue
+    
+    for a in episode_archives:
+        try:
+            # episode_0000.tar.gz -> 0000
+            idx = int(a.stem.replace('.tar', '').split("_")[1])
+            episode_map[idx] = a  # Archives override directories
+        except (IndexError, ValueError):
+            continue
+    
+    # Filter by indices if specified
     if episode_indices is not None:
-        episode_dirs = [
-            d for d in episode_dirs 
-            if int(d.name.split("_")[1]) in episode_indices
-        ]
+        episode_map = {k: v for k, v in episode_map.items() if k in episode_indices}
+    
+    # Sort by index and return paths
+    return [episode_map[k] for k in sorted(episode_map.keys())]
+
+
+# Keep old function name for backward compatibility
+def get_episode_dirs(data_dir: Path, episode_indices: Optional[List[int]] = None) -> List[Path]:
+    """Deprecated: Use get_episode_paths instead."""
+    return get_episode_paths(data_dir, episode_indices)
     
     return episode_dirs
 
@@ -321,7 +427,7 @@ def create_xyz_curve_frame(
         RGB image array of shape (H, W, 3)
     """
     # Use 3x2 grid if force data available, otherwise 2x2
-    if has_force_data and not is_teleop:
+    if has_force_data:
         fig, axes = plt.subplots(3, 2, figsize=(figsize[0], figsize[1] * 1.5), dpi=dpi)
     else:
         fig, axes = plt.subplots(2, 2, figsize=figsize, dpi=dpi)
@@ -418,8 +524,8 @@ def create_xyz_curve_frame(
     ax.set_xlim(0, total_t)
     ax.grid(True, alpha=0.3)
     
-    # Force visualization (only for scripted data with force data)
-    if has_force_data and not is_teleop and ee_force is not None and joint_torques is not None:
+    # Force visualization (for both scripted and teleop data with force data)
+    if has_force_data and ee_force is not None and joint_torques is not None:
         joint_colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#a65628']
         joint_labels = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
         
@@ -628,25 +734,48 @@ def compose_frame_simple(
 # Main Visualization Function
 # =============================================================================
 
+def get_episode_timestamp(episode_path: Path, is_teleop: bool = False) -> Optional[str]:
+    """Extract collection timestamp from episode data.
+    
+    Args:
+        episode_path: Path to episode directory or tar.gz archive
+        is_teleop: Whether this is teleop data
+        
+    Returns:
+        Timestamp string in format YYYYMMDD_HHMMSS, or None if not available
+    """
+    try:
+        episode_data = load_episode_data(episode_path, is_teleop=is_teleop)
+        timestamps = episode_data.get('timestamp')
+        if timestamps is not None and len(timestamps) > 0:
+            # Use the first timestamp (episode start time)
+            # Timestamps are typically in seconds since epoch
+            first_ts = timestamps[0]
+            dt = datetime.fromtimestamp(first_ts)
+            return dt.strftime("%Y%m%d_%H%M%S")
+    except Exception as e:
+        print(f"Warning: Could not extract timestamp: {e}")
+    return None
+
+
 def create_visualization_video(
-    data_dir: Path,
+    episode_path: Path,
     output_path: Path,
-    episode_indices: Optional[List[int]] = None,
     fps: int = 30,
     include_xyz_curves: bool = True,
     target_height: int = 480,
 ) -> None:
-    """Create visualization video from collected data.
+    """Create visualization video from a single episode.
     
     Args:
-        data_dir: Root data directory containing episode folders.
+        episode_path: Path to episode directory or tar.gz archive.
         output_path: Path to save the output video.
-        episode_indices: Optional list of specific episode indices to visualize.
         fps: Frames per second for output video.
         include_xyz_curves: Whether to include XYZ curve plots.
         target_height: Target height for camera images.
     """
-    # Load metadata to detect data type
+    # Detect data type from parent directory metadata
+    data_dir = episode_path.parent
     metadata = load_metadata(data_dir)
     is_teleop = is_teleop_data(metadata)
     
@@ -656,14 +785,10 @@ def create_visualization_video(
     else:
         print("Detected SCRIPTED data (absolute actions)")
     
-    # Get episode directories
-    episode_dirs = get_episode_dirs(data_dir, episode_indices)
+    # Single episode
+    episode_paths = [episode_path]
     
-    if len(episode_dirs) == 0:
-        print(f"No episodes found in {data_dir}")
-        return
-    
-    print(f"Found {len(episode_dirs)} episodes to visualize")
+    print(f"Visualizing episode: {episode_path}")
     
     # Create output directory if needed
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -679,73 +804,64 @@ def create_visualization_video(
     
     total_frames = 0
     
-    for episode_dir in tqdm(episode_dirs, desc="Processing episodes"):
-        try:
-            episode_data = load_episode_data(episode_dir, is_teleop=is_teleop)
-        except Exception as e:
-            print(f"Error loading {episode_dir}: {e}")
-            continue
+    # Load episode data
+    try:
+        episode_data = load_episode_data(episode_path, is_teleop=is_teleop)
+    except Exception as e:
+        print(f"Error loading {episode_path}: {e}")
+        writer.close()
+        return
+    
+    episode_id = episode_data['episode_id']
+    num_timesteps = episode_data['num_timesteps']
+    has_force = episode_data.get('has_force_data', False)
+    
+    force_str = " (with force data)" if has_force else ""
+    print(f"  Episode {episode_id}: {num_timesteps} timesteps{force_str}")
+    
+    for t in tqdm(range(num_timesteps), desc="Rendering frames"):
+        fixed_img = episode_data['fixed_images'][t]
+        wrist_img = episode_data['wrist_images'][t]
+        fsm_state = episode_data['fsm_state'][t]
         
-        episode_id = episode_data['episode_id']
-        num_timesteps = episode_data['num_timesteps']
-        has_force = episode_data.get('has_force_data', False)
-        
-        force_str = " (with force data)" if has_force else ""
-        print(f"  Episode {episode_id}: {num_timesteps} timesteps{force_str}")
-        
-        for t in range(num_timesteps):
-            fixed_img = episode_data['fixed_images'][t]
-            wrist_img = episode_data['wrist_images'][t]
-            fsm_state = episode_data['fsm_state'][t]
-            
-            if include_xyz_curves:
-                # Create XYZ curve frame (with optional force data)
-                xyz_img = create_xyz_curve_frame(
-                    ee_pose_history=episode_data['ee_pose'],
-                    action_history=episode_data['action'],
-                    action_integrated=episode_data['action_integrated'],
-                    current_t=t,
-                    total_t=num_timesteps,
-                    episode_id=episode_id,
-                    fsm_state=fsm_state,
-                    is_teleop=is_teleop,
-                    joint_torques=episode_data.get('joint_torques'),
-                    ee_force=episode_data.get('ee_force'),
-                    has_force_data=episode_data.get('has_force_data', False),
-                )
-                
-                # Compose final frame
-                frame = compose_frame(
-                    fixed_img=fixed_img,
-                    wrist_img=wrist_img,
-                    xyz_curve_img=xyz_img,
-                    target_height=target_height,
-                )
-            else:
-                # Simple frame without XYZ curves
-                frame = compose_frame_simple(
-                    fixed_img=fixed_img,
-                    wrist_img=wrist_img,
-                    episode_id=episode_id,
-                    current_t=t,
-                    total_t=num_timesteps,
-                    fsm_state=fsm_state,
-                    is_teleop=is_teleop,
-                    target_height=target_height,
-                )
-            
-            writer.append_data(frame)
-            total_frames += 1
-        
-        # Add a few blank frames between episodes for visual separation
-        if episode_dir != episode_dirs[-1]:
-            separator = create_placeholder_image(
-                frame.shape[1], frame.shape[0],
-                f"Episode {episode_id} Complete"
+        if include_xyz_curves:
+            # Create XYZ curve frame (with optional force data)
+            xyz_img = create_xyz_curve_frame(
+                ee_pose_history=episode_data['ee_pose'],
+                action_history=episode_data['action'],
+                action_integrated=episode_data['action_integrated'],
+                current_t=t,
+                total_t=num_timesteps,
+                episode_id=episode_id,
+                fsm_state=fsm_state,
+                is_teleop=is_teleop,
+                joint_torques=episode_data.get('joint_torques'),
+                ee_force=episode_data.get('ee_force'),
+                has_force_data=episode_data.get('has_force_data', False),
             )
-            for _ in range(fps // 2):  # 0.5 second pause
-                writer.append_data(separator)
-                total_frames += 1
+            
+            # Compose final frame
+            frame = compose_frame(
+                fixed_img=fixed_img,
+                wrist_img=wrist_img,
+                xyz_curve_img=xyz_img,
+                target_height=target_height,
+            )
+        else:
+            # Simple frame without XYZ curves
+            frame = compose_frame_simple(
+                fixed_img=fixed_img,
+                wrist_img=wrist_img,
+                episode_id=episode_id,
+                current_t=t,
+                total_t=num_timesteps,
+                fsm_state=fsm_state,
+                is_teleop=is_teleop,
+                target_height=target_height,
+            )
+        
+        writer.append_data(frame)
+        total_frames += 1
     
     writer.close()
     
@@ -766,40 +882,33 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Visualize all episodes (includes force data if available)
-  python 3_visualize_collected_data.py --data_dir data/piper_pick_place
+  # Visualize a specific episode (tar.gz archive)
+  python 3_visualize_collected_data.py --episode data/teleop_data/episode_0000.tar.gz
   
-  # Visualize specific episodes
-  python 3_visualize_collected_data.py --data_dir data/piper_pick_place --episodes 0 1 2
+  # Visualize a specific episode (directory format)
+  python 3_visualize_collected_data.py --episode data/piper_pick_place/episode_0000
   
   # Without XYZ curves (faster, no force visualization)
-  python 3_visualize_collected_data.py --data_dir data/piper_pick_place --no_xyz_curves
+  python 3_visualize_collected_data.py --episode data/teleop_data/episode_0000.tar.gz --no_xyz_curves
 
 Note:
-  - Scripted data (script 1) includes force data: joint_torques, ee_force
-  - Teleop data (script 2) does NOT include force data
-  - Force data is automatically visualized if available
+  - Both scripted (script 1) and teleop (script 2) data can include force data
+  - Force data (joint_torques, ee_force) is automatically visualized if available
+  - Output filename includes episode collection timestamp
 """
     )
     
     parser.add_argument(
-        "--data_dir", "-d",
+        "--episode", "-e",
         type=str,
-        default="data/piper_pick_place",
-        help="Directory containing episode data (default: data/piper_pick_place)"
+        required=True,
+        help="Path to episode directory or tar.gz archive (e.g., data/teleop_data/episode_0000.tar.gz)"
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
         default=None,
-        help="Output video path (default: data/piper_pick_place_viz.mp4)"
-    )
-    parser.add_argument(
-        "--episodes", "-e",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Specific episode indices to visualize (default: all)"
+        help="Output video path (default: auto-generated with timestamp suffix)"
     )
     parser.add_argument(
         "--fps",
@@ -825,43 +934,52 @@ Note:
 def main():
     args = parse_args()
     
-    data_dir = Path(args.data_dir)
+    episode_path = Path(args.episode)
     
-    if not data_dir.exists():
-        print(f"Error: Data directory not found: {data_dir}")
+    if not episode_path.exists():
+        print(f"Error: Episode not found: {episode_path}")
         return
     
     # Load metadata for display
+    data_dir = episode_path.parent
     metadata = load_metadata(data_dir)
     is_teleop = is_teleop_data(metadata)
     
-    # Default output path
+    # Extract episode name (without .tar.gz extension)
+    if episode_path.suffix == '.gz' and episode_path.stem.endswith('.tar'):
+        episode_name = episode_path.stem.replace('.tar', '')
+    else:
+        episode_name = episode_path.name
+    
+    # Get episode timestamp for output filename
+    timestamp_suffix = get_episode_timestamp(episode_path, is_teleop=is_teleop)
+    if timestamp_suffix is None:
+        timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        print(f"Warning: Could not extract collection timestamp, using current time")
+    
+    # Default output path with timestamp suffix
     if args.output is None:
-        output_path = data_dir.parent / f"{data_dir.name}_viz.mp4"
+        output_path = data_dir / f"{episode_name}_viz_{timestamp_suffix}.mp4"
     else:
         output_path = Path(args.output)
     
     print("=" * 60)
     print("Piper Data Visualization")
     print("=" * 60)
-    print(f"Data directory: {data_dir}")
+    print(f"Episode:        {episode_path}")
     print(f"Output video:   {output_path}")
     print(f"Data type:      {'TELEOP (relative delta)' if is_teleop else 'SCRIPTED (absolute)'}")
-    print(f"Force data:     {'Not available (teleop)' if is_teleop else 'Will be visualized if present'}")
+    print(f"Force data:     Will be visualized if present")
+    print(f"Collection:     {timestamp_suffix}")
     print(f"FPS:            {args.fps}")
     print(f"XYZ curves:     {'Disabled' if args.no_xyz_curves else 'Enabled'}")
     print(f"Camera height:  {args.height}px")
-    if args.episodes:
-        print(f"Episodes:       {args.episodes}")
-    else:
-        print(f"Episodes:       All")
     print("=" * 60)
     print()
     
     create_visualization_video(
-        data_dir=data_dir,
+        episode_path=episode_path,
         output_path=output_path,
-        episode_indices=args.episodes,
         fps=args.fps,
         include_xyz_curves=not args.no_xyz_curves,
         target_height=args.height,

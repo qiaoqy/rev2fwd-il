@@ -35,7 +35,10 @@ PS5 CONTROLLER MAPPING
 |                   |   - Controller yaw   → arm RZ                       |
 |                   |   - Controller roll  → arm RX                       |
 | Triangle (△)      | Toggle gripper (open/close)                         |
-| Square (▢)        | Print current pose and record position              |
+| Square (▢)        | Toggle recording (with --record) / Print pose       |
+|                   |   - Short press: start/stop recording               |
+|                   |   - Long press (~1.5s): discard recording           |
+|                   |   - 1 vibrate = started, 2 = saved, 3 = discarded   |
 | Share             | Emergency stop / Resume                             |
 | Options           | Re-enable arm (three-line button, top right)        |
 | PS Button         | Quit program (PlayStation logo, center)             |
@@ -64,14 +67,19 @@ from __future__ import annotations
 
 import argparse
 import grp
+import io
 import json
 import os
 import pwd
+import queue
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import threading
 import warnings
+from datetime import datetime
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -214,6 +222,14 @@ from scipy.spatial.transform import Rotation as R
 # RoboKit
 from robokit.controllers.imu_control import RawIMUHandler
 
+# Force estimator
+try:
+    from rev2fwd_il.real import PiperForceEstimator
+    FORCE_ESTIMATOR_AVAILABLE = True
+except ImportError:
+    FORCE_ESTIMATOR_AVAILABLE = False
+    print("[Warning] Force estimator not available. Install rev2fwd_il package.")
+
 
 # =============================================================================
 # Constants and Parameters
@@ -315,47 +331,262 @@ class EpisodeData:
     gripper_state: list # List of floats (0=closed, 1=open, normalized)
     action: list        # List of (8,) arrays [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
     timestamp: list     # List of Unix timestamps
+    # Force/torque data
+    joint_angles: list = field(default_factory=list)   # List of (6,) arrays in radians
+    joint_torques: list = field(default_factory=list)  # List of (6,) arrays in N·m
+    ee_force: list = field(default_factory=list)       # List of (6,) arrays [Fx,Fy,Fz,Mx,My,Mz]
     success: bool = True
 
 
+def backup_existing_directory(dir_path: Path) -> Optional[Path]:
+    """Backup existing directory by renaming it with creation timestamp.
+    
+    Args:
+        dir_path: Path to the directory to backup.
+        
+    Returns:
+        Path to the backup directory if backup was created, None otherwise.
+        Returns None and deletes the directory if it's empty or has no episode data.
+    """
+    if not dir_path.exists():
+        return None
+    
+    # Check if directory is empty or only has metadata.json (no episode data)
+    # Episode files are named like: episode_XXXX.tar.gz or episode_XXXX/ directories
+    contents = list(dir_path.iterdir())
+    episode_files = [f for f in contents if f.name.startswith("episode_")]
+    
+    if len(episode_files) == 0:
+        # No episode data - delete the empty/metadata-only directory
+        try:
+            shutil.rmtree(str(dir_path))
+            print(f"[Backup] Removed empty directory (no episode data): {dir_path}")
+        except Exception as e:
+            print(f"[Backup] Warning: Failed to remove empty directory {dir_path}: {e}")
+        return None
+    
+    # Get directory creation time (or modification time as fallback)
+    try:
+        # On Linux, st_ctime is inode change time, st_mtime is more reliable
+        # For backup naming, we use the earliest available timestamp
+        stat_info = dir_path.stat()
+        # Try birth time first (available on some systems)
+        if hasattr(stat_info, 'st_birthtime'):
+            creation_time = stat_info.st_birthtime
+        else:
+            # Use modification time as fallback
+            creation_time = stat_info.st_mtime
+        
+        # Format timestamp for filename: YYYYMMDD_HHMMSS
+        timestamp_str = datetime.fromtimestamp(creation_time).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        # If we can't get the time, use current time
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create backup path
+    backup_path = dir_path.parent / f"{dir_path.name}_backup_{timestamp_str}"
+    
+    # Handle case where backup already exists (add counter)
+    counter = 1
+    original_backup_path = backup_path
+    while backup_path.exists():
+        backup_path = dir_path.parent / f"{original_backup_path.name}_{counter}"
+        counter += 1
+    
+    # Rename the directory
+    try:
+        shutil.move(str(dir_path), str(backup_path))
+        print(f"[Backup] Existing directory backed up to: {backup_path}")
+        return backup_path
+    except Exception as e:
+        print(f"[Backup] Warning: Failed to backup {dir_path}: {e}")
+        return None
+
+
+def _save_episode_sync(episode: EpisodeData, out_dir: Path):
+    """Save episode data as a compressed tar.gz archive (synchronous).
+    
+    The episode is saved as a single compressed archive file:
+        episode_XXXX.tar.gz
+    
+    Archive structure:
+        episode_XXXX/
+            episode_data.npz      # Numeric data (poses, actions, etc.)
+            fixed_cam/
+                000000.png, 000001.png, ...
+            wrist_cam/
+                000000.png, 000001.png, ...
+    
+    Using tar.gz for ML datasets because:
+    - Good compression ratio for mixed data (images + numeric)
+    - Python standard library support (no extra dependencies)
+    - Can be easily extracted for inspection
+    - Widely compatible with data loading pipelines
+    
+    Note: For even better performance, consider tar.zst (Zstandard) which offers
+    better compression ratio and faster decompression, but requires the 'zstandard' package.
+    """
+    import tempfile
+    
+    episode_name = f"episode_{episode.episode_id:04d}"
+    archive_path = out_dir / f"{episode_name}.tar.gz"
+    
+    # Create a temporary directory for assembling the episode
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        episode_dir = temp_path / episode_name
+        fixed_dir = episode_dir / "fixed_cam"
+        wrist_dir = episode_dir / "wrist_cam"
+        
+        # Create directories
+        fixed_dir.mkdir(parents=True, exist_ok=True)
+        wrist_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save images
+        for i, (fixed_img, wrist_img) in enumerate(zip(episode.fixed_images, episode.wrist_images)):
+            # Convert RGB to BGR for cv2
+            if fixed_img is not None:
+                cv2.imwrite(str(fixed_dir / f"{i:06d}.png"), cv2.cvtColor(fixed_img, cv2.COLOR_RGB2BGR))
+            if wrist_img is not None:
+                cv2.imwrite(str(wrist_dir / f"{i:06d}.png"), cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR))
+        
+        # Convert lists to arrays
+        T = len(episode.ee_pose)
+        ee_pose_arr = np.array(episode.ee_pose, dtype=np.float32)
+        gripper_arr = np.array(episode.gripper_state, dtype=np.float32)
+        action_arr = np.array(episode.action, dtype=np.float32)
+        timestamp_arr = np.array(episode.timestamp, dtype=np.float64)
+        
+        # Convert force data to arrays
+        joint_angles_arr = np.array(episode.joint_angles, dtype=np.float32) if episode.joint_angles else np.zeros((T, 6), dtype=np.float32)
+        joint_torques_arr = np.array(episode.joint_torques, dtype=np.float32) if episode.joint_torques else np.zeros((T, 6), dtype=np.float32)
+        ee_force_arr = np.array(episode.ee_force, dtype=np.float32) if episode.ee_force else np.zeros((T, 6), dtype=np.float32)
+        
+        # DEBUG: Print force data stats before saving
+        print(f"[DEBUG Save] Force data stats for episode {episode.episode_id}:")
+        print(f"  joint_angles: shape={joint_angles_arr.shape}, has_nonzero={np.any(np.abs(joint_angles_arr) > 1e-6)}")
+        print(f"  joint_torques: shape={joint_torques_arr.shape}, has_nonzero={np.any(np.abs(joint_torques_arr) > 1e-6)}")
+        print(f"    torques range: [{joint_torques_arr.min():.4f}, {joint_torques_arr.max():.4f}]")
+        print(f"  ee_force: shape={ee_force_arr.shape}, has_nonzero={np.any(np.abs(ee_force_arr) > 1e-6)}")
+        print(f"    force range: [{ee_force_arr.min():.4f}, {ee_force_arr.max():.4f}]")
+        
+        # Save NPZ
+        np.savez(
+            episode_dir / "episode_data.npz",
+            ee_pose=ee_pose_arr,
+            gripper_state=gripper_arr,
+            action=action_arr,
+            timestamp=timestamp_arr,
+            # Force/torque data
+            joint_angles=joint_angles_arr,
+            joint_torques=joint_torques_arr,
+            ee_force=ee_force_arr,
+            success=episode.success,
+            episode_id=episode.episode_id,
+            num_timesteps=T,
+        )
+        
+        # Create compressed tar archive
+        # Using gzip compression (compresslevel=6 is a good balance)
+        with tarfile.open(archive_path, "w:gz", compresslevel=6) as tar:
+            # Add the episode directory to the archive
+            tar.add(episode_dir, arcname=episode_name)
+    
+    # Calculate archive size for logging
+    archive_size_mb = archive_path.stat().st_size / (1024 * 1024)
+    print(f"[Save] Episode {episode.episode_id} saved to {archive_path} ({T} frames, {archive_size_mb:.2f} MB)")
+
+
+class BackgroundSaver:
+    """Background thread for saving episode data without blocking teleoperation."""
+    
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = None
+        self._running = False
+        self._saved_count = 0
+        self._pending_count = 0
+        self._lock = threading.Lock()
+    
+    def start(self):
+        """Start the background saver thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._save_loop, daemon=True)
+        self._thread.start()
+        print("[BackgroundSaver] Started")
+    
+    def _save_loop(self):
+        """Background loop that processes save requests."""
+        while self._running or not self._queue.empty():
+            try:
+                # Wait for a save request with timeout
+                episode, out_dir = self._queue.get(timeout=0.5)
+                
+                # Perform the actual save
+                try:
+                    _save_episode_sync(episode, out_dir)
+                    with self._lock:
+                        self._saved_count += 1
+                        self._pending_count -= 1
+                except Exception as e:
+                    print(f"[BackgroundSaver] Error saving episode {episode.episode_id}: {e}")
+                    with self._lock:
+                        self._pending_count -= 1
+                
+                self._queue.task_done()
+                
+            except queue.Empty:
+                continue
+    
+    def save_episode(self, episode: EpisodeData, out_dir: Path):
+        """Queue an episode for background saving.
+        
+        This method returns immediately without blocking.
+        """
+        with self._lock:
+            self._pending_count += 1
+        self._queue.put((episode, out_dir))
+        print(f"[BackgroundSaver] Episode {episode.episode_id} queued for saving ({len(episode.ee_pose)} frames)")
+    
+    def stop(self, wait: bool = True, timeout: float = 30.0):
+        """Stop the background saver.
+        
+        Args:
+            wait: If True, wait for all pending saves to complete.
+            timeout: Maximum time to wait for pending saves.
+        """
+        self._running = False
+        
+        if wait and self._thread is not None:
+            # Wait for queue to be processed
+            pending = self.get_pending_count()
+            if pending > 0:
+                print(f"[BackgroundSaver] Waiting for {pending} pending save(s)...")
+            
+            self._thread.join(timeout=timeout)
+            
+            if self._thread.is_alive():
+                print(f"[BackgroundSaver] Warning: Timeout waiting for saves to complete")
+            else:
+                print(f"[BackgroundSaver] All saves completed")
+    
+    def get_saved_count(self) -> int:
+        """Get the number of successfully saved episodes."""
+        with self._lock:
+            return self._saved_count
+    
+    def get_pending_count(self) -> int:
+        """Get the number of episodes waiting to be saved."""
+        with self._lock:
+            return self._pending_count
+
+
+# Legacy function for backward compatibility
 def save_episode(episode: EpisodeData, out_dir: Path):
-    """Save episode data to NPZ file and PNG images."""
-    episode_dir = out_dir / f"episode_{episode.episode_id:04d}"
-    fixed_dir = episode_dir / "fixed_cam"
-    wrist_dir = episode_dir / "wrist_cam"
-    
-    # Create directories
-    fixed_dir.mkdir(parents=True, exist_ok=True)
-    wrist_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save images
-    for i, (fixed_img, wrist_img) in enumerate(zip(episode.fixed_images, episode.wrist_images)):
-        # Convert RGB to BGR for cv2
-        if fixed_img is not None:
-            cv2.imwrite(str(fixed_dir / f"{i:06d}.png"), cv2.cvtColor(fixed_img, cv2.COLOR_RGB2BGR))
-        if wrist_img is not None:
-            cv2.imwrite(str(wrist_dir / f"{i:06d}.png"), cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR))
-    
-    # Convert lists to arrays
-    T = len(episode.ee_pose)
-    ee_pose_arr = np.array(episode.ee_pose, dtype=np.float32)
-    gripper_arr = np.array(episode.gripper_state, dtype=np.float32)
-    action_arr = np.array(episode.action, dtype=np.float32)
-    timestamp_arr = np.array(episode.timestamp, dtype=np.float64)
-    
-    # Save NPZ
-    np.savez(
-        episode_dir / "episode_data.npz",
-        ee_pose=ee_pose_arr,
-        gripper_state=gripper_arr,
-        action=action_arr,
-        timestamp=timestamp_arr,
-        success=episode.success,
-        episode_id=episode.episode_id,
-        num_timesteps=T,
-    )
-    
-    print(f"[Save] Episode {episode.episode_id} saved to {episode_dir} ({T} timesteps)")
+    """Save episode data (synchronous, for backward compatibility)."""
+    _save_episode_sync(episode, out_dir)
 
 
 def is_camera_enabled(camera_id: Union[int, str]) -> bool:
@@ -699,6 +930,59 @@ class PS5Controller:
         except:
             return (0, 0)
     
+    def rumble(self, low_frequency: float = 0.5, high_frequency: float = 0.5, 
+               duration_ms: int = 200):
+        """Vibrate the controller.
+        
+        Args:
+            low_frequency: Low frequency motor intensity (0.0 to 1.0)
+            high_frequency: High frequency motor intensity (0.0 to 1.0)
+            duration_ms: Duration in milliseconds
+        """
+        if not self.connected or self.joystick is None:
+            return
+        
+        try:
+            self.joystick.rumble(low_frequency, high_frequency, duration_ms)
+        except Exception as e:
+            pass  # Rumble not supported or failed
+    
+    def stop_rumble(self):
+        """Stop any ongoing vibration."""
+        if not self.connected or self.joystick is None:
+            return
+        try:
+            self.joystick.stop_rumble()
+        except Exception as e:
+            pass
+    
+    def rumble_short(self, count: int = 1, intensity: float = 0.7, duration_ms: int = 100):
+        """Short vibration pulses.
+        
+        Args:
+            count: Number of pulses
+            intensity: Motor intensity (0.0 to 1.0)
+            duration_ms: Duration per pulse in milliseconds
+        """
+        if count <= 0:
+            return
+        
+        def _do_rumble():
+            gap_ms = 150  # Gap between pulses in milliseconds
+            for i in range(count):
+                # Start vibration
+                self.rumble(intensity, intensity, duration_ms)
+                # Wait for the vibration duration
+                time.sleep(duration_ms / 1000.0)
+                # Explicitly stop vibration
+                self.stop_rumble()
+                # Wait for gap before next pulse (if not last pulse)
+                if i < count - 1:
+                    time.sleep(gap_ms / 1000.0)
+        
+        # Run in background thread to not block
+        threading.Thread(target=_do_rumble, daemon=True).start()
+    
     def close(self):
         """Close pygame."""
         if self.joystick is not None:
@@ -829,7 +1113,9 @@ class TeleoperationController:
                  # Data recording parameters
                  record_data: bool = False,
                  fixed_cam: Optional[CameraCapture] = None,
-                 wrist_cam: Optional[CameraCapture] = None):
+                 wrist_cam: Optional[CameraCapture] = None,
+                 force_estimator: Optional["PiperForceEstimator"] = None,
+                 imu_handler: Optional[RawIMUHandler] = None):
         self.piper = piper
         self.ps5 = ps5
         self.linear_scale = linear_scale
@@ -847,8 +1133,8 @@ class TeleoperationController:
         # Gyro mode tracking
         self._gyro_mode_active = False
 
-        # RoboKit IMU handler for gyroscope
-        self._imu_handler = RawIMUHandler()
+        # RoboKit IMU handler for gyroscope (use provided or create new)
+        self._imu_handler = imu_handler if imu_handler is not None else RawIMUHandler()
         
         # Data recording
         self._record_data = record_data
@@ -858,6 +1144,15 @@ class TeleoperationController:
         self._current_episode: Optional[EpisodeData] = None
         self._episode_count = 0
         self._prev_pose = None  # For computing delta action
+        
+        # Force estimator
+        self._force_estimator = force_estimator
+        
+        # Long-press Square button tracking for discard
+        self._square_press_start_time: Optional[float] = None
+        self._square_long_press_triggered = False
+        self._square_long_press_threshold = 1.5  # seconds to hold for discard
+        self._square_rumble_interval = 0.15  # seconds between rumble pulses during hold
         
     def start_recording(self, episode_id: int = None):
         """Start recording a new episode."""
@@ -876,10 +1171,15 @@ class TeleoperationController:
             gripper_state=[],
             action=[],
             timestamp=[],
+            joint_angles=[],
+            joint_torques=[],
+            ee_force=[],
         )
         self._recording = True
         self._prev_pose = None
-        print(f"[Teleop] 🔴 Recording episode {episode_id}...")
+        # Increment episode count for next recording
+        self._episode_count += 1
+        print(f"[Teleop] 🔴 Recording episode {episode_id + 1}...")
         
     def stop_recording(self, success: bool = True) -> Optional[EpisodeData]:
         """Stop recording and return the episode data."""
@@ -890,8 +1190,7 @@ class TeleoperationController:
         episode = self._current_episode
         if episode is not None:
             episode.success = success
-            self._episode_count += 1
-            print(f"[Teleop] ⬛ Episode {episode.episode_id} stopped ({len(episode.ee_pose)} frames)")
+            print(f"[Teleop] ⬛ Episode {episode.episode_id + 1} stopped ({len(episode.ee_pose)} frames)")
         self._current_episode = None
         self._prev_pose = None
         return episode
@@ -965,6 +1264,37 @@ class TeleoperationController:
         if wrist_img is None:
             wrist_img = np.zeros_like(fixed_img)
         
+        # Get force/torque data
+        joint_angles = np.zeros(6)
+        joint_torques = np.zeros(6)
+        ee_force = np.zeros(6)
+        
+        frame_idx = len(self._current_episode.ee_pose) if self._current_episode else -1
+        
+        if self._force_estimator is not None and self.piper.piper is not None:
+            joint_state = self._force_estimator.get_joint_state_from_piper(self.piper.piper)
+            if joint_state is not None:
+                joint_angles, joint_torques = joint_state
+                ee_force = self._force_estimator.estimate_force(
+                    joint_angles, joint_torques,
+                    use_filter=True,
+                    use_gravity_comp=True
+                )
+                # DEBUG: Print force data on first few frames
+                if frame_idx < 3:
+                    print(f"[DEBUG Force] Frame {frame_idx}: SUCCESS")
+                    print(f"  joint_angles: {joint_angles}")
+                    print(f"  joint_torques: {joint_torques}")
+                    print(f"  ee_force: {ee_force}")
+            else:
+                # DEBUG: joint_state is None - print for first few frames
+                if frame_idx < 5:
+                    print(f"[DEBUG Force] Frame {frame_idx}: joint_state is None!")
+        else:
+            # DEBUG: force_estimator not available
+            if frame_idx < 3:
+                print(f"[DEBUG Force] Frame {frame_idx}: force_estimator={self._force_estimator is not None}, piper.piper={self.piper.piper is not None}")
+        
         # Record data
         self._current_episode.fixed_images.append(fixed_img)
         self._current_episode.wrist_images.append(wrist_img)
@@ -972,6 +1302,10 @@ class TeleoperationController:
         self._current_episode.gripper_state.append(gripper_state)
         self._current_episode.action.append(action)
         self._current_episode.timestamp.append(time.time())
+        # Record force data
+        self._current_episode.joint_angles.append(joint_angles)
+        self._current_episode.joint_torques.append(joint_torques)
+        self._current_episode.ee_force.append(ee_force)
         
         # Update previous pose for next delta computation
         self._prev_pose = {
@@ -995,14 +1329,21 @@ class TeleoperationController:
         print("  Cross (X):     Go to home")
         print("  Circle HOLD:   Gyro mode (hold still briefly, then tilt)")
         print("  Triangle:      Toggle gripper")
-        print("  Square:        Print & record pose")
+        if self._record_data:
+            print("  Square:        Short=Start/Stop recording, Long=Discard")
+        else:
+            print("  Square:        Print & record pose")
         print("  Share:         Emergency stop/Resume")
         print("  PS Button:     Quit")
         
         if self._record_data:
             print("\nData Recording:")
-            print("  L3 (Left Stick Press):  Start/Stop recording episode")
-            print("  R3 (Right Stick Press): Discard current episode")
+            print("  Square (short press): Start/Stop recording")
+            print("    - 1 vibrate = started recording")
+            print("    - 2 vibrates = stopped & saved")
+            print("  Square (long press):  Discard current episode")
+            print("    - continuous vibration while holding")
+            print("    - 3 vibrates = discarded")
         print("=" * 60 + "\n")
     
     def step(self) -> bool:
@@ -1042,6 +1383,10 @@ class TeleoperationController:
         if self.ps5.get_button_pressed(PS5Buttons.OPTIONS):
             print("[Teleop] Resetting arm...")
             self.piper.enable()
+            # Keep gripper open after re-enable (enable() sets gripper to closed state)
+            self.piper.open_gripper()
+            self._gripper_open = True
+            self._gripper_target_angle = GRIPPER_OPEN_ANGLE
             return True
         
         # Cross button - go home
@@ -1063,8 +1408,71 @@ class TeleoperationController:
                 print("[Teleop] Gripper: OPEN")
             return True
         
-        # Square button - print and record pose (was Triangle)
-        if self.ps5.get_button_pressed(PS5Buttons.SQUARE):
+        # Square button - toggle recording (short press) or discard (long press)
+        square_held = self.ps5.get_button(PS5Buttons.SQUARE)
+        square_just_pressed = self.ps5.get_button_pressed(PS5Buttons.SQUARE)
+        
+        if self._record_data and self._recording:
+            # Recording mode with active recording: handle long-press for discard
+            if square_just_pressed:
+                # Start tracking long press
+                self._square_press_start_time = time.time()
+                self._square_long_press_triggered = False
+            
+            if square_held and self._square_press_start_time is not None:
+                hold_duration = time.time() - self._square_press_start_time
+                
+                if not self._square_long_press_triggered:
+                    # Continuous vibration while holding (after short delay to distinguish from short press)
+                    if hold_duration > 0.3:  # Start vibrating after 0.3s to avoid short-press confusion
+                        # Rumble continuously by checking interval
+                        if not hasattr(self, '_last_hold_rumble_time'):
+                            self._last_hold_rumble_time = 0
+                        if time.time() - self._last_hold_rumble_time > self._square_rumble_interval:
+                            self.ps5.rumble(0.4, 0.4, int(self._square_rumble_interval * 1000))
+                            self._last_hold_rumble_time = time.time()
+                    
+                    # Check if long press threshold reached
+                    if hold_duration >= self._square_long_press_threshold:
+                        # Discard recording
+                        self._square_long_press_triggered = True
+                        self._recording = False
+                        self._current_episode = None
+                        self._prev_pose = None
+                        print("[Teleop] 🗑️ Episode discarded (long press)")
+                        # Stop continuous vibration first, then three pulses
+                        self.ps5.stop_rumble()
+                        time.sleep(0.1)  # Brief pause before pulses
+                        self.ps5.rumble_short(count=3, intensity=0.8, duration_ms=120)
+            
+            elif not square_held and self._square_press_start_time is not None:
+                # Button released - check if it was a short press
+                hold_duration = time.time() - self._square_press_start_time
+                
+                # Stop any ongoing rumble first
+                self.ps5.stop_rumble()
+                
+                if not self._square_long_press_triggered and hold_duration < 0.3:
+                    # Short press: stop recording and save
+                    self._recording = False
+                    print(f"[Teleop] ⬛ Stopped recording ({len(self._current_episode.ee_pose) if self._current_episode else 0} frames)")
+                    # Vibrate twice to indicate stop
+                    time.sleep(0.05)  # Brief pause to ensure previous rumble stopped
+                    self.ps5.rumble_short(count=2, intensity=0.8, duration_ms=120)
+                
+                # Reset tracking
+                self._square_press_start_time = None
+                self._square_long_press_triggered = False
+        
+        elif self._record_data and not self._recording:
+            # Recording mode but not recording: short press starts recording
+            if square_just_pressed:
+                self.start_recording()
+                # Vibrate once to indicate start
+                self.ps5.rumble_short(count=1, intensity=0.7, duration_ms=150)
+        
+        elif not self._record_data and square_just_pressed:
+            # No recording mode: print and record pose (original behavior)
             pose = self.piper.get_ee_pose_meters()
             gripper = self.piper.get_gripper_angle()
             if pose:
@@ -1079,32 +1487,12 @@ class TeleoperationController:
                     'gripper': gripper if gripper else 0.0
                 })
                 print(f"[Teleop] Pose recorded! Total: {len(self._recorded_poses)}")
-            return True
         
         # Speed adjustment (L1/R1)
         if self.ps5.get_button_pressed(PS5Buttons.L1):
             self.piper.set_speed(self.piper._speed_percent - 5)
         if self.ps5.get_button_pressed(PS5Buttons.R1):
             self.piper.set_speed(self.piper._speed_percent + 5)
-        
-        # Recording controls (L3/R3)
-        if self._record_data:
-            # L3: Start/Stop recording
-            if self.ps5.get_button_pressed(PS5Buttons.L3):
-                if self._recording:
-                    # Stop recording (episode will be saved by main loop)
-                    self._recording = False
-                    print(f"[Teleop] ⬛ Stopped recording ({len(self._current_episode.ee_pose) if self._current_episode else 0} frames)")
-                else:
-                    self.start_recording()
-            
-            # R3: Discard current episode
-            if self.ps5.get_button_pressed(PS5Buttons.R3):
-                if self._recording:
-                    self._recording = False
-                    self._current_episode = None
-                    self._prev_pose = None
-                    print("[Teleop] 🗑️ Episode discarded")
         
         # Get current pose
         pose = self.piper.get_ee_pose_meters()
@@ -1263,6 +1651,37 @@ class TeleoperationController:
             if wrist_img is None:
                 wrist_img = np.zeros_like(fixed_img)
             
+            # Get force/torque data
+            joint_angles = np.zeros(6)
+            joint_torques = np.zeros(6)
+            ee_force = np.zeros(6)
+            
+            frame_idx = len(self._current_episode.ee_pose)
+            
+            if self._force_estimator is not None and self.piper.piper is not None:
+                joint_state = self._force_estimator.get_joint_state_from_piper(self.piper.piper)
+                if joint_state is not None:
+                    joint_angles, joint_torques = joint_state
+                    ee_force = self._force_estimator.estimate_force(
+                        joint_angles, joint_torques,
+                        use_filter=True,
+                        use_gravity_comp=True
+                    )
+                    # DEBUG: Print force data on first few frames
+                    if frame_idx < 3:
+                        print(f"[DEBUG Force] Frame {frame_idx}: SUCCESS")
+                        print(f"  joint_angles: {joint_angles}")
+                        print(f"  joint_torques: {joint_torques}")
+                        print(f"  ee_force: {ee_force}")
+                else:
+                    # DEBUG: joint_state is None - print for first few frames
+                    if frame_idx < 5:
+                        print(f"[DEBUG Force] Frame {frame_idx}: joint_state is None!")
+            else:
+                # DEBUG: force_estimator not available
+                if frame_idx < 3:
+                    print(f"[DEBUG Force] Frame {frame_idx}: force_estimator={self._force_estimator is not None}, piper.piper={self.piper.piper is not None}")
+            
             # Record data
             self._current_episode.fixed_images.append(fixed_img)
             self._current_episode.wrist_images.append(wrist_img)
@@ -1270,6 +1689,10 @@ class TeleoperationController:
             self._current_episode.gripper_state.append(gripper_state)
             self._current_episode.action.append(action)
             self._current_episode.timestamp.append(time.time())
+            # Record force data
+            self._current_episode.joint_angles.append(joint_angles)
+            self._current_episode.joint_torques.append(joint_torques)
+            self._current_episode.ee_force.append(ee_force)
             
             # Update previous pose for next delta computation
             self._prev_pose = {
@@ -1307,8 +1730,8 @@ Examples:
   python 2_teleop_ps5_controller.py --record --front_cam Orbbec_Gemini_335L --wrist_cam Dabai_DC1
 
 Data Recording Controls (when --record is enabled):
-  - L3 (Left Stick Press):  Start/Stop recording episode
-  - R3 (Right Stick Press): Discard current episode
+  - Square (short press): Start/Stop recording (1 vibrate = start, 2 vibrates = stop & save)
+  - Square (long press ~1.5s): Discard current episode (continuous vibrate while holding, 3 vibrates = discarded)
 """
     )
     
@@ -1372,8 +1795,14 @@ def main():
     out_dir = None
     if args.record:
         out_dir = Path(args.out_dir)
+        
+        # Backup existing directory if it exists (instead of overwriting)
+        if out_dir.exists():
+            backup_existing_directory(out_dir)
+        
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\nData will be saved to: {out_dir}")
+        print(f"  Format: Compressed tar.gz archives (one per episode)")
     
     # Initialize PS5 controller
     ps5 = None
@@ -1392,19 +1821,120 @@ def main():
         ps5.close()
         sys.exit(1)
     
-    # Initialize Piper arm
-    print("\n[Init] Connecting to Piper arm...")
-    piper = PiperController(args.can_interface)
-    piper._speed_percent = args.speed
+    # =========================================================================
+    # Parallel initialization: IMU calibration + Arm connection + Cameras
+    # IMU calibration requires the controller to be still, but doesn't conflict
+    # with arm initialization or camera setup, so we can do them in parallel.
+    # =========================================================================
+    import concurrent.futures
     
-    if not piper.connect():
-        print("[Error] Failed to connect to Piper arm")
-        ps5.close()
-        sys.exit(1)
+    imu_handler = None
+    piper = None
+    fixed_cam = None
+    wrist_cam = None
+    display_cam = None
+    init_errors = []
     
-    if not piper.enable():
-        print("[Error] Failed to enable Piper arm")
-        piper.disconnect()
+    def init_imu():
+        """Initialize IMU handler (includes gyroscope calibration)."""
+        print("\n[Init] Initializing IMU handler (gyroscope calibration)...")
+        print("[Init] ⚠ Keep the PS5 controller STILL during calibration!")
+        handler = RawIMUHandler()
+        print("[Init] ✓ IMU handler initialized and calibrated")
+        return handler
+    
+    def init_arm():
+        """Initialize and enable Piper arm."""
+        print("\n[Init] Connecting to Piper arm...")
+        arm = PiperController(args.can_interface)
+        arm._speed_percent = args.speed
+        
+        if not arm.connect():
+            raise RuntimeError("Failed to connect to Piper arm")
+        
+        if not arm.enable():
+            arm.disconnect()
+            raise RuntimeError("Failed to enable Piper arm")
+        
+        return arm
+    
+    def init_cameras():
+        """Initialize cameras for recording or display."""
+        cams = {"fixed": None, "wrist": None, "display": None}
+        
+        if args.record:
+            # Front camera (required for recording)
+            front_cam_id = normalize_camera_value(args.front_cam)
+            print(f"\n[Init] Starting front camera: {front_cam_id}")
+            cams["fixed"] = CameraCapture(front_cam_id, args.image_width, args.image_height, name="front")
+            if not cams["fixed"].start():
+                raise RuntimeError(f"Front camera failed to start: {front_cam_id}")
+            
+            # Wrist camera (optional)
+            wrist_cam_id = normalize_camera_value(args.wrist_cam)
+            wrist_cam_enabled = is_camera_enabled(wrist_cam_id)
+            if wrist_cam_enabled:
+                print(f"[Init] Starting wrist camera: {wrist_cam_id}")
+                cams["wrist"] = CameraCapture(wrist_cam_id, args.image_width, args.image_height, name="wrist")
+                if not cams["wrist"].start():
+                    # Stop fixed cam before raising
+                    if cams["fixed"]:
+                        cams["fixed"].stop()
+                    raise RuntimeError(f"Wrist camera failed to start: {wrist_cam_id}")
+            
+            # Use front camera for display if --show_camera
+            if args.show_camera:
+                cams["display"] = cams["fixed"]
+                
+        elif args.show_camera and CV2_AVAILABLE:
+            # Just display camera, no recording
+            print("\n[Init] Starting camera for display...")
+            cams["display"] = CameraCapture(args.camera_id, name="display")
+            if not cams["display"].start():
+                print("[Init] ⚠ Camera failed to start, continuing without display")
+                cams["display"] = None
+        
+        print("[Init] ✓ Cameras initialized")
+        return cams
+    
+    # Run all initializations in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        imu_future = executor.submit(init_imu)
+        arm_future = executor.submit(init_arm)
+        cam_future = executor.submit(init_cameras)
+        
+        # Wait for all to complete
+        try:
+            imu_handler = imu_future.result()
+        except Exception as e:
+            init_errors.append(f"IMU init failed: {e}")
+        
+        try:
+            piper = arm_future.result()
+        except Exception as e:
+            init_errors.append(f"Arm init failed: {e}")
+        
+        try:
+            cams = cam_future.result()
+            fixed_cam = cams["fixed"]
+            wrist_cam = cams["wrist"]
+            display_cam = cams["display"]
+        except Exception as e:
+            init_errors.append(f"Camera init failed: {e}")
+    
+    # Check for errors
+    if init_errors:
+        print("\n[Error] Initialization failed:")
+        for err in init_errors:
+            print(f"  - {err}")
+        if imu_handler:
+            imu_handler.stop()
+        if piper:
+            piper.disconnect()
+        if fixed_cam:
+            fixed_cam.stop()
+        if wrist_cam:
+            wrist_cam.stop()
         ps5.close()
         sys.exit(1)
     
@@ -1417,40 +1947,19 @@ def main():
     piper.open_gripper()
     time.sleep(0.5)
     
-    # Initialize cameras for recording
-    fixed_cam = None
-    wrist_cam = None
-    display_cam = None  # For --show_camera option
-    
-    if args.record:
-        # Front camera (required for recording)
-        front_cam_id = normalize_camera_value(args.front_cam)
-        print(f"\n[Init] Starting front camera: {front_cam_id}")
-        fixed_cam = CameraCapture(front_cam_id, args.image_width, args.image_height, name="front")
-        if not fixed_cam.start():
-            print("[Warning] Front camera failed to start")
-            fixed_cam = None
-        
-        # Wrist camera (optional)
-        wrist_cam_id = normalize_camera_value(args.wrist_cam)
-        wrist_cam_enabled = is_camera_enabled(wrist_cam_id)
-        if wrist_cam_enabled:
-            print(f"[Init] Starting wrist camera: {wrist_cam_id}")
-            wrist_cam = CameraCapture(wrist_cam_id, args.image_width, args.image_height, name="wrist")
-            if not wrist_cam.start():
-                print("[Warning] Wrist camera failed to start")
-                wrist_cam = None
-        
-        # Use front camera for display if --show_camera
-        if args.show_camera:
-            display_cam = fixed_cam
-    elif args.show_camera and CV2_AVAILABLE:
-        # Just display camera, no recording
-        print("\n[Init] Starting camera for display...")
-        display_cam = CameraCapture(args.camera_id, name="display")
-        if not display_cam.start():
-            print("[Init] ⚠ Camera failed to start, continuing without display")
-            display_cam = None
+    # Initialize force estimator
+    force_estimator = None
+    if FORCE_ESTIMATOR_AVAILABLE:
+        print("\n[Init] Initializing force estimator...")
+        force_estimator = PiperForceEstimator(dh_is_offset=0x01)
+        # Calibrate gravity baseline at home position
+        time.sleep(0.5)  # Wait for arm to settle
+        if force_estimator.calibrate_gravity_from_piper(piper.piper):
+            print("[Init] ✓ Force estimator gravity baseline calibrated")
+        else:
+            print("[Init] ✗ Force estimator calibration failed, continuing without gravity compensation")
+    else:
+        print("\n[Init] Force estimator not available, skipping force recording")
     
     # Create teleoperation controller
     teleop = TeleoperationController(
@@ -1462,12 +1971,20 @@ def main():
         record_data=args.record,
         fixed_cam=fixed_cam,
         wrist_cam=wrist_cam,
+        force_estimator=force_estimator,
+        imu_handler=imu_handler,
     )
     teleop.start()
     
     # Track saved episodes
     saved_episodes = 0
     prev_recording_state = False  # Track recording state changes
+    
+    # Initialize background saver for non-blocking data saving
+    bg_saver = None
+    if args.record:
+        bg_saver = BackgroundSaver()
+        bg_saver.start()
     
     # Main loop
     control_period = 1.0 / args.control_freq
@@ -1488,13 +2005,13 @@ def main():
             
             # Check if recording just stopped (state changed from True to False)
             if args.record and was_recording and not teleop._recording:
-                # Recording was stopped via L3, save the episode
+                # Recording was stopped via Square button, queue episode for background saving
                 episode = teleop._current_episode
                 if episode is not None and len(episode.ee_pose) > 10:  # Min 10 frames
                     episode.success = True
-                    save_episode(episode, out_dir)
+                    bg_saver.save_episode(episode, out_dir)  # Non-blocking
                     saved_episodes += 1
-                    print(f"[Main] ✓ Episode {saved_episodes} saved!")
+                    print(f"[Main] ✓ Episode {saved_episodes} queued for saving!")
                 teleop._current_episode = None
             
             # Show camera if available
@@ -1547,7 +2064,7 @@ def main():
             episode = teleop._current_episode
             if len(episode.ee_pose) > 10:
                 episode.success = True
-                save_episode(episode, out_dir)
+                bg_saver.save_episode(episode, out_dir)  # Queue for background saving
                 saved_episodes += 1
         
         if not piper._emergency_stop:
@@ -1571,6 +2088,12 @@ def main():
         
         if CV2_AVAILABLE:
             cv2.destroyAllWindows()
+        
+        # Wait for background saves to complete before saving metadata
+        if bg_saver is not None:
+            bg_saver.stop(wait=True, timeout=60.0)
+            # Update saved_episodes count from background saver
+            saved_episodes = bg_saver.get_saved_count()
         
         # Save metadata if recording
         if args.record and out_dir:

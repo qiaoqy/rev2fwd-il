@@ -298,6 +298,10 @@ class PiperForceEstimator:
         try:
             # Get joint angles
             joint_msgs = piper.GetArmJointMsgs()
+            if joint_msgs is None:
+                print("[ForceEstimator] DEBUG: GetArmJointMsgs returned None")
+                return None
+            
             q = np.deg2rad(np.array([
                 joint_msgs.joint_state.joint_1 / 1000.0,
                 joint_msgs.joint_state.joint_2 / 1000.0,
@@ -309,6 +313,10 @@ class PiperForceEstimator:
             
             # Get joint torques
             high_spd = piper.GetArmHighSpdInfoMsgs()
+            if high_spd is None:
+                print("[ForceEstimator] DEBUG: GetArmHighSpdInfoMsgs returned None")
+                return None
+            
             tau = np.array([
                 high_spd.motor_1.effort / 1000.0,
                 high_spd.motor_2.effort / 1000.0,
@@ -321,7 +329,9 @@ class PiperForceEstimator:
             return q, tau
         
         except Exception as e:
-            print(f"[ForceEstimator] Error: {e}")
+            print(f"[ForceEstimator] Error in get_joint_state_from_piper: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def calibrate_gravity_from_piper(self, piper: "C_PiperInterface_V2") -> bool:
