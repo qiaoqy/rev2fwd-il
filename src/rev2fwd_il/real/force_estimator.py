@@ -3,8 +3,11 @@
 This module provides force estimation based on joint torques and Jacobian matrix.
 The estimation uses the relationship: τ = J^T * F_ext
 
-Note: This is an approximation without gravity compensation. For better accuracy,
-consider calibrating gravity torques at different poses.
+Gravity compensation is provided by the PiperGravityModel which uses analytically
+computed gravity torques based on verified physics parameters from the MuJoCo model.
+This approach avoids runtime MuJoCo dependency while maintaining accuracy.
+
+Physics parameters source: piper-sdk-rs/crates/piper-physics/assets/piper_no_gripper.xml
 """
 
 from __future__ import annotations
@@ -12,13 +15,15 @@ from __future__ import annotations
 import numpy as np
 from typing import Optional, Tuple, TYPE_CHECKING
 
-# Import Piper FK class for DH parameters
+# Import Piper FK class for DH parameters (optional, fallback to built-in)
 try:
     from piper_sdk.kinematics.piper_fk import C_PiperForwardKinematics
     PIPER_FK_AVAILABLE = True
 except ImportError:
     PIPER_FK_AVAILABLE = False
-    print("[Warning] piper_sdk.kinematics not available, using built-in DH parameters")
+
+# Import gravity model
+from .gravity_model import PiperGravityModel, GravityCompensator
 
 if TYPE_CHECKING:
     from piper_sdk import C_PiperInterface_V2
@@ -162,22 +167,42 @@ class PiperForceEstimator:
     Estimates external forces/torques at end-effector from joint torques
     using the Jacobian transpose relationship: τ = J^T * F_ext
     
-    Note: Without proper gravity compensation, the estimated forces will
-    include gravitational effects. For better results:
-    1. Calibrate gravity torques at various poses
-    2. Use a low-pass filter on torque readings
-    3. Consider only force changes (delta) rather than absolute values
+    Gravity compensation is provided by PiperGravityModel which uses analytical
+    calculation based on verified physics parameters. This avoids the need for
+    single-pose calibration and works across the entire workspace.
+    
+    For best accuracy:
+    1. Use analytical gravity compensation (use_model_gravity=True)
+    2. Optionally calibrate scaling factors with calibrate_gravity_from_samples()
+    3. Apply low-pass filter on torque readings
     """
     
-    def __init__(self, dh_is_offset: int = 0x01):
+    def __init__(self, 
+                 dh_is_offset: int = 0x01,
+                 include_gripper: bool = True,
+                 gripper_mass: Optional[float] = None,
+                 use_model_gravity: bool = True):
         """Initialize force estimator.
         
         Args:
             dh_is_offset: DH parameter offset flag (see PiperJacobian)
+            include_gripper: Whether to include gripper mass in gravity model
+            gripper_mass: Override gripper mass (kg) if known
+            use_model_gravity: Use analytical gravity model instead of single-pose baseline
         """
         self.jacobian = PiperJacobian(dh_is_offset)
         
-        # Gravity compensation baseline (can be calibrated)
+        # Analytical gravity compensation model
+        self._use_model_gravity = use_model_gravity
+        if use_model_gravity:
+            self._gravity_compensator = GravityCompensator(
+                include_gripper=include_gripper,
+                gripper_mass=gripper_mass,
+            )
+        else:
+            self._gravity_compensator = None
+        
+        # Legacy: single-pose gravity compensation baseline (fallback)
         self._gravity_baseline: Optional[np.ndarray] = None
         self._baseline_pose: Optional[np.ndarray] = None
         
@@ -185,8 +210,16 @@ class PiperForceEstimator:
         self._filtered_torque: Optional[np.ndarray] = None
         self._filter_alpha: float = 0.3  # EMA smoothing factor
     
+    @property
+    def gravity_compensator(self) -> Optional[GravityCompensator]:
+        """Access the gravity compensator for calibration."""
+        return self._gravity_compensator
+    
     def set_gravity_baseline(self, q: np.ndarray, tau: np.ndarray):
-        """Set gravity compensation baseline at current pose.
+        """Set gravity compensation baseline at current pose (legacy method).
+        
+        This is a fallback for single-pose calibration. For better accuracy,
+        use the analytical gravity model with use_model_gravity=True.
         
         Call this when the arm is stationary with no external load.
         
@@ -196,7 +229,29 @@ class PiperForceEstimator:
         """
         self._gravity_baseline = tau.copy()
         self._baseline_pose = q.copy()
-        print(f"[ForceEstimator] Gravity baseline set at pose: {np.rad2deg(q)}")
+        
+        # If using model gravity, calibrate offsets instead
+        if self._use_model_gravity and self._gravity_compensator is not None:
+            self._gravity_compensator.calibrate_offsets(q, tau)
+        else:
+            print(f"[ForceEstimator] Gravity baseline set at pose: {np.rad2deg(q)}")
+    
+    def calibrate_gravity_from_samples(self, q_samples: np.ndarray, tau_samples: np.ndarray):
+        """Calibrate gravity compensation from multiple pose samples.
+        
+        This provides better accuracy than single-pose calibration by fitting
+        scaling factors and offsets across the workspace.
+        
+        Args:
+            q_samples: Joint angle samples (N, 6) in radians
+            tau_samples: Measured torque samples (N, 6) in N·m
+        """
+        if self._gravity_compensator is not None:
+            self._gravity_compensator.calibrate_scaling(q_samples, tau_samples)
+        else:
+            print("[ForceEstimator] Warning: No gravity compensator, using first sample as baseline")
+            if len(q_samples) > 0:
+                self.set_gravity_baseline(q_samples[0], tau_samples[0])
     
     def estimate_force(self, q: np.ndarray, tau: np.ndarray, 
                        use_filter: bool = True,
@@ -207,7 +262,7 @@ class PiperForceEstimator:
             q: Joint angles (6,) in radians
             tau: Measured joint torques (6,) in N·m
             use_filter: Apply low-pass filter to torque readings
-            use_gravity_comp: Subtract gravity baseline if available
+            use_gravity_comp: Apply gravity compensation
             
         Returns:
             F_ext: Estimated external force/torque (6,)
@@ -227,8 +282,14 @@ class PiperForceEstimator:
         
         # Gravity compensation
         tau_ext = tau_filtered.copy()
-        if use_gravity_comp and self._gravity_baseline is not None:
-            tau_ext = tau_filtered - self._gravity_baseline
+        if use_gravity_comp:
+            if self._use_model_gravity and self._gravity_compensator is not None:
+                # Use analytical gravity model
+                tau_gravity = self._gravity_compensator.predict(q, apply_filter=False)
+                tau_ext = tau_filtered - tau_gravity
+            elif self._gravity_baseline is not None:
+                # Fallback: single-pose baseline
+                tau_ext = tau_filtered - self._gravity_baseline
         
         # Compute Jacobian
         J = self.jacobian.compute_jacobian(q)
@@ -243,6 +304,19 @@ class PiperForceEstimator:
             F_ext = np.zeros(6)
         
         return F_ext
+    
+    def get_gravity_torques(self, q: np.ndarray) -> Optional[np.ndarray]:
+        """Get predicted gravity torques at given pose.
+        
+        Args:
+            q: Joint angles (6,) in radians
+            
+        Returns:
+            Predicted gravity torques (6,) in N·m, or None if model not available
+        """
+        if self._gravity_compensator is not None:
+            return self._gravity_compensator.predict(q, apply_filter=False)
+        return None
     
     def estimate_force_from_piper(self, piper: "C_PiperInterface_V2",
                                    use_filter: bool = True,
@@ -338,6 +412,8 @@ class PiperForceEstimator:
         """Calibrate gravity baseline from current Piper state.
         
         Call this when the arm is stationary with no external load.
+        This calibrates offsets for the analytical gravity model if enabled,
+        or sets a single-pose baseline otherwise.
         
         Args:
             piper: Piper SDK interface instance
@@ -356,3 +432,27 @@ class PiperForceEstimator:
     def reset_filter(self):
         """Reset the low-pass filter state."""
         self._filtered_torque = None
+        if self._gravity_compensator is not None:
+            self._gravity_compensator.reset_filter()
+    
+    def save_gravity_calibration(self, filepath: str):
+        """Save gravity calibration parameters to file.
+        
+        Args:
+            filepath: Path to save calibration (.npz format)
+        """
+        if self._gravity_compensator is not None:
+            self._gravity_compensator.save_calibration(filepath)
+        else:
+            print("[ForceEstimator] No gravity compensator to save")
+    
+    def load_gravity_calibration(self, filepath: str):
+        """Load gravity calibration parameters from file.
+        
+        Args:
+            filepath: Path to calibration file (.npz format)
+        """
+        if self._gravity_compensator is not None:
+            self._gravity_compensator.load_calibration(filepath)
+        else:
+            print("[ForceEstimator] No gravity compensator to load into")

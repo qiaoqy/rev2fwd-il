@@ -5,6 +5,20 @@ This script allows teleoperation of the Piper robotic arm using
 PS5 DualSense controller connected via Bluetooth.
 
 =============================================================================
+FORCE ESTIMATION CONFIGURATION
+=============================================================================
+The force estimator uses an analytical gravity compensation model based on
+verified physics parameters from the MuJoCo model (piper_no_gripper.xml).
+
+Key assumptions:
+- GRIPPER_MASS = 0.15 kg  (可自定义夹爪质量，根据实际夹爪调整)
+- Gripper COM offset from link6: [0, 0, 0.05] m
+- The gripper's center of mass is assumed constant during open/close
+
+To adjust gripper mass, modify GRIPPER_MASS constant below or pass
+--gripper_mass argument when running the script.
+
+=============================================================================
 SETUP INSTRUCTIONS
 =============================================================================
 PS5 Controller Setup:
@@ -222,9 +236,9 @@ from scipy.spatial.transform import Rotation as R
 # RoboKit
 from robokit.controllers.imu_control import RawIMUHandler
 
-# Force estimator
+# Force estimator with analytical gravity compensation
 try:
-    from rev2fwd_il.real import PiperForceEstimator
+    from rev2fwd_il.real import PiperForceEstimator, PiperGravityModel, GravityCompensator
     FORCE_ESTIMATOR_AVAILABLE = True
 except ImportError:
     FORCE_ESTIMATOR_AVAILABLE = False
@@ -234,6 +248,13 @@ except ImportError:
 # =============================================================================
 # Constants and Parameters
 # =============================================================================
+
+# === Force Estimation Settings ===
+# Gripper mass for gravity compensation (可自定义夹爪质量)
+# Adjust this value based on your actual gripper weight
+# If you see large Fz bias, increase this value
+# Rule of thumb: Fz_bias / 9.8 ≈ mass error in kg
+GRIPPER_MASS = 0.0  # kg - increased from 0.2 to better match actual gripper
 
 # === Camera Settings ===
 DEFAULT_FRONT_CAMERA = "Orbbec_Gemini_335L"  # Front camera name/ID
@@ -462,14 +483,6 @@ def _save_episode_sync(episode: EpisodeData, out_dir: Path):
         joint_torques_arr = np.array(episode.joint_torques, dtype=np.float32) if episode.joint_torques else np.zeros((T, 6), dtype=np.float32)
         ee_force_arr = np.array(episode.ee_force, dtype=np.float32) if episode.ee_force else np.zeros((T, 6), dtype=np.float32)
         
-        # DEBUG: Print force data stats before saving
-        print(f"[DEBUG Save] Force data stats for episode {episode.episode_id}:")
-        print(f"  joint_angles: shape={joint_angles_arr.shape}, has_nonzero={np.any(np.abs(joint_angles_arr) > 1e-6)}")
-        print(f"  joint_torques: shape={joint_torques_arr.shape}, has_nonzero={np.any(np.abs(joint_torques_arr) > 1e-6)}")
-        print(f"    torques range: [{joint_torques_arr.min():.4f}, {joint_torques_arr.max():.4f}]")
-        print(f"  ee_force: shape={ee_force_arr.shape}, has_nonzero={np.any(np.abs(ee_force_arr) > 1e-6)}")
-        print(f"    force range: [{ee_force_arr.min():.4f}, {ee_force_arr.max():.4f}]")
-        
         # Save NPZ
         np.savez(
             episode_dir / "episode_data.npz",
@@ -632,44 +645,132 @@ class PiperController:
             return False
     
     def enable(self) -> bool:
-        """Enable the arm."""
+        """Enable the arm with robust checking.
+        
+        Uses multiple enable commands and checks motor driver status directly.
+        """
         if not self.connected or self.piper is None:
             print("[Piper] ✗ Not connected, cannot enable")
             return False
         
         try:
             print("[Piper] Enabling arm...")
-            self.piper.EnableArm(7)
+            
+            # Send enable commands multiple times for reliability
+            for attempt in range(3):
+                self.piper.EnableArm(7)
+                time.sleep(0.1)
+            
+            # Set motion control mode
             self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
+            
+            # Enable gripper
             self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
             
+            # Wait for enable completion with detailed checking
             start_time = time.time()
             while time.time() - start_time < ENABLE_TIMEOUT:
-                if self._check_enabled():
+                arm_enabled, gripper_enabled = self._check_motor_enable_status()
+                if arm_enabled and gripper_enabled:
                     self.enabled = True
-                    print("[Piper] ✓ Enabled")
+                    print("[Piper] ✓ Enabled (all motors confirmed)")
                     return True
+                elif arm_enabled:
+                    # Arm enabled but gripper not yet
+                    self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
+                else:
+                    # Keep sending enable
+                    self.piper.EnableArm(7)
                 time.sleep(0.1)
             
             print("[Piper] ✗ Enable timeout")
+            self._print_enable_status()
             return False
         except Exception as e:
             print(f"[Piper] ✗ Enable failed: {e}")
             return False
     
-    def _check_enabled(self) -> bool:
-        """Check if arm is enabled."""
+    def _check_motor_enable_status(self) -> Tuple[bool, bool]:
+        """Check if arm motors and gripper are enabled via driver status.
+        
+        Returns:
+            (arm_enabled, gripper_enabled) tuple
+        """
         try:
+            # Check arm motors via low speed info (more reliable)
+            arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
+            arm_enabled = (
+                arm_msgs.motor_1.foc_status.driver_enable_status and
+                arm_msgs.motor_2.foc_status.driver_enable_status and
+                arm_msgs.motor_3.foc_status.driver_enable_status and
+                arm_msgs.motor_4.foc_status.driver_enable_status and
+                arm_msgs.motor_5.foc_status.driver_enable_status and
+                arm_msgs.motor_6.foc_status.driver_enable_status
+            )
+            
+            # Check gripper
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_enabled = gripper_msgs.gripper_state.foc_status.driver_enable_status
+            
+            return arm_enabled, gripper_enabled
+        except Exception as e:
+            return False, False
+    
+    def _print_enable_status(self):
+        """Print detailed enable status for debugging."""
+        try:
+            arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
+            print("[Piper] Motor enable status:")
+            for i in range(1, 7):
+                motor = getattr(arm_msgs, f"motor_{i}")
+                status = motor.foc_status.driver_enable_status
+                print(f"  Motor {i}: {'✓' if status else '✗'}")
+            
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_status = gripper_msgs.gripper_state.foc_status.driver_enable_status
+            print(f"  Gripper: {'✓' if gripper_status else '✗'}")
+        except Exception as e:
+            print(f"[Piper] Failed to read enable status: {e}")
+    
+    def is_arm_ready(self) -> bool:
+        """Check if arm is ready for motion (enabled and not in error).
+        
+        This is a more thorough check than just enabled status.
+        """
+        if not self.enabled or self.piper is None:
+            return False
+        
+        try:
+            arm_enabled, gripper_enabled = self._check_motor_enable_status()
+            if not (arm_enabled and gripper_enabled):
+                return False
+            
+            # Also check control mode
             status = self.piper.GetArmStatus()
-            ctrl_mode = getattr(status.arm_status, 'ctrl_mode', None)
-            ctrl_ok = ctrl_mode is not None and int(ctrl_mode) != 0
-            
-            enable_list = self.piper.GetArmEnableStatus()
-            enable_ok = bool(enable_list) and all(enable_list)
-            
-            return ctrl_ok and enable_ok
+            ctrl_mode = getattr(status.arm_status, 'ctrl_mode', 0)
+            return int(ctrl_mode) != 0
         except:
             return False
+    
+    def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        """Wait until arm is fully ready for motion.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            True if arm is ready, False if timeout
+        """
+        print("[Piper] Waiting for arm to be ready...")
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.is_arm_ready():
+                print("[Piper] ✓ Arm is ready")
+                return True
+            time.sleep(0.1)
+        print("[Piper] ✗ Arm not ready after timeout")
+        self._print_enable_status()
+        return False
     
     def disconnect(self):
         """Disable and disconnect from the arm."""
@@ -1110,6 +1211,7 @@ class TeleoperationController:
                  linear_scale: float = LINEAR_VEL_SCALE,
                  angular_scale: float = ANGULAR_VEL_SCALE,
                  control_freq: float = 30.0,
+                 record_freq: float = 10.0,  # Recording frequency (Hz), lower than control_freq to reduce data size
                  # Data recording parameters
                  record_data: bool = False,
                  fixed_cam: Optional[CameraCapture] = None,
@@ -1122,6 +1224,11 @@ class TeleoperationController:
         self.angular_scale = angular_scale
         self._control_freq = control_freq
         self._control_dt = 1.0 / control_freq  # Time step for integration
+        
+        # Recording frequency control (record every N control steps)
+        self._record_freq = min(record_freq, control_freq)  # Can't record faster than control
+        self._record_interval = max(1, int(control_freq / self._record_freq))  # Steps between records
+        self._step_counter = 0  # Counter for recording interval
         
         self._gripper_open = True
         self._gripper_target_angle = GRIPPER_OPEN_ANGLE  # Track target gripper angle
@@ -1280,20 +1387,6 @@ class TeleoperationController:
                     use_filter=True,
                     use_gravity_comp=True
                 )
-                # DEBUG: Print force data on first few frames
-                if frame_idx < 3:
-                    print(f"[DEBUG Force] Frame {frame_idx}: SUCCESS")
-                    print(f"  joint_angles: {joint_angles}")
-                    print(f"  joint_torques: {joint_torques}")
-                    print(f"  ee_force: {ee_force}")
-            else:
-                # DEBUG: joint_state is None - print for first few frames
-                if frame_idx < 5:
-                    print(f"[DEBUG Force] Frame {frame_idx}: joint_state is None!")
-        else:
-            # DEBUG: force_estimator not available
-            if frame_idx < 3:
-                print(f"[DEBUG Force] Frame {frame_idx}: force_estimator={self._force_estimator is not None}, piper.piper={self.piper.piper is not None}")
         
         # Record data
         self._current_episode.fixed_images.append(fixed_img)
@@ -1527,14 +1620,6 @@ class TeleoperationController:
             # Exited gyro mode
             self._gyro_mode_active = False
         
-        # Debug: print gyro status when Circle is first pressed
-        if circle_held and not getattr(self, '_gyro_debug_printed', False):
-            print("[Teleop] 🎮 Gyro mode activated - using RawIMUHandler")
-            print(f"[Teleop] ✓ IMU ready! Tilt controller to rotate end-effector")
-            self._gyro_debug_printed = True
-        elif not circle_held:
-            self._gyro_debug_printed = False
-        
         # Calculate target pose
         # Left stick up/down -> X axis, left/right -> Y axis
         target_x = pose['x'] + left_stick_y * self.linear_scale  # Up = +X
@@ -1560,7 +1645,7 @@ class TeleoperationController:
             
             # Convert degrees to radians and apply sensitivity
             # Mapping: controller roll -> robot RX, controller pitch -> robot RY, controller yaw -> robot RZ
-            delta_rx = -np.deg2rad(roll_rel) * self._gyro_sensitivity   # Controller roll -> robot RX
+            delta_rx = np.deg2rad(roll_rel) * self._gyro_sensitivity   # Controller roll -> robot RX
             delta_ry = np.deg2rad(pitch_rel) * self._gyro_sensitivity   # Controller pitch -> robot RY
             delta_rz = np.deg2rad(yaw_rel) * self._gyro_sensitivity     # Controller yaw -> robot RZ
             
@@ -1604,7 +1689,13 @@ class TeleoperationController:
             self._gripper_open = self._gripper_target_angle > GRIPPER_OPEN_ANGLE / 2
         
         # === Data Recording ===
-        if self._recording and self._current_episode is not None:
+        # Increment step counter
+        self._step_counter += 1
+        
+        # Only record at specified frequency (decimation)
+        should_record = (self._step_counter % self._record_interval == 0)
+        
+        if self._recording and self._current_episode is not None and should_record:
             # Get current pose as observation
             current_pos = np.array([pose['x'], pose['y'], pose['z']])
             current_quat = np.array(euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg']))
@@ -1667,20 +1758,6 @@ class TeleoperationController:
                         use_filter=True,
                         use_gravity_comp=True
                     )
-                    # DEBUG: Print force data on first few frames
-                    if frame_idx < 3:
-                        print(f"[DEBUG Force] Frame {frame_idx}: SUCCESS")
-                        print(f"  joint_angles: {joint_angles}")
-                        print(f"  joint_torques: {joint_torques}")
-                        print(f"  ee_force: {ee_force}")
-                else:
-                    # DEBUG: joint_state is None - print for first few frames
-                    if frame_idx < 5:
-                        print(f"[DEBUG Force] Frame {frame_idx}: joint_state is None!")
-            else:
-                # DEBUG: force_estimator not available
-                if frame_idx < 3:
-                    print(f"[DEBUG Force] Frame {frame_idx}: force_estimator={self._force_estimator is not None}, piper.piper={self.piper.piper is not None}")
             
             # Record data
             self._current_episode.fixed_images.append(fixed_img)
@@ -1743,8 +1820,8 @@ Data Recording Controls (when --record is enabled):
                         help=f"Linear velocity scale m/cycle (default: {LINEAR_VEL_SCALE})")
     parser.add_argument("--angular_scale", type=float, default=ANGULAR_VEL_SCALE,
                         help=f"Angular velocity scale rad/cycle (default: {ANGULAR_VEL_SCALE})")
-    parser.add_argument("--control_freq", type=int, default=30,
-                        help="Control loop frequency Hz (default: 30)")
+    parser.add_argument("--control_freq", type=int, default=20,
+                        help="Control loop frequency Hz (default: 20)")
     parser.add_argument("--deadzone", type=float, default=0.1,
                         help="Joystick deadzone (default: 0.1)")
     parser.add_argument("--show_camera", action="store_true",
@@ -1761,10 +1838,18 @@ Data Recording Controls (when --record is enabled):
                         help=f"Front camera ID/name (default: {DEFAULT_FRONT_CAMERA})")
     parser.add_argument("--wrist_cam", "-w", type=str, default=DEFAULT_WRIST_CAMERA,
                         help=f"Wrist camera ID/name, use -1 to disable (default: {DEFAULT_WRIST_CAMERA})")
-    parser.add_argument("--image_width", type=int, default=640,
-                        help="Camera image width (default: 640)")
-    parser.add_argument("--image_height", type=int, default=480,
-                        help="Camera image height (default: 480)")
+    parser.add_argument("--image_width", type=int, default=320,
+                        help="Camera image width (default: 320)")
+    parser.add_argument("--image_height", type=int, default=270,
+                        help="Camera image height (default: 270)")
+    
+    # Force estimation options
+    parser.add_argument("--gripper_mass", type=float, default=GRIPPER_MASS,
+                        help=f"Gripper mass in kg for gravity compensation (default: {GRIPPER_MASS})")
+    
+    # Recording frequency
+    parser.add_argument("--record_freq", type=float, default=20.0,
+                        help="Recording frequency in Hz, independent of control freq (default: 20)")
     
     return parser.parse_args()
 
@@ -1833,6 +1918,7 @@ def main():
     fixed_cam = None
     wrist_cam = None
     display_cam = None
+    force_estimator = None
     init_errors = []
     
     def init_imu():
@@ -1852,9 +1938,13 @@ def main():
         if not arm.connect():
             raise RuntimeError("Failed to connect to Piper arm")
         
+        print("[Init] Enabling arm motors...")
         if not arm.enable():
             arm.disconnect()
             raise RuntimeError("Failed to enable Piper arm")
+        
+        # Print current enable status for debugging
+        arm._print_enable_status()
         
         return arm
     
@@ -1897,11 +1987,32 @@ def main():
         print("[Init] ✓ Cameras initialized")
         return cams
     
-    # Run all initializations in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    def init_force_estimator():
+        """Initialize force estimator (without calibration - that needs arm at home)."""
+        if not FORCE_ESTIMATOR_AVAILABLE:
+            print("\n[Init] Force estimator not available, skipping")
+            return None
+        
+        print("\n[Init] Creating force estimator with analytical gravity model...")
+        print(f"[Init] Using gripper mass: {args.gripper_mass} kg")
+        
+        # Create force estimator with analytical gravity model
+        # This uses physics parameters from verified MuJoCo model (piper_no_gripper.xml)
+        estimator = PiperForceEstimator(
+            dh_is_offset=0x01,
+            include_gripper=True,
+            gripper_mass=args.gripper_mass,  # 可自定义夹爪质量
+            use_model_gravity=True,  # Use analytical gravity model
+        )
+        print("[Init] ✓ Force estimator created (calibration pending)")
+        return estimator
+    
+    # Run all initializations in parallel (4 tasks now)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         imu_future = executor.submit(init_imu)
         arm_future = executor.submit(init_arm)
         cam_future = executor.submit(init_cameras)
+        force_future = executor.submit(init_force_estimator)
         
         # Wait for all to complete
         try:
@@ -1921,6 +2032,11 @@ def main():
             display_cam = cams["display"]
         except Exception as e:
             init_errors.append(f"Camera init failed: {e}")
+        
+        try:
+            force_estimator = force_future.result()
+        except Exception as e:
+            init_errors.append(f"Force estimator init failed: {e}")
     
     # Check for errors
     if init_errors:
@@ -1938,6 +2054,15 @@ def main():
         ps5.close()
         sys.exit(1)
     
+    # Verify arm is truly ready before proceeding
+    print("\n[Init] Verifying arm is ready...")
+    if not piper.wait_until_ready(timeout=10.0):
+        print("[Error] Arm failed to initialize properly")
+        print("[Error] Try: 1) Power cycle the arm, 2) Check CAN connection")
+        piper.disconnect()
+        ps5.close()
+        sys.exit(1)
+    
     # Go to home position
     print("\n[Init] Going to home position...")
     piper.go_to_home()
@@ -1947,19 +2072,35 @@ def main():
     piper.open_gripper()
     time.sleep(0.5)
     
-    # Initialize force estimator
-    force_estimator = None
-    if FORCE_ESTIMATOR_AVAILABLE:
-        print("\n[Init] Initializing force estimator...")
-        force_estimator = PiperForceEstimator(dh_is_offset=0x01)
-        # Calibrate gravity baseline at home position
-        time.sleep(0.5)  # Wait for arm to settle
+    # Wait for motion to complete and arm to settle
+    print("[Init] Waiting for arm to settle at home position...")
+    time.sleep(1.0)
+    
+    # Verify arm is still ready after motion
+    if not piper.is_arm_ready():
+        print("[Warning] Arm may not be fully ready. Force calibration may be inaccurate.")
+    
+    # Calibrate force estimator at home position (estimator was created in parallel)
+    if force_estimator is not None:
+        print("\n[Init] Calibrating force estimator at home position...")
+        
         if force_estimator.calibrate_gravity_from_piper(piper.piper):
-            print("[Init] ✓ Force estimator gravity baseline calibrated")
+            # Reset filter after calibration to avoid initial transients
+            force_estimator.reset_filter()
+            print("[Init] ✓ Force estimator calibrated")
+            
+            # Verify calibration by checking current force reading
+            test_force = force_estimator.estimate_force_from_piper(
+                piper.piper, use_filter=False, use_gravity_comp=True
+            )
+            if test_force is not None:
+                print(f"[Init]   Initial force: Fx={test_force[0]:.2f}, Fy={test_force[1]:.2f}, Fz={test_force[2]:.2f} N")
+                if abs(test_force[2]) > 5.0:
+                    print(f"[Init] ⚠ Warning: Fz bias = {test_force[2]:.2f}N is large!")
+                    print(f"[Init]   Consider adjusting --gripper_mass (current: {args.gripper_mass} kg)")
+                    print(f"[Init]   Estimated mass correction: {-test_force[2]/9.8:.2f} kg")
         else:
-            print("[Init] ✗ Force estimator calibration failed, continuing without gravity compensation")
-    else:
-        print("\n[Init] Force estimator not available, skipping force recording")
+            print("[Init] ⚠ Force calibration failed, using model-only gravity compensation")
     
     # Create teleoperation controller
     teleop = TeleoperationController(
@@ -1968,6 +2109,7 @@ def main():
         linear_scale=args.linear_scale,
         angular_scale=args.angular_scale,
         control_freq=args.control_freq,
+        record_freq=args.record_freq,
         record_data=args.record,
         fixed_cam=fixed_cam,
         wrist_cam=wrist_cam,
@@ -1975,6 +2117,9 @@ def main():
         imu_handler=imu_handler,
     )
     teleop.start()
+    
+    if args.record:
+        print(f"[Main] Recording at {teleop._record_freq:.1f} Hz (every {teleop._record_interval} control steps)")
     
     # Track saved episodes
     saved_episodes = 0
