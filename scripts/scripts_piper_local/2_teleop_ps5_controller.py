@@ -345,7 +345,7 @@ def quat_to_euler(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, fl
 @dataclass
 class EpisodeData:
     """Container for episode data (teleoperation)."""
-    episode_id: int
+    episode_id: str  # Timestamp-based ID (YYYYMMDD_HHMMSS_ffffff)
     fixed_images: list  # List of (H, W, 3) uint8 arrays
     wrist_images: list  # List of (H, W, 3) uint8 arrays
     ee_pose: list       # List of (7,) arrays [x, y, z, qw, qx, qy, qz]
@@ -449,7 +449,7 @@ def _save_episode_sync(episode: EpisodeData, out_dir: Path):
     """
     import tempfile
     
-    episode_name = f"episode_{episode.episode_id:04d}"
+    episode_name = f"episode_{episode.episode_id}"
     archive_path = out_dir / f"{episode_name}.tar.gz"
     
     # Create a temporary directory for assembling the episode
@@ -507,7 +507,7 @@ def _save_episode_sync(episode: EpisodeData, out_dir: Path):
     
     # Calculate archive size for logging
     archive_size_mb = archive_path.stat().st_size / (1024 * 1024)
-    print(f"[Save] Episode {episode.episode_id} saved to {archive_path} ({T} frames, {archive_size_mb:.2f} MB)")
+    print(f"[Save] Saved {T} frames ({archive_size_mb:.2f} MB)")
 
 
 class BackgroundSaver:
@@ -528,7 +528,6 @@ class BackgroundSaver:
         self._running = True
         self._thread = threading.Thread(target=self._save_loop, daemon=True)
         self._thread.start()
-        print("[BackgroundSaver] Started")
     
     def _save_loop(self):
         """Background loop that processes save requests."""
@@ -561,7 +560,6 @@ class BackgroundSaver:
         with self._lock:
             self._pending_count += 1
         self._queue.put((episode, out_dir))
-        print(f"[BackgroundSaver] Episode {episode.episode_id} queued for saving ({len(episode.ee_pose)} frames)")
     
     def stop(self, wait: bool = True, timeout: float = 30.0):
         """Stop the background saver.
@@ -631,17 +629,15 @@ class PiperController:
     def connect(self) -> bool:
         """Connect to the Piper arm."""
         try:
-            print(f"[Piper] Connecting via {self.can_interface}...")
             self.piper = C_PiperInterface_V2(self.can_interface)
             self.piper.ConnectPort()
             time.sleep(0.5)
             self.connected = True
-            print("[Piper] ✓ Connected")
             return True
         except Exception as e:
-            print(f"[Piper] ✗ Connection failed: {e}")
-            print(f"[Piper] If CAN interface is not UP, run:")
-            print(f"       sudo ip link set {self.can_interface} up type can bitrate 1000000")
+            print(f"[Error] Piper connection failed: {e}")
+            print(f"[Error] If CAN interface is not UP, run:")
+            print(f"        sudo ip link set {self.can_interface} up type can bitrate 1000000")
             return False
     
     def enable(self) -> bool:
@@ -650,12 +646,10 @@ class PiperController:
         Uses multiple enable commands and checks motor driver status directly.
         """
         if not self.connected or self.piper is None:
-            print("[Piper] ✗ Not connected, cannot enable")
+            print("[Error] Piper not connected, cannot enable")
             return False
         
         try:
-            print("[Piper] Enabling arm...")
-            
             # Send enable commands multiple times for reliability
             for attempt in range(3):
                 self.piper.EnableArm(7)
@@ -673,7 +667,6 @@ class PiperController:
                 arm_enabled, gripper_enabled = self._check_motor_enable_status()
                 if arm_enabled and gripper_enabled:
                     self.enabled = True
-                    print("[Piper] ✓ Enabled (all motors confirmed)")
                     return True
                 elif arm_enabled:
                     # Arm enabled but gripper not yet
@@ -683,11 +676,11 @@ class PiperController:
                     self.piper.EnableArm(7)
                 time.sleep(0.1)
             
-            print("[Piper] ✗ Enable timeout")
+            print("[Error] Piper enable timeout")
             self._print_enable_status()
             return False
         except Exception as e:
-            print(f"[Piper] ✗ Enable failed: {e}")
+            print(f"[Error] Piper enable failed: {e}")
             return False
     
     def _check_motor_enable_status(self) -> Tuple[bool, bool]:
@@ -717,10 +710,10 @@ class PiperController:
             return False, False
     
     def _print_enable_status(self):
-        """Print detailed enable status for debugging."""
+        """Print detailed enable status for debugging (called on failure)."""
         try:
             arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
-            print("[Piper] Motor enable status:")
+            print("[Debug] Motor enable status:")
             for i in range(1, 7):
                 motor = getattr(arm_msgs, f"motor_{i}")
                 status = motor.foc_status.driver_enable_status
@@ -730,7 +723,7 @@ class PiperController:
             gripper_status = gripper_msgs.gripper_state.foc_status.driver_enable_status
             print(f"  Gripper: {'✓' if gripper_status else '✗'}")
         except Exception as e:
-            print(f"[Piper] Failed to read enable status: {e}")
+            print(f"[Debug] Failed to read enable status: {e}")
     
     def is_arm_ready(self) -> bool:
         """Check if arm is ready for motion (enabled and not in error).
@@ -761,26 +754,23 @@ class PiperController:
         Returns:
             True if arm is ready, False if timeout
         """
-        print("[Piper] Waiting for arm to be ready...")
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.is_arm_ready():
-                print("[Piper] ✓ Arm is ready")
                 return True
             time.sleep(0.1)
-        print("[Piper] ✗ Arm not ready after timeout")
+        print("[Error] Arm not ready after timeout")
         self._print_enable_status()
         return False
     
     def disconnect(self):
         """Disable and disconnect from the arm."""
         if self.piper is not None and self.enabled:
-            print("[Piper] Disabling arm...")
             try:
                 self.piper.DisableArm(7)
                 self.enabled = False
             except Exception as e:
-                print(f"[Piper] Disable error: {e}")
+                print(f"[Error] Piper disable error: {e}")
         self.connected = False
         self.piper = None
     
@@ -929,44 +919,33 @@ class PS5Controller:
     def initialize(self) -> bool:
         """Initialize pygame and find PS5 controller."""
         if not PYGAME_AVAILABLE:
-            print("[Controller] ✗ pygame not available")
+            print("[Error] pygame not available")
             return False
         
         pygame.init()
         pygame.joystick.init()
         
-        # Print SDL2 version info for debugging
-        print(f"[Controller] pygame version: {pygame.version.ver}")
-        print(f"[Controller] SDL version: {pygame.version.SDL}")
         # SDL2 >= 2.0.14 is required for DualSense gyro support
         sdl_version = pygame.version.SDL
         if sdl_version < (2, 0, 14):
-            print(f"[Controller] ⚠ SDL2 version {sdl_version} < 2.0.14, gyro may not work!")
-        else:
-            print(f"[Controller] ✓ SDL2 version {sdl_version} supports DualSense sensors")
+            print(f"[Warning] SDL2 version {sdl_version} < 2.0.14, gyro may not work!")
         
         # Find connected joysticks
         num_joysticks = pygame.joystick.get_count()
         if num_joysticks == 0:
-            print("[Controller] ✗ No joysticks found")
-            print("[Controller] Make sure PS5 controller is connected via Bluetooth")
+            print("[Error] No joysticks found. Make sure PS5 controller is connected via Bluetooth")
             return False
-        
-        print(f"[Controller] Found {num_joysticks} joystick(s):")
         
         # Look for PS5 controller
         for i in range(num_joysticks):
             js = pygame.joystick.Joystick(i)
             js.init()
             name = js.get_name()
-            print(f"  [{i}] {name}")
             
             # Check if it's a PS5 controller
             if "dualsense" in name.lower() or "ps5" in name.lower() or "sony" in name.lower() or "wireless controller" in name.lower():
                 self.joystick = js
                 self.connected = True
-                print(f"[Controller] ✓ Using: {name}")
-                print(f"[Controller]   Buttons: {js.get_numbuttons()}, Axes: {js.get_numaxes()}, Hats: {js.get_numhats()}")
                 return True
         
         # If no PS5 found, use first joystick
@@ -974,7 +953,7 @@ class PS5Controller:
             self.joystick = pygame.joystick.Joystick(0)
             self.joystick.init()
             self.connected = True
-            print(f"[Controller] ⚠ No PS5 controller found, using: {self.joystick.get_name()}")
+            print(f"[Warning] No PS5 controller found, using: {self.joystick.get_name()}")
             return True
         
         return False
@@ -1106,6 +1085,8 @@ class CameraCapture:
         self.cap = None
         self._lock = threading.Lock()
         self._latest_frame = None
+        self._frame_timestamp = 0.0  # When the frame was captured
+        self._consecutive_failures = 0  # Track consecutive read failures
         self._running = False
         self._thread = None
     
@@ -1143,7 +1124,7 @@ class CameraCapture:
         self.cap = cv2.VideoCapture(source)
         
         if not self.cap.isOpened():
-            print(f"[Camera {self.name}] ✗ Failed to open: {source}")
+            print(f"[Error] Camera {self.name} failed to open: {source}")
             return False
         
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -1159,7 +1140,6 @@ class CameraCapture:
             if self._latest_frame is not None:
                 break
         
-        print(f"[Camera {self.name}] ✓ Started ({self.width}x{self.height})")
         return True
     
     def _capture_loop(self):
@@ -1169,6 +1149,14 @@ class CameraCapture:
             if ret:
                 with self._lock:
                     self._latest_frame = frame
+                    self._frame_timestamp = time.time()
+                    self._consecutive_failures = 0
+            else:
+                with self._lock:
+                    self._consecutive_failures += 1
+                    # After too many failures, mark frame as stale
+                    if self._consecutive_failures > 10:
+                        self._latest_frame = None
             time.sleep(0.01)
     
     def get_frame(self) -> Optional[np.ndarray]:
@@ -1185,6 +1173,31 @@ class CameraCapture:
             return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return None
     
+    def get_frame_age(self) -> float:
+        """Get age of latest frame in seconds (how stale it is)."""
+        with self._lock:
+            if self._frame_timestamp > 0:
+                return time.time() - self._frame_timestamp
+        return float('inf')  # No frame ever captured
+    
+    def is_healthy(self, max_age: float = 1.0) -> bool:
+        """Check if camera is producing fresh frames.
+        
+        Args:
+            max_age: Maximum acceptable frame age in seconds
+            
+        Returns:
+            True if camera is working and producing fresh frames
+        """
+        with self._lock:
+            if self._latest_frame is None:
+                return False
+            if self._consecutive_failures > 5:
+                return False
+            if self._frame_timestamp > 0 and (time.time() - self._frame_timestamp) > max_age:
+                return False
+        return True
+    
     def stop(self):
         """Stop camera."""
         self._running = False
@@ -1192,7 +1205,6 @@ class CameraCapture:
             self._thread.join(timeout=1.0)
         if self.cap:
             self.cap.release()
-        print(f"[Camera {self.name}] Stopped")
 
 
 # =============================================================================
@@ -1258,17 +1270,17 @@ class TeleoperationController:
         # Long-press Square button tracking for discard
         self._square_press_start_time: Optional[float] = None
         self._square_long_press_triggered = False
-        self._square_long_press_threshold = 1.5  # seconds to hold for discard
         self._square_rumble_interval = 0.15  # seconds between rumble pulses during hold
         
-    def start_recording(self, episode_id: int = None):
+    def start_recording(self, episode_id: str = None):
         """Start recording a new episode."""
         if not self._record_data:
             print("[Teleop] ⚠ Data recording not enabled")
             return
         
+        # Generate timestamp-based episode_id: YYYYMMDD_HHMMSS_ffffff
         if episode_id is None:
-            episode_id = self._episode_count
+            episode_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
         self._current_episode = EpisodeData(
             episode_id=episode_id,
@@ -1284,9 +1296,7 @@ class TeleoperationController:
         )
         self._recording = True
         self._prev_pose = None
-        # Increment episode count for next recording
-        self._episode_count += 1
-        print(f"[Teleop] 🔴 Recording episode {episode_id + 1}...")
+        print(f"[Teleop] 🔴 Recording started...")
         
     def stop_recording(self, success: bool = True) -> Optional[EpisodeData]:
         """Stop recording and return the episode data."""
@@ -1297,7 +1307,7 @@ class TeleoperationController:
         episode = self._current_episode
         if episode is not None:
             episode.success = success
-            print(f"[Teleop] ⬛ Episode {episode.episode_id + 1} stopped ({len(episode.ee_pose)} frames)")
+            print(f"[Teleop] � Recording completed ({len(episode.ee_pose)} frames)")
         self._current_episode = None
         self._prev_pose = None
         return episode
@@ -1365,7 +1375,80 @@ class TeleoperationController:
         fixed_img = self._fixed_cam.get_frame_rgb() if self._fixed_cam else None
         wrist_img = self._wrist_cam.get_frame_rgb() if self._wrist_cam else None
         
-        # Handle missing camera data
+        # === Camera validation - FAIL FAST if camera data is missing/stale/black ===
+        def is_black_image(img: np.ndarray, threshold: float = 5.0) -> bool:
+            """Check if image is essentially black (mean pixel value < threshold)."""
+            if img is None:
+                return True
+            return np.mean(img) < threshold
+        
+        # Check fixed camera (front camera) - check health first (frame freshness)
+        if self._fixed_cam is not None:
+            if not self._fixed_cam.is_healthy(max_age=1.0):
+                frame_age = self._fixed_cam.get_frame_age()
+                raise RuntimeError(
+                    "\n" + "=" * 60 + "\n"
+                    "❌ CAMERA ERROR: Front camera (fixed_cam) is UNHEALTHY!\n"
+                    f"   Frame age: {frame_age:.2f}s (max allowed: 1.0s)\n"
+                    "   Camera may be experiencing V4L2 timeout or disconnected.\n"
+                    "   Recording STOPPED to prevent invalid data.\n"
+                    "=" * 60
+                )
+            if fixed_img is None:
+                raise RuntimeError(
+                    "\n" + "=" * 60 + "\n"
+                    "❌ CAMERA ERROR: Front camera (fixed_cam) returned None!\n"
+                    "   Camera may be disconnected or experiencing timeout.\n"
+                    "   Recording STOPPED to prevent invalid data.\n"
+                    "=" * 60
+                )
+            if is_black_image(fixed_img):
+                raise RuntimeError(
+                    "\n" + "=" * 60 + "\n"
+                    "❌ CAMERA ERROR: Front camera (fixed_cam) returned BLACK image!\n"
+                    f"   Mean pixel value: {np.mean(fixed_img):.2f} (threshold: 5.0)\n"
+                    "   Camera may be blocked, disconnected, or malfunctioning.\n"
+                    "   Recording STOPPED to prevent invalid data.\n"
+                    "=" * 60
+                )
+        
+        # Check wrist camera - check health first (frame freshness)
+        if self._wrist_cam is not None:
+            if not self._wrist_cam.is_healthy(max_age=1.0):
+                frame_age = self._wrist_cam.get_frame_age()
+                raise RuntimeError(
+                    "\n" + "=" * 60 + "\n"
+                    "❌ CAMERA ERROR: Wrist camera (wrist_cam) is UNHEALTHY!\n"
+                    f"   Frame age: {frame_age:.2f}s (max allowed: 1.0s)\n"
+                    "   Camera: Dabai DC1 (/dev/video10)\n"
+                    "   Camera is experiencing V4L2 timeout - not producing new frames.\n"
+                    "   Try: 1) Replug USB cable  2) Run with --wrist_cam -1 to disable\n"
+                    "   Recording STOPPED to prevent invalid/stale data.\n"
+                    "=" * 60
+                )
+            if wrist_img is None:
+                raise RuntimeError(
+                    "\n" + "=" * 60 + "\n"
+                    "❌ CAMERA ERROR: Wrist camera (wrist_cam) returned None!\n"
+                    "   Camera: Dabai DC1 (/dev/video10)\n"
+                    "   Camera may be disconnected or experiencing V4L2 timeout.\n"
+                    "   Try: 1) Replug USB cable  2) Run with --wrist_cam -1 to disable\n"
+                    "   Recording STOPPED to prevent invalid data.\n"
+                    "=" * 60
+                )
+            if is_black_image(wrist_img):
+                raise RuntimeError(
+                    "\n" + "=" * 60 + "\n"
+                    "❌ CAMERA ERROR: Wrist camera (wrist_cam) returned BLACK image!\n"
+                    f"   Mean pixel value: {np.mean(wrist_img):.2f} (threshold: 5.0)\n"
+                    "   Camera: Dabai DC1 (/dev/video10)\n"
+                    "   Camera may be blocked, disconnected, or malfunctioning.\n"
+                    "   Try: 1) Replug USB cable  2) Run with --wrist_cam -1 to disable\n"
+                    "   Recording STOPPED to prevent invalid data.\n"
+                    "=" * 60
+                )
+        
+        # Fallback for disabled cameras (create placeholder only if camera not configured)
         if fixed_img is None:
             fixed_img = np.zeros((480, 640, 3), dtype=np.uint8)
         if wrist_img is None:
@@ -1436,7 +1519,7 @@ class TeleoperationController:
             print("    - 2 vibrates = stopped & saved")
             print("  Square (long press):  Discard current episode")
             print("    - continuous vibration while holding")
-            print("    - 3 vibrates = discarded")
+            print("    - release to discard (vibration stops)")
         print("=" * 60 + "\n")
     
     def step(self) -> bool:
@@ -1493,12 +1576,10 @@ class TeleoperationController:
                 self.piper.close_gripper()
                 self._gripper_open = False
                 self._gripper_target_angle = GRIPPER_CLOSE_ANGLE
-                print("[Teleop] Gripper: CLOSE")
             else:
                 self.piper.open_gripper()
                 self._gripper_open = True
                 self._gripper_target_angle = GRIPPER_OPEN_ANGLE
-                print("[Teleop] Gripper: OPEN")
             return True
         
         # Square button - toggle recording (short press) or discard (long press)
@@ -1515,40 +1596,34 @@ class TeleoperationController:
             if square_held and self._square_press_start_time is not None:
                 hold_duration = time.time() - self._square_press_start_time
                 
-                if not self._square_long_press_triggered:
-                    # Continuous vibration while holding (after short delay to distinguish from short press)
-                    if hold_duration > 0.3:  # Start vibrating after 0.3s to avoid short-press confusion
-                        # Rumble continuously by checking interval
-                        if not hasattr(self, '_last_hold_rumble_time'):
-                            self._last_hold_rumble_time = 0
-                        if time.time() - self._last_hold_rumble_time > self._square_rumble_interval:
-                            self.ps5.rumble(0.4, 0.4, int(self._square_rumble_interval * 1000))
-                            self._last_hold_rumble_time = time.time()
-                    
-                    # Check if long press threshold reached
-                    if hold_duration >= self._square_long_press_threshold:
-                        # Discard recording
-                        self._square_long_press_triggered = True
-                        self._recording = False
-                        self._current_episode = None
-                        self._prev_pose = None
-                        print("[Teleop] 🗑️ Episode discarded (long press)")
-                        # Stop continuous vibration first, then three pulses
-                        self.ps5.stop_rumble()
-                        time.sleep(0.1)  # Brief pause before pulses
-                        self.ps5.rumble_short(count=3, intensity=0.8, duration_ms=120)
+                # Continuous vibration while holding (after short delay to distinguish from short press)
+                if hold_duration > 0.3:  # Start vibrating after 0.3s to avoid short-press confusion
+                    # Mark as long press mode
+                    self._square_long_press_triggered = True
+                    # Rumble continuously by checking interval
+                    if not hasattr(self, '_last_hold_rumble_time'):
+                        self._last_hold_rumble_time = 0
+                    if time.time() - self._last_hold_rumble_time > self._square_rumble_interval:
+                        self.ps5.rumble(0.5, 0.5, int(self._square_rumble_interval * 1000))
+                        self._last_hold_rumble_time = time.time()
             
             elif not square_held and self._square_press_start_time is not None:
-                # Button released - check if it was a short press
+                # Button released
                 hold_duration = time.time() - self._square_press_start_time
                 
-                # Stop any ongoing rumble first
+                # Stop any ongoing rumble
                 self.ps5.stop_rumble()
                 
-                if not self._square_long_press_triggered and hold_duration < 0.3:
+                if self._square_long_press_triggered:
+                    # Long press released: discard recording (vibration stopping is the signal)
+                    self._recording = False
+                    self._current_episode = None
+                    self._prev_pose = None
+                    print("[Teleop] 🗑️ Episode discarded")
+                elif hold_duration < 0.3:
                     # Short press: stop recording and save
                     self._recording = False
-                    print(f"[Teleop] ⬛ Stopped recording ({len(self._current_episode.ee_pose) if self._current_episode else 0} frames)")
+                    print(f"[Teleop] 🟢 Recording completed ({len(self._current_episode.ee_pose) if self._current_episode else 0} frames)")
                     # Vibrate twice to indicate stop
                     time.sleep(0.05)  # Brief pause to ensure previous rumble stopped
                     self.ps5.rumble_short(count=2, intensity=0.8, duration_ms=120)
@@ -1614,8 +1689,6 @@ class TeleoperationController:
             self._imu_handler.reset_pose() 
             # debug the vr gyro instead
             # self._quest_handler.reset_pose()
-
-            print("[Gyro] 🎯 Entering gyro mode - IMU pose reset")
         elif not circle_held and self._gyro_mode_active:
             # Exited gyro mode
             self._gyro_mode_active = False
@@ -1653,13 +1726,6 @@ class TeleoperationController:
             target_ry = pose['ry'] + delta_ry
             target_rz = pose['rz'] + delta_rz
             
-            # Periodic debug print (every ~1 second at 30Hz)
-            if not hasattr(self, '_gyro_print_counter'):
-                self._gyro_print_counter = 0
-            self._gyro_print_counter += 1
-            if self._gyro_print_counter % 30 == 0:
-                print(f"[Gyro] rpy_rel=({roll_rel:+.1f}, {pitch_rel:+.1f}, {yaw_rel:+.1f}) deg  "
-                      f"Δ=({np.rad2deg(delta_rx):+.2f}, {np.rad2deg(delta_ry):+.2f}, {np.rad2deg(delta_rz):+.2f}) deg")
         else:
             # Normal mode: D-pad for rotation
             target_rx = pose['rx'] + dpad_roll * self.angular_scale * 0.5
@@ -1808,7 +1874,7 @@ Examples:
 
 Data Recording Controls (when --record is enabled):
   - Square (short press): Start/Stop recording (1 vibrate = start, 2 vibrates = stop & save)
-  - Square (long press ~1.5s): Discard current episode (continuous vibrate while holding, 3 vibrates = discarded)
+  - Square (long press): Discard current episode (continuous vibrate while holding, release to discard)
 """
     )
     
@@ -1830,10 +1896,10 @@ Data Recording Controls (when --record is enabled):
                         help=f"Camera ID/name for display (default: {DEFAULT_FRONT_CAMERA})")
     
     # Data recording options
-    parser.add_argument("--record", "-r", action="store_true",
-                        help="Enable data recording mode")
-    parser.add_argument("--out_dir", "-o", type=str, default="data/teleop_data",
-                        help="Output directory for recorded data (default: data/teleop_data)")
+    parser.add_argument("--record", "-r", action="store_true", default=True,
+                        help="Enable data recording mode (default: enabled)")
+    parser.add_argument("--out_dir", "-o", type=str, default="/media/qiyuan/SSDQQY/rev2fwd_data/pick_place_piper",
+                        help="Output directory for recorded data (default: /media/qiyuan/SSDQQY/rev2fwd_data/pick_place_piper)")
     parser.add_argument("--front_cam", "-f", type=str, default=DEFAULT_FRONT_CAMERA,
                         help=f"Front camera ID/name (default: {DEFAULT_FRONT_CAMERA})")
     parser.add_argument("--wrist_cam", "-w", type=str, default=DEFAULT_WRIST_CAMERA,
@@ -1878,21 +1944,26 @@ def main():
     
     # Create output directory if recording
     out_dir = None
+    existing_episodes = []  # Track existing episodes in directory
     if args.record:
         out_dir = Path(args.out_dir)
         
-        # Backup existing directory if it exists (instead of overwriting)
-        if out_dir.exists():
-            backup_existing_directory(out_dir)
-        
+        # Don't backup - just continue saving in the same folder (timestamps won't conflict)
         out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Count existing episodes in the directory
+        existing_episodes = sorted([
+            f.stem.replace("episode_", "") 
+            for f in out_dir.glob("episode_*.tar.gz")
+        ])
+        if existing_episodes:
+            print(f"\nFound {len(existing_episodes)} existing episode(s) in {out_dir}")
+        
         print(f"\nData will be saved to: {out_dir}")
         print(f"  Format: Compressed tar.gz archives (one per episode)")
     
     # Initialize PS5 controller
     ps5 = None
-    # Initialize PS5 controller
-    print("\n[Init] Initializing PS5 controller...")
     if not PYGAME_AVAILABLE:
         print("[Error] pygame not available. Please install: pip install pygame")
         sys.exit(1)
@@ -1923,28 +1994,21 @@ def main():
     
     def init_imu():
         """Initialize IMU handler (includes gyroscope calibration)."""
-        print("\n[Init] Initializing IMU handler (gyroscope calibration)...")
-        print("[Init] ⚠ Keep the PS5 controller STILL during calibration!")
+        print("\n⚠ Keep the PS5 controller STILL during IMU calibration!")
         handler = RawIMUHandler()
-        print("[Init] ✓ IMU handler initialized and calibrated")
         return handler
     
     def init_arm():
         """Initialize and enable Piper arm."""
-        print("\n[Init] Connecting to Piper arm...")
         arm = PiperController(args.can_interface)
         arm._speed_percent = args.speed
         
         if not arm.connect():
             raise RuntimeError("Failed to connect to Piper arm")
         
-        print("[Init] Enabling arm motors...")
         if not arm.enable():
             arm.disconnect()
             raise RuntimeError("Failed to enable Piper arm")
-        
-        # Print current enable status for debugging
-        arm._print_enable_status()
         
         return arm
     
@@ -1955,7 +2019,6 @@ def main():
         if args.record:
             # Front camera (required for recording)
             front_cam_id = normalize_camera_value(args.front_cam)
-            print(f"\n[Init] Starting front camera: {front_cam_id}")
             cams["fixed"] = CameraCapture(front_cam_id, args.image_width, args.image_height, name="front")
             if not cams["fixed"].start():
                 raise RuntimeError(f"Front camera failed to start: {front_cam_id}")
@@ -1964,7 +2027,6 @@ def main():
             wrist_cam_id = normalize_camera_value(args.wrist_cam)
             wrist_cam_enabled = is_camera_enabled(wrist_cam_id)
             if wrist_cam_enabled:
-                print(f"[Init] Starting wrist camera: {wrist_cam_id}")
                 cams["wrist"] = CameraCapture(wrist_cam_id, args.image_width, args.image_height, name="wrist")
                 if not cams["wrist"].start():
                     # Stop fixed cam before raising
@@ -1978,23 +2040,16 @@ def main():
                 
         elif args.show_camera and CV2_AVAILABLE:
             # Just display camera, no recording
-            print("\n[Init] Starting camera for display...")
             cams["display"] = CameraCapture(args.camera_id, name="display")
             if not cams["display"].start():
-                print("[Init] ⚠ Camera failed to start, continuing without display")
                 cams["display"] = None
         
-        print("[Init] ✓ Cameras initialized")
         return cams
     
     def init_force_estimator():
         """Initialize force estimator (without calibration - that needs arm at home)."""
         if not FORCE_ESTIMATOR_AVAILABLE:
-            print("\n[Init] Force estimator not available, skipping")
             return None
-        
-        print("\n[Init] Creating force estimator with analytical gravity model...")
-        print(f"[Init] Using gripper mass: {args.gripper_mass} kg")
         
         # Create force estimator with analytical gravity model
         # This uses physics parameters from verified MuJoCo model (piper_no_gripper.xml)
@@ -2004,7 +2059,6 @@ def main():
             gripper_mass=args.gripper_mass,  # 可自定义夹爪质量
             use_model_gravity=True,  # Use analytical gravity model
         )
-        print("[Init] ✓ Force estimator created (calibration pending)")
         return estimator
     
     # Run all initializations in parallel (4 tasks now)
@@ -2055,7 +2109,6 @@ def main():
         sys.exit(1)
     
     # Verify arm is truly ready before proceeding
-    print("\n[Init] Verifying arm is ready...")
     if not piper.wait_until_ready(timeout=10.0):
         print("[Error] Arm failed to initialize properly")
         print("[Error] Try: 1) Power cycle the arm, 2) Check CAN connection")
@@ -2064,7 +2117,7 @@ def main():
         sys.exit(1)
     
     # Go to home position
-    print("\n[Init] Going to home position...")
+    print("\nInitializing arm (going to home position)...")
     piper.go_to_home()
     time.sleep(2.0)
     
@@ -2073,7 +2126,6 @@ def main():
     time.sleep(0.5)
     
     # Wait for motion to complete and arm to settle
-    print("[Init] Waiting for arm to settle at home position...")
     time.sleep(1.0)
     
     # Verify arm is still ready after motion
@@ -2082,25 +2134,20 @@ def main():
     
     # Calibrate force estimator at home position (estimator was created in parallel)
     if force_estimator is not None:
-        print("\n[Init] Calibrating force estimator at home position...")
-        
         if force_estimator.calibrate_gravity_from_piper(piper.piper):
             # Reset filter after calibration to avoid initial transients
             force_estimator.reset_filter()
-            print("[Init] ✓ Force estimator calibrated")
             
-            # Verify calibration by checking current force reading
+            # Check for large bias which might need user attention
             test_force = force_estimator.estimate_force_from_piper(
                 piper.piper, use_filter=False, use_gravity_comp=True
             )
-            if test_force is not None:
-                print(f"[Init]   Initial force: Fx={test_force[0]:.2f}, Fy={test_force[1]:.2f}, Fz={test_force[2]:.2f} N")
-                if abs(test_force[2]) > 5.0:
-                    print(f"[Init] ⚠ Warning: Fz bias = {test_force[2]:.2f}N is large!")
-                    print(f"[Init]   Consider adjusting --gripper_mass (current: {args.gripper_mass} kg)")
-                    print(f"[Init]   Estimated mass correction: {-test_force[2]/9.8:.2f} kg")
+            if test_force is not None and abs(test_force[2]) > 5.0:
+                print(f"[Warning] Force Fz bias = {test_force[2]:.2f}N is large!")
+                print(f"  Consider adjusting --gripper_mass (current: {args.gripper_mass} kg)")
+                print(f"  Estimated mass correction: {-test_force[2]/9.8:.2f} kg")
         else:
-            print("[Init] ⚠ Force calibration failed, using model-only gravity compensation")
+            print("[Warning] Force calibration failed, using model-only gravity compensation")
     
     # Create teleoperation controller
     teleop = TeleoperationController(
@@ -2118,11 +2165,9 @@ def main():
     )
     teleop.start()
     
-    if args.record:
-        print(f"[Main] Recording at {teleop._record_freq:.1f} Hz (every {teleop._record_interval} control steps)")
-    
     # Track saved episodes
-    saved_episodes = 0
+    saved_episodes = 0  # Episodes saved in this session
+    total_episodes = len(existing_episodes)  # Total episodes in directory
     prev_recording_state = False  # Track recording state changes
     
     # Initialize background saver for non-blocking data saving
@@ -2156,7 +2201,8 @@ def main():
                     episode.success = True
                     bg_saver.save_episode(episode, out_dir)  # Non-blocking
                     saved_episodes += 1
-                    print(f"[Main] ✓ Episode {saved_episodes} queued for saving!")
+                    total_episodes += 1
+                    print(f"[Main] ✓ Episode saved! (session: {saved_episodes}, total: {total_episodes})")
                 teleop._current_episode = None
             
             # Show camera if available
@@ -2200,6 +2246,16 @@ def main():
     except KeyboardInterrupt:
         print("\n[Main] Interrupted by user")
     
+    except RuntimeError as e:
+        # Camera error or other runtime error - print and exit gracefully
+        print(str(e))
+        print("\n[Main] ⚠ Stopping due to camera error...")
+        # Discard current episode (don't save incomplete data)
+        if args.record and teleop._recording:
+            teleop._recording = False
+            teleop._current_episode = None
+            print("[Main] ⚠ Current episode DISCARDED (camera data missing)")
+    
     finally:
         print("\n[Main] Cleaning up...")
         teleop.stop()
@@ -2242,30 +2298,78 @@ def main():
         
         # Save metadata if recording
         if args.record and out_dir:
+            # Re-scan directory to get all episodes (existing + new)
+            all_episode_ids = sorted([
+                f.stem.replace("episode_", "") 
+                for f in out_dir.glob("episode_*.tar.gz")
+            ])
+            total_episodes = len(all_episode_ids)
+            
+            # Load existing metadata if present, to preserve any fields
+            existing_metadata = {}
+            metadata_path = out_dir / "metadata.json"
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path, "r") as f:
+                        existing_metadata = json.load(f)
+                except Exception:
+                    pass
+            
+            # Update metadata with current settings and episode list
             metadata = {
+                # === Dataset Info ===
                 "collection_type": "teleop",
                 "control_mode": "ps5",
+                "robot": "piper",
+                "can_interface": args.can_interface,
+                
+                # === Data Format ===
                 "action_type": "relative_delta",
                 "action_description": "action[0:3] = delta_xyz (meters), action[3:7] = delta_quat (wxyz), action[7] = gripper_target (0-1)",
                 "ee_pose_description": "ee_pose[0:3] = xyz (meters), ee_pose[3:7] = quat (wxyz)",
                 "gripper_state_description": "normalized 0-1 (0=closed, 1=open)",
-                "num_episodes": saved_episodes,
-                "control_freq": args.control_freq,
-                "image_size": [args.image_height, args.image_width],
-                "home_position": list(HOME_POSITION),
+                "force_data_description": "joint_angles (rad), joint_torques (N·m), ee_force [Fx,Fy,Fz,Mx,My,Mz]",
+                
+                # === Episode Summary ===
+                "num_episodes": total_episodes,
+                "episode_ids": all_episode_ids,
+                "episodes_added_this_session": saved_episodes,
+                
+                # === Control Settings ===
+                "control_freq_hz": args.control_freq,
+                "record_freq_hz": args.record_freq,
+                "linear_scale_m_per_cycle": args.linear_scale,
+                "angular_scale_rad_per_cycle": args.angular_scale,
+                
+                # === Home Position ===
+                "home_position_m": list(HOME_POSITION),
                 "home_orientation_rad": list(HOME_ORIENTATION),
-                "linear_scale": args.linear_scale,
-                "angular_scale": args.angular_scale,
+                
+                # === Workspace Limits ===
+                "workspace_limits_m": WORKSPACE_LIMITS,
+                
+                # === Gripper Settings ===
+                "gripper_open_angle_deg": GRIPPER_OPEN_ANGLE,
+                "gripper_close_angle_deg": GRIPPER_CLOSE_ANGLE,
+                "gripper_mass_kg": args.gripper_mass,
+                
+                # === Camera Settings ===
+                "image_size_hw": [args.image_height, args.image_width],
                 "front_camera": str(args.front_cam),
                 "wrist_camera": str(args.wrist_cam),
                 "wrist_camera_enabled": wrist_cam is not None,
+                
+                # === Timestamps ===
+                "created": existing_metadata.get("created", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             
-            with open(out_dir / "metadata.json", "w") as f:
+            with open(metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
             
             print(f"\n[Main] Data collection complete!")
-            print(f"  Episodes saved: {saved_episodes}")
+            print(f"  Episodes saved this session: {saved_episodes}")
+            print(f"  Total episodes in directory: {total_episodes}")
             print(f"  Output directory: {out_dir}")
         
         print("[Main] Done!")

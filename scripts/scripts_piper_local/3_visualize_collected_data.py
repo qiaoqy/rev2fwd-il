@@ -141,7 +141,7 @@ def load_episode_data(episode_path: Union[Path, str], is_teleop: bool = False) -
         - ee_force: (T, 6) array [Fx,Fy,Fz,Mx,My,Mz] (optional, scripted data only)
         - has_force_data: bool - whether force data is available
         - success: bool
-        - episode_id: int
+        - episode_id: int or str (timestamp format YYYYMMDD_HHMMSS_ffffff)
         - is_teleop: bool
     """
     episode_path = Path(episode_path)
@@ -204,13 +204,28 @@ def _load_episode_from_directory(episode_dir: Path, is_teleop: bool = False) -> 
     
     data = np.load(npz_path, allow_pickle=True)
     
+    # Handle episode_id: can be int (old format) or str (new timestamp format)
+    raw_episode_id = data['episode_id']
+    if isinstance(raw_episode_id, np.ndarray):
+        raw_episode_id = raw_episode_id.item()  # Extract scalar from 0-d array
+    # Try to convert to int if it looks like an integer, otherwise keep as string
+    try:
+        if isinstance(raw_episode_id, str) and raw_episode_id.isdigit():
+            episode_id = int(raw_episode_id)
+        elif isinstance(raw_episode_id, (int, np.integer)):
+            episode_id = int(raw_episode_id)
+        else:
+            episode_id = str(raw_episode_id)  # Keep timestamp string format
+    except (ValueError, TypeError):
+        episode_id = str(raw_episode_id)
+    
     result = {
         'ee_pose': data['ee_pose'],
         'action': data['action'],
         'gripper_state': data['gripper_state'],
         'timestamp': data['timestamp'],
         'success': bool(data['success']),
-        'episode_id': int(data['episode_id']),
+        'episode_id': episode_id,
         'num_timesteps': int(data['num_timesteps']),
         'is_teleop': is_teleop,
     }
@@ -397,7 +412,7 @@ def create_xyz_curve_frame(
     action_integrated: np.ndarray,
     current_t: int,
     total_t: int,
-    episode_id: int,
+    episode_id: Union[int, str],
     fsm_state: int,
     is_teleop: bool = False,
     joint_torques: np.ndarray = None,
@@ -435,8 +450,15 @@ def create_xyz_curve_frame(
     fsm_name = FSM_STATE_NAMES.get(fsm_state, f"UNKNOWN({fsm_state})")
     mode_str = "TELEOP" if is_teleop else "SCRIPTED"
     force_str = " | FORCE" if has_force_data else ""
+    # Format episode_id for display (truncate timestamp to show only time part)
+    if isinstance(episode_id, str) and len(episode_id) > 15:
+        # Format: YYYYMMDD_HHMMSS_ffffff -> show as HH:MM:SS
+        ep_display = episode_id[9:15]  # Extract HHMMSS
+        ep_display = f"{ep_display[:2]}:{ep_display[2:4]}:{ep_display[4:6]}"
+    else:
+        ep_display = str(episode_id)
     fig.suptitle(
-        f"Episode {episode_id} | Frame {current_t}/{total_t} | {mode_str}{force_str} | {fsm_name}",
+        f"Episode {ep_display} | Frame {current_t}/{total_t} | {mode_str}{force_str} | {fsm_name}",
         fontsize=12, fontweight='bold'
     )
     
@@ -690,7 +712,7 @@ def compose_frame(
 def compose_frame_simple(
     fixed_img: Optional[np.ndarray],
     wrist_img: Optional[np.ndarray],
-    episode_id: int,
+    episode_id: Union[int, str],
     current_t: int,
     total_t: int,
     fsm_state: int,
@@ -708,12 +730,20 @@ def compose_frame_simple(
     fsm_name = FSM_STATE_NAMES.get(fsm_state, f"UNKNOWN({fsm_state})")
     mode_str = "TELEOP" if is_teleop else "SCRIPTED"
     
+    # Format episode_id for display (truncate timestamp to show only time part)
+    if isinstance(episode_id, str) and len(episode_id) > 15:
+        # Format: YYYYMMDD_HHMMSS_ffffff -> show as HH:MM:SS
+        ep_display = episode_id[9:15]  # Extract HHMMSS
+        ep_display = f"{ep_display[:2]}:{ep_display[2:4]}:{ep_display[4:6]}"
+    else:
+        ep_display = str(episode_id)
+    
     # Resize camera images
     if fixed_img is not None:
         fixed_resized = resize_image(fixed_img, cam_height)
         fixed_resized = add_text_overlay(
             fixed_resized, 
-            f"Ep{episode_id} | {current_t}/{total_t} | {mode_str} | {fsm_name}"
+            f"Ep{ep_display} | {current_t}/{total_t} | {mode_str} | {fsm_name}"
         )
     else:
         fixed_resized = create_placeholder_image(640, cam_height, "No Front Camera")
