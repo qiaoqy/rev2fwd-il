@@ -15,11 +15,13 @@ The goal is to perform a **Pick & Place** task with local data collection and fi
 5. [Script 0: System Test](#5-script-0-system-test)
 6. [Script 1: PS5 Teleoperation](#6-script-1-ps5-teleoperation)
 7. [Script 2: Data Visualization](#7-script-2-data-visualization)
-8. [Script 5: Model Evaluation](#8-script-5-model-evaluation)
-9. [Script 6: FSM Data Collection](#9-script-6-fsm-data-collection)
-10. [Safety Guidelines](#10-safety-guidelines)
-11. [Debugging Guide](#11-debugging-guide--known-issues)
-12. [TODO / Open Questions](#12-todo--open-questions)
+8. [Script 3: Time Reversal](#8-script-3-time-reversal)
+9. [Script 4: Train Diffusion Policy](#9-script-4-train-diffusion-policy)
+10. [Script 5: Model Evaluation](#10-script-5-model-evaluation)
+11. [Script 6: FSM Data Collection](#11-script-6-fsm-data-collection)
+12. [Safety Guidelines](#12-safety-guidelines)
+13. [Debugging Guide](#13-debugging-guide--known-issues)
+14. [TODO / Open Questions](#14-todo--open-questions)
 
 ---
 
@@ -349,14 +351,271 @@ python 2_visualize_collected_data.py --episode data/teleop_data/episode_0000.tar
 
 ---
 
-## 8. Script 5: Model Evaluation
+## 8. Script 3: Time Reversal
 
 ### 8.1 Overview
+
+`3_make_forward_data.py` creates **forward training data** by time-reversing teleop trajectories. This is the core of the **Rev2Fwd** method:
+
+- **Input**: Task B trajectories (e.g., place → pick) from Script 1
+- **Output**: Task A trajectories (e.g., pick → place) for policy training
+
+### 8.2 Core Algorithm
+
+```
+Original trajectory (Task B):
+  t=0      t=1      t=2      ...      t=T-1
+  pose[0] → pose[1] → pose[2] → ... → pose[T-1]
+  
+Reversed trajectory (Task A):
+  t=0          t=1          t=2          ...      t=T-1
+  pose[T-1] → pose[T-2] → pose[T-1] → ... → pose[0]
+```
+
+For **relative delta actions**, the reversal process:
+
+1. **Reverse all sequences** in time: `ee_pose`, `gripper_state`, images, etc.
+2. **Recompute relative actions** from the reversed `ee_pose`:
+   ```python
+   # Position delta
+   action_rev[t][:3] = ee_pose_rev[t+1][:3] - ee_pose_rev[t][:3]
+   
+   # Quaternion delta: rotation from quat[t] to quat[t+1]
+   action_rev[t][3:7] = quat_inverse(quat[t]) * quat[t+1]
+   
+   # Gripper target: the gripper state we're moving TO
+   action_rev[t][7] = gripper_state_rev[t+1]
+   ```
+3. **Verify** that integrating actions recovers the trajectory (error should be ~0)
+
+### 8.3 Usage
+
+```bash
+# Basic usage: reverse all episodes
+python 3_make_forward_data.py \
+    --input data/pick_place_piper \
+    --output data/pick_place_piper_A
+
+# Process only successful episodes
+python 3_make_forward_data.py \
+    --input data/pick_place_piper \
+    --output data/pick_place_piper_A \
+    --success_only
+
+# Verbose mode with detailed verification
+python 3_make_forward_data.py \
+    --input data/pick_place_piper \
+    --output data/pick_place_piper_A \
+    --verbose
+
+# Skip verification for faster processing
+python 3_make_forward_data.py \
+    --input data/pick_place_piper \
+    --output data/pick_place_piper_A \
+    --no_verify
+```
+
+### 8.4 Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--input`, `-i` | (required) | Input directory with teleop episodes (tar.gz) |
+| `--output`, `-o` | (required) | Output directory for reversed episodes |
+| `--success_only` | False | Only process episodes marked as successful |
+| `--verbose`, `-v` | False | Print detailed debug info for each episode |
+| `--verify` | True | Verify each reversal is correct |
+| `--no_verify` | False | Disable verification (faster) |
+
+### 8.5 Output Format
+
+The output maintains the **same format** as the input:
+- `episode_*.tar.gz` archives with identical structure
+- Updated `metadata.json` with:
+  - `collection_type`: `"reversed_teleop"`
+  - `reversed_from`: source directory path
+  - `reversal_timestamp`: when reversal was performed
+
+### 8.6 Verification
+
+The script automatically verifies each reversal:
+
+1. **Position check**: Original start == Reversed end (and vice versa)
+2. **Action integration**: Summing delta actions should reconstruct the trajectory
+3. **Gripper check**: Gripper states correctly reversed
+
+Expected integration error: **< 1e-6 meters** (numerical precision)
+
+---
+
+## 9. Script 4: Train Diffusion Policy
+
+### 9.1 Overview
+
+`4_train_diffusion.py` trains a vision-based **Diffusion Policy** using LeRobot on the teleoperation data collected by Script 1 (or time-reversed data from Script 3).
+
+**Key Features**:
+- Uses **relative delta actions** (position + quaternion + gripper)
+- Supports dual cameras (fixed + wrist) with automatic resolution alignment
+- LeRobot v3.0 dataset format with video encoding
+- Multi-GPU training support via `torchrun`
+- WandB logging integration
+
+### 9.2 Data Requirements
+
+The script expects data in the format produced by Script 1:
+
+```
+data/pick_place_piper/
+├── episode_0000.tar.gz
+├── episode_0001.tar.gz
+├── ...
+└── metadata.json
+```
+
+Each `episode_*.tar.gz` contains:
+```
+episode_XXXX/
+├── episode_data.npz    # Numeric data (ee_pose, action, gripper_state, etc.)
+├── fixed_cam/          # Front camera images (000000.png, ...)
+└── wrist_cam/          # Wrist camera images (000000.png, ...)
+```
+
+### 9.3 Action Format
+
+The script uses **8D relative delta actions**:
+
+| Index | Field | Description |
+|-------|-------|-------------|
+| 0-2 | `delta_xyz` | Position change in meters |
+| 3-6 | `delta_quat` | Quaternion change (qw, qx, qy, qz) |
+| 7 | `gripper` | Target gripper state [0-1] |
+
+### 9.4 Observation Format
+
+| Feature | Shape | Description |
+|---------|-------|-------------|
+| `observation.image` | (3, H, W) | Fixed camera RGB |
+| `observation.wrist_image` | (3, H, W) | Wrist camera RGB (optional) |
+| `observation.state` | (7,) or (8,) | EE pose (+ gripper if `--include_gripper`) |
+
+**Note**: If cameras have different resolutions, all images are resized to a common size (default: 240×320) during conversion.
+
+### 9.5 Usage Examples
+
+```bash
+# Basic training (single GPU)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_teleop \
+    --batch_size 64 --steps 50000 --wandb
+
+# With gripper state in observation (state_dim=8)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_teleop \
+    --include_gripper \
+    --batch_size 64 --steps 50000 --wandb
+
+# Custom image size (both cameras resized)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_teleop \
+    --image_size 240 320 \
+    --batch_size 64 --steps 50000 --wandb
+
+# Data conversion only (for debugging)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_teleop \
+    --convert_only
+
+# Multi-GPU training (4 GPUs)
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+    scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_teleop \
+    --batch_size 32 --steps 100000 --wandb
+
+# Resume training from checkpoint
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_teleop \
+    --resume --steps 100000
+
+# Overfit mode (1 episode for debugging)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper \
+    --out runs/diffusion_piper_overfit \
+    --overfit --steps 1000
+```
+
+### 9.6 Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--dataset` | `data/pick_place_piper` | Path to episode tar.gz files |
+| `--out` | `runs/diffusion_piper_teleop` | Output directory for checkpoints |
+| `--steps` | `100000` | Number of training steps |
+| `--batch_size` | `32` | Mini-batch size |
+| `--lr` | `1e-4` | Learning rate |
+| `--image_size` | `240 320` | Target image size (H, W) |
+| `--include_gripper` | `False` | Include gripper state in observation |
+| `--num_episodes` | `-1` | Number of episodes to use (-1 = all) |
+| `--convert_only` | `False` | Only convert data, don't train |
+| `--skip_convert` | `False` | Skip conversion (use existing dataset) |
+| `--force_convert` | `False` | Force re-conversion |
+| `--resume` | `False` | Resume from checkpoint |
+| `--overfit` | `False` | Overfit mode (1 episode) |
+| `--wandb` | `False` | Enable WandB logging |
+| `--wandb_project` | `piper-diffusion-teleop` | WandB project name |
+
+### 9.7 Diffusion Policy Architecture Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--n_obs_steps` | `2` | Number of observation steps |
+| `--horizon` | `16` | Diffusion horizon (action sequence length) |
+| `--n_action_steps` | `8` | Number of action steps to execute |
+| `--vision_backbone` | `resnet18` | Vision backbone architecture |
+| `--crop_shape` | `128 128` | Image crop shape |
+| `--num_train_timesteps` | `100` | Diffusion timesteps |
+
+### 9.8 Output Structure
+
+```
+runs/diffusion_piper_teleop/
+├── lerobot_dataset/           # Converted LeRobot dataset
+│   ├── data/
+│   ├── meta/
+│   └── videos/
+├── checkpoints/               # Training checkpoints
+│   └── checkpoints/
+│       ├── 020000/
+│       │   ├── model.safetensors
+│       │   └── pretrained_model/
+│       ├── 040000/
+│       └── last/              # Latest checkpoint
+└── .conversion_meta.json      # Metadata for distributed training
+```
+
+### 9.9 Training Tips
+
+1. **GPU Memory**: With ResNet18 backbone, batch_size=64 requires ~20GB VRAM
+2. **Training Time**: 50,000 steps ≈ 2-3 hours on RTX 4090
+3. **Checkpoints**: Saved every 20,000 steps by default (use `--save_freq` to change)
+4. **Validation Split**: Use `--val_split 0.1` for 10% validation set
+5. **XYZ Visualization**: Use `--enable_xyz_viz` to generate trajectory plots during training
+
+---
+
+## 10. Script 5: Model Evaluation
+
+### 10.1 Overview
 
 `5_eval_diffusion_piper.py` evaluates a trained diffusion policy on the real Piper arm:
 - **Task A**: Pick from **random table position** → Place at **plate center**
 
-### 8.2 Inference Pipeline
+### 10.2 Inference Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -377,7 +636,7 @@ python 2_visualize_collected_data.py --episode data/teleop_data/episode_0000.tar
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 Action Chunking
+### 10.3 Action Chunking
 
 The diffusion policy predicts **8-step action chunks**. Execution strategy:
 
@@ -391,7 +650,7 @@ current_action = action_chunk[step % n_action_steps]
 send_to_robot(current_action)
 ```
 
-### 8.4 Success Criteria
+### 10.4 Success Criteria
 
 An episode is considered **successful** if:
 1. The gripper closes on the object (object detected in grasp)
@@ -399,7 +658,7 @@ An episode is considered **successful** if:
 3. No emergency stop was triggered
 4. Episode completed within **max_steps** (default: 500)
 
-### 8.5 Command Line Interface
+### 10.5 Command Line Interface
 
 ```bash
 # Basic evaluation
@@ -420,7 +679,7 @@ python 5_eval_diffusion_piper.py \
     --seed 42
 ```
 
-### 8.6 Output
+### 10.6 Output
 
 ```
 runs/piper_diffusion/eval_videos/
@@ -445,23 +704,23 @@ runs/piper_diffusion/eval_videos/
 
 ---
 
-## 9. Script 6: FSM Data Collection
+## 11. Script 6: FSM Data Collection
 
-### 9.1 Overview
+### 11.1 Overview
 
 `6_collect_data_piper.py` collects **Task B** trajectories using a finite state machine (FSM) expert:
 - **Task B**: Pick from **plate center** → Place at **random table position**
 
 The collected trajectories will later be **time-reversed** to generate Task A training data.
 
-### 9.2 FSM State Diagram
+### 11.2 FSM State Diagram
 
 ```
 IDLE → GO_TO_HOME → HOVER_PLATE → LOWER_GRASP → CLOSE_GRIP → LIFT_OBJECT 
      → HOVER_PLACE → LOWER_PLACE → OPEN_GRIP → LIFT_RETREAT → RETURN_HOME → DONE → IDLE
 ```
 
-### 9.3 Usage
+### 11.3 Usage
 
 ```bash
 # Basic usage with default cameras
@@ -479,7 +738,7 @@ python 6_collect_data_piper.py \
     --speed 20
 ```
 
-### 9.4 Keyboard Controls
+### 11.4 Keyboard Controls
 
 | Input         | Action                              |
 |---------------|-------------------------------------|
@@ -491,9 +750,9 @@ python 6_collect_data_piper.py \
 
 ---
 
-## 10. Safety Guidelines
+## 12. Safety Guidelines
 
-### 10.1 Pre-Flight Checklist
+### 12.1 Pre-Flight Checklist
 
 - [ ] CAN interface is properly configured and connected
 - [ ] Arm is powered on and in slave mode
@@ -502,7 +761,7 @@ python 6_collect_data_piper.py \
 - [ ] Cameras are connected and recognized
 - [ ] Object is placed on the plate
 
-### 10.2 Emergency Stop Procedures
+### 12.2 Emergency Stop Procedures
 
 1. **Software E-Stop**: Press `ESC` key → Arm freezes in place
 2. **Hardware E-Stop**: Press physical emergency stop button
@@ -514,7 +773,7 @@ python 6_collect_data_piper.py \
    python -c "from piper_sdk import *; p=C_PiperInterface_V2(); p.ConnectPort(); p.EnablePiper()"
    ```
 
-### 10.3 Workspace Limits (Soft Limits)
+### 12.3 Workspace Limits (Soft Limits)
 
 ```python
 # Enforce these limits in software to prevent collisions
@@ -527,9 +786,9 @@ WORKSPACE_LIMITS = {
 
 ---
 
-## 11. Debugging Guide & Known Issues
+## 13. Debugging Guide & Known Issues
 
-### 11.1 Critical Parameters to Calibrate
+### 13.1 Critical Parameters to Calibrate
 
 | Parameter | Location | Issue | How to Calibrate |
 |-----------|----------|-------|------------------|
@@ -538,7 +797,7 @@ WORKSPACE_LIMITS = {
 | `GRASP_HEIGHT` | Both scripts | `0.15m` may be too high/low | Adjust based on object height |
 | `GRIPPER_OPEN_POS` | Both scripts | `70000` (70mm) may not match your gripper | Check SDK docs or test with `piper.GetArmGripperMsgs()` |
 
-### 11.2 Known Issues & Bugs
+### 13.2 Known Issues & Bugs
 
 #### Script 6: FSM Data Collection
 
@@ -582,9 +841,7 @@ WORKSPACE_LIMITS = {
    - Manual `/ 255.0` normalization in `build_observation()` may conflict with preprocessor
    - Check if preprocessor already handles image normalization
 
-### 11.3 Pre-Run Checklist
-
-```bash
+### 13.3 Pre-Run Checklist
 # 1. Test CAN connection
 python -c "from piper_sdk import *; p=C_PiperInterface_V2('can0'); p.ConnectPort(); print('OK')"
 
@@ -616,7 +873,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 "
 ```
 
-### 11.4 Recommended Debugging Steps
+### 13.4 Recommended Debugging Steps
 
 1. **First run with arm disabled** (comment out `piper.connect()`)
    - Verify cameras work
@@ -644,12 +901,12 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 
 ---
 
-## 12. TODO / Open Questions
+## 14. TODO / Open Questions
 
 - [ ] Determine exact home position by reading from `piper_ctrl_go_zero.py`
 - [ ] Calibrate camera intrinsics if needed for future visual servoing
 - [ ] Tune gripper force parameters for reliable grasping
-- [ ] Add support for LeRobot dataset format conversion
+- [x] ~~Add support for LeRobot dataset format conversion~~ (Done: Script 4)
 - [ ] Add object detection for better success criteria
 - [ ] Test on Windows (CAN interface compatibility)
 - [ ] Add teleoperation mode for manual data collection fallback

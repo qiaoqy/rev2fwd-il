@@ -1,0 +1,1272 @@
+#!/usr/bin/env python3
+"""Step 4: Train Diffusion Policy using LeRobot.
+
+This script trains a vision-based Diffusion Policy on the teleoperation data
+collected by script 1 (1_teleop_ps5_controller.py).
+
+=============================================================================
+INPUT DATA FORMAT (from script 1)
+=============================================================================
+Data directory containing episode_*.tar.gz files and metadata.json.
+
+Each episode tar.gz contains:
+    episode_XXXX/
+        episode_data.npz    # Numeric data
+        fixed_cam/          # Front camera images (000000.png, ...)
+        wrist_cam/          # Wrist camera images (000000.png, ...)
+
+episode_data.npz structure:
+    - ee_pose:       (T, 7)   EE poses [x, y, z, qw, qx, qy, qz] in meters/radians
+    - gripper_state: (T,)     Gripper state [0-1] (0=closed, 1=open)
+    - action:        (T, 8)   RELATIVE actions [delta_xyz, delta_quat, gripper_target]
+    - timestamp:     (T,)     Timestamps
+    - joint_angles:  (T, 6)   Joint angles in radians
+    - joint_torques: (T, 6)   Joint torques in N·m
+    - ee_force:      (T, 6)   End-effector force [Fx,Fy,Fz,Mx,My,Mz]
+    - success:       bool     Whether episode was successful
+    - episode_id:    str      Unique episode identifier
+
+=============================================================================
+OBSERVATION STATE DIMENSION OPTIONS
+=============================================================================
+The observation.state can include different combinations of features:
+
+  Flags                      | state_dim | Components
+  ---------------------------|-----------|---------------------------
+  (none)                     |     7     | ee_pose(7)
+  --include_gripper          |     8     | ee_pose(7) + gripper(1)
+
+Default: state_dim=7 (ee_pose only)
+
+=============================================================================
+ACTION FORMAT (Relative Delta)
+=============================================================================
+The action output is 8D relative delta:
+    [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
+
+Where:
+    - delta_xyz: Position change in meters
+    - delta_quat: Quaternion change (w, x, y, z)
+    - gripper_target: Target gripper state [0-1]
+
+=============================================================================
+IMAGE HANDLING
+=============================================================================
+If fixed camera and wrist camera have different resolutions, all images are
+resized to a common size (default: 240x320) during conversion to ensure
+compatibility with the diffusion policy's multi-camera stacking.
+
+=============================================================================
+USAGE EXAMPLES
+=============================================================================
+# Basic training
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/diffusion_piper_teleop \
+    --batch_size 64 --steps 50000 --wandb
+
+# With gripper in observation (state_dim=8)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/diffusion_piper_teleop \
+    --batch_size 64 --steps 50000 \
+    --include_gripper --wandb
+
+# Custom image size (both cameras resized to this)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/diffusion_piper_teleop \
+    --image_size 240 320 \
+    --batch_size 64 --steps 50000 --wandb
+
+# Data conversion only (for debugging)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/diffusion_piper_teleop \
+    --convert_only
+
+# Multi-GPU training
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/diffusion_piper_teleop \
+    --batch_size 32 --steps 20000 --include_gripper --wandb
+
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import multiprocessing as mp
+import os
+import shutil
+import sys
+import tarfile
+import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+# Suppress verbose output from video encoders
+os.environ["AV_LOG_LEVEL"] = "quiet"
+os.environ["SVT_LOG"] = "0"
+os.environ["FFMPEG_LOG_LEVEL"] = "quiet"
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train Diffusion Policy on Piper teleoperation data with relative actions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # =========================================================================
+    # Input/Output Arguments
+    # =========================================================================
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="data/pick_place_piper_A",
+        help="Path to the data directory containing episode_*.tar.gz files.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="runs/diffusion_piper_teleop",
+        help="Output directory for saving model checkpoints and logs.",
+    )
+    parser.add_argument(
+        "--lerobot_dataset_dir",
+        type=str,
+        default=None,
+        help="Directory to save the converted LeRobot dataset. "
+             "If not specified, uses {out}/lerobot_dataset.",
+    )
+
+    # =========================================================================
+    # Mode Selection
+    # =========================================================================
+    parser.add_argument(
+        "--convert_only",
+        action="store_true",
+        help="Only convert data to LeRobot format, don't train.",
+    )
+    parser.add_argument(
+        "--skip_convert",
+        action="store_true",
+        help="Skip data conversion (assume already converted).",
+    )
+    parser.add_argument(
+        "--force_convert",
+        action="store_true",
+        help="Force re-conversion even if dataset exists.",
+    )
+    parser.add_argument(
+        "--include_gripper",
+        action="store_true",
+        help="Include gripper state (1D) in observation.state. "
+             "If enabled, state includes gripper open/close state. Default: False.",
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        default=[240, 320],
+        help="Target image size (H, W) for both cameras. Images will be resized "
+             "to this size during conversion. Default: 240 320.",
+    )
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    parser.add_argument(
+        "--num_episodes",
+        type=int,
+        default=-1,
+        help="Number of episodes to use for training. Default: -1 (use all episodes).",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=100000,
+        help="Number of training steps. Default: 100000.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Mini-batch size for training. Default: 32.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for Adam optimizer. Default: 1e-4.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducibility. Default: 0.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of dataloader workers. Default: 4.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=20,
+        help="Frames per second of the dataset. Default: 20.",
+    )
+    parser.add_argument(
+        "--convert_workers",
+        type=int,
+        default=-1,
+        help="Number of parallel workers for data conversion. "
+             "-1 means auto (min of cpu_count, num_episodes, 16). Default: -1.",
+    )
+
+    # =========================================================================
+    # Diffusion Policy Architecture
+    # =========================================================================
+    parser.add_argument(
+        "--n_obs_steps",
+        type=int,
+        default=2,
+        help="Number of observation steps. Default: 2.",
+    )
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=16,
+        help="Diffusion horizon (action sequence length). Default: 16.",
+    )
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=8,
+        help="Number of action steps to execute. Default: 8.",
+    )
+    parser.add_argument(
+        "--vision_backbone",
+        type=str,
+        default="resnet18",
+        help="Vision backbone architecture. Default: resnet18.",
+    )
+    parser.add_argument(
+        "--crop_shape",
+        type=int,
+        nargs=2,
+        default=[128, 128],
+        help="Image crop shape (H, W). Default: 128 128.",
+    )
+    parser.add_argument(
+        "--num_train_timesteps",
+        type=int,
+        default=100,
+        help="Number of diffusion timesteps. Default: 100.",
+    )
+    parser.add_argument(
+        "--pretrained_backbone_weights",
+        type=str,
+        default=None,
+        help="Pretrained weights for vision backbone. Default: None.",
+    )
+
+    # =========================================================================
+    # Logging and Checkpointing
+    # =========================================================================
+    parser.add_argument(
+        "--log_freq",
+        type=int,
+        default=50,
+        help="Log metrics every N steps. Default: 50.",
+    )
+    parser.add_argument(
+        "--save_freq",
+        type=int,
+        default=20000,
+        help="Save checkpoint every N steps. Default: 20000.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from checkpoint.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overwrite existing checkpoints. Default: True. Use --no-overwrite to disable.",
+    )
+    parser.add_argument(
+        "--viz_save_freq",
+        type=int,
+        default=20000,
+        help="Save XYZ visualization every N steps. Default: 20000.",
+    )
+    parser.add_argument(
+        "--enable_xyz_viz",
+        action="store_true",
+        help="Enable XYZ curve visualization during training.",
+    )
+
+    # =========================================================================
+    # Overfit Mode
+    # =========================================================================
+    parser.add_argument(
+        "--overfit",
+        action="store_true",
+        help="Enable overfit mode: use only 1 episode. Automatically sets num_episodes=1.",
+    )
+
+    # =========================================================================
+    # Device Selection
+    # =========================================================================
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device ('cuda' or 'cpu'). Auto-detect if not specified.",
+    )
+
+    # =========================================================================
+    # WandB Logging
+    # =========================================================================
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="piper-diffusion-teleop",
+        help="WandB project name. Default: piper-diffusion-teleop.",
+    )
+
+    # =========================================================================
+    # Validation Set
+    # =========================================================================
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.0,
+        help="Fraction of episodes for validation (0.0 to 1.0). Default: 0.0.",
+    )
+    parser.add_argument(
+        "--val_freq",
+        type=int,
+        default=500,
+        help="Compute validation loss every N steps. Default: 500.",
+    )
+
+    return parser.parse_args()
+
+
+def load_episode_from_archive(archive_path: Path) -> dict:
+    """Load episode data from tar.gz archive.
+    
+    Args:
+        archive_path: Path to tar.gz archive (e.g., episode_XXXX.tar.gz)
+        
+    Returns:
+        Dictionary containing episode data with:
+        - ee_pose: (T, 7) array [x, y, z, qw, qx, qy, qz]
+        - action: (T, 8) array [delta_xyz, delta_quat, gripper]
+        - gripper_state: (T,) array
+        - images: list of (H, W, 3) arrays (fixed camera)
+        - wrist_images: list of (H, W, 3) arrays or None
+        - success: bool
+        - episode_id: str
+        - num_timesteps: int
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        
+        # Extract archive
+        with tarfile.open(archive_path, 'r:gz') as tar:
+            tar.extractall(temp_path)
+        
+        # Find the episode directory inside the extracted content
+        extracted_dirs = list(temp_path.iterdir())
+        if len(extracted_dirs) == 1 and extracted_dirs[0].is_dir():
+            episode_dir = extracted_dirs[0]
+        else:
+            # Assume the episode name matches the archive name
+            episode_name = archive_path.stem.replace('.tar', '')
+            episode_dir = temp_path / episode_name
+        
+        if not episode_dir.exists():
+            raise FileNotFoundError(f"Could not find episode directory in archive: {archive_path}")
+        
+        # Load npz data
+        npz_path = episode_dir / "episode_data.npz"
+        if not npz_path.exists():
+            raise FileNotFoundError(f"Episode data not found: {npz_path}")
+        
+        data = np.load(npz_path, allow_pickle=True)
+        
+        # Extract numeric data
+        result = {
+            'ee_pose': data['ee_pose'].astype(np.float32),
+            'action': data['action'].astype(np.float32),
+            'gripper_state': data['gripper_state'].astype(np.float32),
+            'success': bool(data['success']),
+            'episode_id': str(data['episode_id'].item() if data['episode_id'].ndim == 0 else data['episode_id']),
+            'num_timesteps': int(data['num_timesteps']),
+        }
+        
+        T = result['num_timesteps']
+        
+        # Load images from fixed_cam
+        fixed_cam_dir = episode_dir / "fixed_cam"
+        images = []
+        for i in range(T):
+            img_path = fixed_cam_dir / f"{i:06d}.png"
+            if img_path.exists():
+                img = cv2.imread(str(img_path))
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                images.append(img)
+            else:
+                raise FileNotFoundError(f"Missing image: {img_path}")
+        result['images'] = images
+        
+        # Load wrist camera images if available
+        wrist_cam_dir = episode_dir / "wrist_cam"
+        if wrist_cam_dir.exists():
+            wrist_images = []
+            for i in range(T):
+                img_path = wrist_cam_dir / f"{i:06d}.png"
+                if img_path.exists():
+                    img = cv2.imread(str(img_path))
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    wrist_images.append(img)
+                else:
+                    # Missing wrist image, set to None
+                    wrist_images.append(None)
+            # Only keep if all images are present
+            if all(img is not None for img in wrist_images):
+                result['wrist_images'] = wrist_images
+            else:
+                result['wrist_images'] = None
+        else:
+            result['wrist_images'] = None
+        
+        return result
+
+
+def _load_episode_worker(archive_path: Path) -> dict:
+    """Worker function for parallel episode loading.
+    
+    This is a top-level function to be picklable for multiprocessing.
+    """
+    return load_episode_from_archive(archive_path)
+
+
+def load_episodes_from_data_dir(
+    data_dir: Path, 
+    num_episodes: int = -1,
+    num_workers: int = -1,
+) -> list[dict]:
+    """Load episodes from data directory containing tar.gz archives.
+    
+    Args:
+        data_dir: Path to data directory (e.g., data/pick_place_piper)
+        num_episodes: Number of episodes to load. -1 means load all.
+        num_workers: Number of parallel workers. -1 means auto (cpu_count).
+        
+    Returns:
+        List of episode dictionaries.
+    """
+    data_dir = Path(data_dir)
+    
+    # Find all episode archives
+    episode_files = sorted(data_dir.glob("episode_*.tar.gz"))
+    
+    if len(episode_files) == 0:
+        raise FileNotFoundError(f"No episode archives found in {data_dir}")
+    
+    total_episodes = len(episode_files)
+    
+    # Limit number of episodes if specified
+    if num_episodes > 0:
+        episode_files = episode_files[:num_episodes]
+    
+    # Determine number of workers
+    if num_workers == -1:
+        num_workers = min(mp.cpu_count(), len(episode_files), 16)  # Cap at 16 workers
+    num_workers = max(1, num_workers)
+    
+    print(f"Loading {len(episode_files)}/{total_episodes} episodes from {data_dir} "
+          f"using {num_workers} workers...")
+    
+    start_time = time.time()
+    
+    if num_workers == 1:
+        # Serial loading (fallback)
+        episodes = []
+        for i, archive_path in enumerate(episode_files):
+            if (i + 1) % 10 == 0 or i == 0:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(episode_files) - i - 1) / rate if rate > 0 else 0
+                print(f"  [{i + 1}/{len(episode_files)}] Loading {archive_path.name} | "
+                      f"{rate:.1f} ep/s | ETA: {eta:.0f}s")
+            episode = load_episode_from_archive(archive_path)
+            episodes.append(episode)
+    else:
+        # Parallel loading using ProcessPoolExecutor
+        episodes = [None] * len(episode_files)
+        completed = 0
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks with their indices
+            future_to_idx = {
+                executor.submit(_load_episode_worker, path): idx 
+                for idx, path in enumerate(episode_files)
+            }
+            
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    episodes[idx] = future.result()
+                    completed += 1
+                    
+                    # Progress update
+                    if completed % 10 == 0 or completed == 1 or completed == len(episode_files):
+                        elapsed = time.time() - start_time
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        eta = (len(episode_files) - completed) / rate if rate > 0 else 0
+                        print(f"  [{completed}/{len(episode_files)}] Loaded | "
+                              f"{rate:.1f} ep/s | ETA: {eta:.0f}s")
+                except Exception as e:
+                    print(f"  Error loading episode {idx}: {e}")
+                    raise
+    
+    load_time = time.time() - start_time
+    total_frames = sum(ep['num_timesteps'] for ep in episodes)
+    print(f"Loaded {len(episodes)} episodes ({total_frames} frames) in {load_time:.1f}s "
+          f"({len(episodes)/load_time:.1f} ep/s with {num_workers} workers)")
+    
+    return episodes
+
+
+def convert_episodes_to_lerobot_format(
+    data_dir: str,
+    output_dir: str,
+    fps: int = 20,
+    repo_id: str = "local/piper_teleop",
+    force: bool = False,
+    num_episodes: int = -1,
+    include_gripper: bool = False,
+    target_image_size: tuple[int, int] = (240, 320),
+    num_workers: int = -1,
+) -> tuple[int, int, bool]:
+    """Convert episode data to LeRobot v3.0 format.
+    
+    Args:
+        data_dir: Path to data directory with episode archives.
+        output_dir: Directory to save LeRobot dataset.
+        fps: Frames per second.
+        repo_id: Repository ID for the dataset.
+        force: Force re-conversion even if dataset exists.
+        num_episodes: Number of episodes to use. -1 means use all.
+        include_gripper: Whether to include gripper state in observation.state.
+        target_image_size: Target (H, W) for all images. Images will be resized.
+        num_workers: Number of parallel workers for loading episodes. -1 = auto.
+        
+    Returns:
+        Tuple of (image_height, image_width, has_wrist_camera).
+    """
+    # Suppress verbose logging
+    logging.getLogger("imageio").setLevel(logging.ERROR)
+    logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)
+    logging.getLogger("av").setLevel(logging.ERROR)
+    
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    
+    output_dir = Path(output_dir)
+    data_dir = Path(data_dir)
+    
+    # Check if dataset already exists BEFORE loading
+    if output_dir.exists() and not force:
+        # Check if the dataset is complete (has valid metadata AND loadable data)
+        meta_path = output_dir / "meta" / "info.json"
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r") as f:
+                    info = json.load(f)
+                features = info.get("features", {})
+                if "observation.image" in features:
+                    img_shape = features["observation.image"]["shape"]  # (C, H, W)
+                    image_height, image_width = img_shape[1], img_shape[2]
+                else:
+                    image_height, image_width = 270, 320  # Default from metadata
+                has_wrist = "observation.wrist_image" in features
+                
+                # Verify dataset is actually loadable (check parquet files are valid)
+                print(f"Verifying existing dataset at {output_dir}...")
+                try:
+                    test_dataset = LeRobotDataset(
+                        repo_id=repo_id,
+                        root=output_dir,
+                    )
+                    # Quick sanity check - try to access first item
+                    if len(test_dataset) > 0:
+                        _ = test_dataset[0]
+                    del test_dataset
+                    
+                    # Dataset is valid
+                    print(f"LeRobot dataset already exists at {output_dir}")
+                    print("Skipping loading and conversion. Use --force_convert to re-convert.")
+                    print(f"  Loaded metadata: image=({image_height}, {image_width}), has_wrist={has_wrist}")
+                    return image_height, image_width, has_wrist
+                except Exception as load_error:
+                    print(f"Warning: Existing dataset has corrupted data files: {load_error}")
+                    print(f"  Removing incomplete dataset at {output_dir} and re-converting...")
+                    shutil.rmtree(output_dir)
+                    
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"Warning: Existing dataset has corrupted metadata: {e}")
+                print(f"  Removing incomplete dataset at {output_dir} and re-converting...")
+                shutil.rmtree(output_dir)
+        else:
+            # Dataset directory exists but no metadata - incomplete conversion
+            print(f"Warning: Found incomplete dataset at {output_dir} (no metadata)")
+            print(f"  Removing and re-converting...")
+            shutil.rmtree(output_dir)
+    
+    # Load episodes (using parallel workers)
+    episodes = load_episodes_from_data_dir(
+        data_dir, 
+        num_episodes=num_episodes,
+        num_workers=num_workers,
+    )
+    
+    if len(episodes) == 0:
+        raise ValueError(f"No episodes loaded from {data_dir}")
+    
+    # Get data dimensions from first episode
+    ep0 = episodes[0]
+    original_image_shape = np.array(ep0['images'][0]).shape  # (H, W, 3)
+    has_wrist = ep0.get('wrist_images') is not None
+    
+    # Use target image size for all cameras (ensures they can be stacked)
+    image_height, image_width = target_image_size
+    
+    # Check if wrist camera has different size
+    if has_wrist:
+        original_wrist_shape = np.array(ep0['wrist_images'][0]).shape
+        if original_wrist_shape[:2] != original_image_shape[:2]:
+            print(f"  NOTE: Fixed camera ({original_image_shape[:2]}) and wrist camera ({original_wrist_shape[:2]}) "
+                  f"have different sizes.")
+            print(f"        All images will be resized to ({image_height}, {image_width})")
+    
+    # State dimension
+    state_dim = 7  # ee_pose (7)
+    state_names = ["ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz"]
+    if include_gripper:
+        state_dim += 1
+        state_names.append("gripper")
+    
+    # Action dimension: 8 for relative delta
+    action_dim = 8
+    
+    # Remove existing dataset if force conversion
+    if output_dir.exists() and force:
+        print(f"Removing existing dataset at {output_dir}")
+        shutil.rmtree(output_dir)
+    
+    print(f"\n{'='*60}")
+    print("Converting episodes to LeRobot format (Relative Action)")
+    print(f"{'='*60}")
+    print(f"  Input: {data_dir}")
+    print(f"  Output: {output_dir}")
+    print(f"  FPS: {fps}")
+    print(f"  Original image shape: {original_image_shape} (H, W, C)")
+    print(f"  Target image size: ({image_height}, {image_width})")
+    if has_wrist:
+        print(f"  Original wrist camera shape: {original_wrist_shape}")
+        print(f"  Wrist images will be resized to: ({image_height}, {image_width})")
+    else:
+        print(f"  Wrist camera: disabled")
+    print(f"  State dim: {state_dim} (ee_pose" + (" + gripper" if include_gripper else "") + ")")
+    print(f"  Action dim: {action_dim} (relative delta)")
+    print(f"{'='*60}\n")
+    
+    # Define features for LeRobot dataset (using target size)
+    features = {
+        "observation.image": {
+            "dtype": "video",
+            "shape": (3, image_height, image_width),  # (C, H, W)
+            "names": ["channel", "height", "width"],
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (state_dim,),
+            "names": state_names,
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (action_dim,),
+            "names": ["delta_x", "delta_y", "delta_z", 
+                      "delta_qw", "delta_qx", "delta_qy", "delta_qz", 
+                      "gripper"],
+        },
+    }
+    
+    # Add wrist camera feature if available (using same target size)
+    if has_wrist:
+        features["observation.wrist_image"] = {
+            "dtype": "video",
+            "shape": (3, image_height, image_width),  # (C, H, W) - same as main camera
+            "names": ["channel", "height", "width"],
+        }
+    
+    # Create LeRobot dataset
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=fps,
+        features=features,
+        root=output_dir,
+        robot_type="piper",
+        use_videos=True,
+        image_writer_threads=4,
+    )
+    
+    # Process each episode
+    total_frames = 0
+    start_time = time.time()
+    num_episodes_total = len(episodes)
+    
+    # Determine print frequency
+    print_freq = max(1, num_episodes_total // 20)
+    
+    print(f"\nProcessing {num_episodes_total} episodes...")
+    
+    for ep_idx, ep in enumerate(episodes):
+        T = ep['num_timesteps']
+        
+        # Print progress
+        if num_episodes_total <= 50 or (ep_idx + 1) % print_freq == 0 or ep_idx == 0:
+            elapsed = time.time() - start_time
+            rate = (ep_idx / elapsed) if elapsed > 0 and ep_idx > 0 else 0
+            eta = (num_episodes_total - ep_idx) / rate if rate > 0 else 0
+            print(f"  [{ep_idx + 1}/{num_episodes_total}] Processing episode {ep_idx}, "
+                  f"{T} frames | {rate:.1f} ep/s | ETA: {eta:.0f}s")
+        
+        # Extract data
+        images = ep['images']  # list of (H, W, 3) uint8
+        ee_pose = ep['ee_pose']  # (T, 7)
+        actions = ep['action']  # (T, 8) - RELATIVE delta actions
+        gripper_states = ep['gripper_state']  # (T,)
+        wrist_images = ep.get('wrist_images', None)
+        
+        for t in range(T):
+            # Current observation - resize to target size
+            img = np.array(images[t])  # (H, W, 3)
+            if img.shape[0] != image_height or img.shape[1] != image_width:
+                img = cv2.resize(img, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
+            
+            # Build state
+            if include_gripper:
+                gripper_state = np.array([gripper_states[t]], dtype=np.float32)
+                state = np.concatenate([ee_pose[t], gripper_state])
+            else:
+                state = ee_pose[t]
+            
+            # Action: use relative delta directly from the dataset
+            action = actions[t]  # (8,) [delta_xyz, delta_quat, gripper]
+            
+            frame = {
+                "observation.image": img,
+                "observation.state": state.astype(np.float32),
+                "action": action.astype(np.float32),
+                "task": "piper_teleop",
+            }
+            
+            # Add wrist camera image if available - resize to same target size
+            if wrist_images is not None:
+                wrist_img = np.array(wrist_images[t])
+                if wrist_img.shape[0] != image_height or wrist_img.shape[1] != image_width:
+                    wrist_img = cv2.resize(wrist_img, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
+                frame["observation.wrist_image"] = wrist_img
+            
+            dataset.add_frame(frame)
+        
+        # Save episode
+        dataset.save_episode()
+        total_frames += T
+    
+    # Finalize dataset
+    print("\nFinalizing dataset (encoding videos)...")
+    dataset.finalize()
+    
+    elapsed = time.time() - start_time
+    print(f"\n{'='*60}")
+    print("Conversion Complete!")
+    print(f"{'='*60}")
+    print(f"  Total episodes: {len(episodes)}")
+    print(f"  Total frames: {total_frames}")
+    print(f"  Has wrist camera: {has_wrist}")
+    print(f"  Action type: relative delta")
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Dataset saved to: {output_dir}")
+    print(f"{'='*60}\n")
+    
+    return image_height, image_width, has_wrist
+
+
+def train_with_lerobot_api(
+    args: argparse.Namespace,
+    lerobot_dataset_dir: Path,
+    image_height: int,
+    image_width: int,
+    has_wrist: bool = False,
+    include_gripper: bool = False,
+    train_episodes: list[int] | None = None,
+    val_episodes: list[int] | None = None,
+) -> dict:
+    """Train using LeRobot's Python API.
+    
+    Args:
+        args: Parsed command-line arguments.
+        lerobot_dataset_dir: Path to LeRobot dataset.
+        image_height: Image height.
+        image_width: Image width.
+        has_wrist: Whether the dataset has wrist camera images.
+        include_gripper: Whether gripper state is included in observation.state.
+        train_episodes: List of episode indices for training (None = all).
+        val_episodes: List of episode indices for validation (None = no validation).
+        
+    Returns:
+        Dictionary with training results.
+    """
+    from lerobot.configs.default import DatasetConfig, WandBConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.scripts.lerobot_train import train
+    
+    # Try to import custom training with viz
+    try:
+        from rev2fwd_il.train.lerobot_train_with_viz import train_with_xyz_visualization
+        HAS_VIZ_TRAIN = True
+    except ImportError:
+        HAS_VIZ_TRAIN = False
+    
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if running in distributed mode
+    is_main_process = True
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        is_main_process = (local_rank == 0)
+    
+    # Handle overwrite: remove existing checkpoints directory
+    checkpoint_dir = out_dir / "checkpoints"
+    if is_main_process and args.overwrite and checkpoint_dir.exists() and not args.resume:
+        print(f"Removing existing checkpoints directory: {checkpoint_dir}")
+        shutil.rmtree(checkpoint_dir)
+    
+    # Sync all processes before continuing
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    
+    # Device selection
+    device = args.device
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Determine state dimension
+    state_dim = 7  # base: ee_pose (7)
+    if include_gripper:
+        state_dim += 1
+    
+    # Configure input/output features for the policy
+    input_features = {
+        "observation.image": PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(3, image_height, image_width),
+        ),
+        "observation.state": PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(state_dim,),
+        ),
+    }
+    
+    # Add wrist camera feature if available
+    if has_wrist:
+        input_features["observation.wrist_image"] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(3, image_height, image_width),
+        )
+    
+    output_features = {
+        "action": PolicyFeature(
+            type=FeatureType.ACTION,
+            shape=(8,),  # Relative delta action
+        ),
+    }
+    
+    # Create Diffusion Policy configuration
+    policy_cfg = DiffusionConfig(
+        n_obs_steps=args.n_obs_steps,
+        horizon=args.horizon,
+        n_action_steps=args.n_action_steps,
+        input_features=input_features,
+        output_features=output_features,
+        vision_backbone=args.vision_backbone,
+        crop_shape=tuple(args.crop_shape),
+        num_train_timesteps=args.num_train_timesteps,
+        pretrained_backbone_weights=args.pretrained_backbone_weights,
+        device=device,
+        push_to_hub=False,
+        optimizer_lr=args.lr,
+    )
+    
+    # Print normalization settings
+    print("\n" + "=" * 60)
+    print("[DEBUG] TRAINING Normalization Settings")
+    print("=" * 60)
+    print(f"  policy_cfg.normalization_mapping:")
+    for feat_type, norm_mode in policy_cfg.normalization_mapping.items():
+        print(f"    {feat_type}: {norm_mode}")
+    print("=" * 60 + "\n")
+    
+    # Create dataset configuration
+    dataset_cfg = DatasetConfig(
+        repo_id="local/piper_teleop",
+        root=str(lerobot_dataset_dir),
+        episodes=train_episodes,
+    )
+    
+    # Create validation dataset configuration if specified
+    val_dataset_cfg = None
+    if val_episodes is not None and len(val_episodes) > 0:
+        val_dataset_cfg = DatasetConfig(
+            repo_id="local/piper_teleop",
+            root=str(lerobot_dataset_dir),
+            episodes=val_episodes,
+        )
+    
+    # Create WandB configuration
+    wandb_cfg = WandBConfig(
+        enable=args.wandb,
+        project=args.wandb_project,
+        run_id=None,
+        mode=None,
+    )
+    
+    # Create training pipeline configuration
+    checkpoint_dir = out_dir / "checkpoints"
+    
+    # Handle resume
+    resume_config_path = None
+    if args.resume:
+        checkpoints_subdir = checkpoint_dir / "checkpoints"
+        if not checkpoints_subdir.exists():
+            raise FileNotFoundError(
+                f"Cannot resume: checkpoint directory {checkpoints_subdir} does not exist."
+            )
+        checkpoint_dirs = [d for d in checkpoints_subdir.iterdir() if d.is_dir()]
+        if not checkpoint_dirs:
+            raise FileNotFoundError(
+                f"Cannot resume: no checkpoints found in {checkpoints_subdir}."
+            )
+        
+        # Prefer 'last' checkpoint
+        last_checkpoint = checkpoints_subdir / "last"
+        if last_checkpoint.exists() and last_checkpoint.is_dir():
+            latest_checkpoint = last_checkpoint
+        else:
+            # Find numeric directories and pick the largest
+            numeric_dirs = [(int(d.name), d) for d in checkpoint_dirs if d.name.isdigit()]
+            if numeric_dirs:
+                numeric_dirs.sort(key=lambda x: x[0])
+                latest_checkpoint = numeric_dirs[-1][1]
+            else:
+                latest_checkpoint = sorted(checkpoint_dirs, key=lambda x: x.name)[-1]
+        
+        print(f"Resuming from checkpoint: {latest_checkpoint}")
+        
+        resume_config_path = latest_checkpoint / "pretrained_model" / "train_config.json"
+        if not resume_config_path.exists():
+            raise FileNotFoundError(f"Cannot resume: train_config.json not found at {resume_config_path}")
+        
+        print(f"Loading config from: {resume_config_path}")
+        
+        train_cfg = TrainPipelineConfig.from_pretrained(str(resume_config_path.parent))
+        train_cfg.resume = True
+        train_cfg.steps = args.steps
+        train_cfg.wandb = wandb_cfg
+        train_cfg.checkpoint_path = latest_checkpoint
+        train_cfg.policy.pretrained_path = latest_checkpoint / "pretrained_model"
+        train_cfg.dataset.root = str(lerobot_dataset_dir)
+        train_cfg.output_dir = checkpoint_dir
+        
+        print(f"  Will continue training to step {args.steps}")
+    else:
+        train_cfg = TrainPipelineConfig(
+            dataset=dataset_cfg,
+            policy=policy_cfg,
+            output_dir=checkpoint_dir,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            steps=args.steps,
+            log_freq=args.log_freq,
+            save_freq=args.save_freq,
+            save_checkpoint=True,
+            wandb=wandb_cfg,
+            resume=False,
+            eval_freq=0,
+        )
+    
+    # Print training info
+    print("\n" + "=" * 60)
+    print("Starting Diffusion Policy Training")
+    print("=" * 60)
+    print(f"  Dataset: {args.dataset}")
+    print(f"  LeRobot dataset: {lerobot_dataset_dir}")
+    print(f"  Output: {checkpoint_dir}")
+    print(f"  Steps: {args.steps}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Learning rate: {args.lr}")
+    print(f"  Image shape: ({image_height}, {image_width})")
+    print(f"  Has wrist camera: {has_wrist}")
+    print(f"  Include gripper: {include_gripper}")
+    print(f"  State dim: {state_dim}")
+    print(f"  Action dim: 8 (relative delta)")
+    print(f"  Crop shape: {tuple(args.crop_shape)}")
+    print(f"  Horizon: {args.horizon}")
+    print(f"  N obs steps: {args.n_obs_steps}")
+    print(f"  N action steps: {args.n_action_steps}")
+    print(f"  Vision backbone: {args.vision_backbone}")
+    print(f"  Device: {device}")
+    print(f"  WandB: {args.wandb}")
+    print(f"  XYZ visualization: {args.enable_xyz_viz}")
+    if train_episodes is not None:
+        print(f"  Train episodes: {len(train_episodes)}")
+    if val_episodes is not None:
+        print(f"  Val episodes: {len(val_episodes)}")
+    print("=" * 60 + "\n")
+    
+    # Run training
+    import sys
+    original_argv = sys.argv.copy()
+    if resume_config_path is not None:
+        sys.argv = [sys.argv[0], f"--config_path={resume_config_path}"]
+    
+    try:
+        if args.enable_xyz_viz and HAS_VIZ_TRAIN:
+            xyz_viz_dir = out_dir / "xyz_viz"
+            train_with_xyz_visualization(
+                train_cfg,
+                viz_save_freq=args.viz_save_freq,
+                xyz_viz_dir=xyz_viz_dir,
+                val_dataset_cfg=val_dataset_cfg,
+                val_freq=args.val_freq,
+            )
+        else:
+            if args.enable_xyz_viz and not HAS_VIZ_TRAIN:
+                print("Warning: XYZ visualization not available, using standard training")
+            train(train_cfg)
+    finally:
+        sys.argv = original_argv
+    
+    return {
+        "output_dir": str(checkpoint_dir),
+        "steps": args.steps,
+    }
+
+
+def main() -> None:
+    """Main entry point."""
+    args = _parse_args()
+    
+    # Handle overfit mode
+    if args.overfit:
+        if args.num_episodes != 1:
+            print(f"\n[Overfit Mode] Setting num_episodes=1 (was {args.num_episodes})")
+            args.num_episodes = 1
+    
+    # Set random seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Check if running in distributed mode
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_main_process = (local_rank == 0)
+    
+    # Setup paths
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    lerobot_dataset_dir = args.lerobot_dataset_dir
+    if lerobot_dataset_dir is None:
+        lerobot_dataset_dir = out_dir / "lerobot_dataset"
+    lerobot_dataset_dir = Path(lerobot_dataset_dir)
+    
+    # Step 1: Convert data to LeRobot format (only on main process)
+    # NOTE: We do NOT initialize distributed before conversion to avoid timeout issues.
+    # Data conversion can take a long time (>10 min), which would cause NCCL barrier timeout.
+    if not args.skip_convert:
+        if is_main_process:
+            # Remove stale conversion metadata from previous failed runs
+            meta_file = out_dir / ".conversion_meta.json"
+            if meta_file.exists():
+                meta_file.unlink()
+            
+            image_height, image_width, has_wrist = convert_episodes_to_lerobot_format(
+                data_dir=args.dataset,
+                output_dir=lerobot_dataset_dir,
+                fps=args.fps,
+                repo_id="local/piper_teleop",
+                force=args.force_convert,
+                num_episodes=args.num_episodes,
+                include_gripper=args.include_gripper,
+                target_image_size=tuple(args.image_size),
+                num_workers=args.convert_workers,
+            )
+            # Write metadata to temp file for other processes
+            meta_data = {
+                "image_height": image_height,
+                "image_width": image_width,
+                "has_wrist": has_wrist,
+                "include_gripper": args.include_gripper,
+                "conversion_done": True,
+            }
+            with open(meta_file, "w") as f:
+                json.dump(meta_data, f, indent=2)
+        else:
+            # Non-main processes wait for conversion to complete by polling the metadata file
+            meta_file = out_dir / ".conversion_meta.json"
+            print(f"[Rank {local_rank}] Waiting for rank 0 to finish data conversion...")
+            wait_start = time.time()
+            while True:
+                if meta_file.exists():
+                    try:
+                        with open(meta_file, "r") as f:
+                            meta = json.load(f)
+                        if meta.get("conversion_done", False):
+                            break
+                    except (json.JSONDecodeError, IOError):
+                        pass  # File may be partially written
+                time.sleep(5)  # Poll every 5 seconds
+                elapsed = time.time() - wait_start
+                if elapsed > 3600:  # 1 hour timeout
+                    raise TimeoutError(f"Waited {elapsed:.0f}s for data conversion, giving up.")
+            
+            image_height = meta["image_height"]
+            image_width = meta["image_width"]
+            has_wrist = meta["has_wrist"]
+            print(f"[Rank {local_rank}] Data conversion complete (waited {time.time() - wait_start:.1f}s)")
+    else:
+        # Skip conversion mode - read config from existing LeRobot dataset
+        meta_path = lerobot_dataset_dir / "meta" / "info.json"
+        if meta_path.exists():
+            print(f"[Skip Convert] Reading config from existing LeRobot dataset: {lerobot_dataset_dir}")
+            with open(meta_path, "r") as f:
+                info = json.load(f)
+            features = info.get("features", {})
+            
+            if "observation.image" in features:
+                img_shape = features["observation.image"]["shape"]  # (C, H, W)
+                image_height = img_shape[1]
+                image_width = img_shape[2]
+            else:
+                raise ValueError("observation.image not found in dataset features")
+            
+            has_wrist = "observation.wrist_image" in features
+            
+            print(f"  Image size: {image_height}x{image_width}")
+            print(f"  Has wrist camera: {has_wrist}")
+            print(f"  Total episodes: {info.get('total_episodes', 'unknown')}")
+            print(f"  Total frames: {info.get('total_frames', 'unknown')}")
+        else:
+            raise FileNotFoundError(
+                f"LeRobot dataset not found at {lerobot_dataset_dir}. "
+                f"Run without --skip_convert first."
+            )
+    
+    if args.convert_only:
+        if is_main_process:
+            print("Data conversion complete. Exiting (--convert_only flag).")
+        return
+    
+    # Initialize distributed process group AFTER data conversion is complete
+    # This avoids NCCL timeout issues during long-running conversions
+    if world_size > 1 and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl")
+    
+    # Compute train/val episode split
+    train_episodes = None
+    val_episodes = None
+    
+    if args.val_split > 0.0:
+        meta_path = lerobot_dataset_dir / "meta" / "info.json"
+        if meta_path.exists():
+            with open(meta_path, "r") as f:
+                info = json.load(f)
+            total_episodes = info.get("total_episodes", 0)
+        else:
+            total_episodes = 0
+        
+        if total_episodes > 0:
+            all_episode_indices = list(range(total_episodes))
+            rng = np.random.default_rng(args.seed)
+            rng.shuffle(all_episode_indices)
+            
+            n_val = max(1, int(total_episodes * args.val_split))
+            val_episodes = sorted(all_episode_indices[:n_val])
+            train_episodes = sorted(all_episode_indices[n_val:])
+            
+            if is_main_process:
+                print(f"\n{'='*60}")
+                print("Train/Val Split")
+                print(f"{'='*60}")
+                print(f"  Total episodes: {total_episodes}")
+                print(f"  Val split: {args.val_split:.1%}")
+                print(f"  Train episodes: {len(train_episodes)}")
+                print(f"  Val episodes: {len(val_episodes)}")
+                print(f"{'='*60}\n")
+    
+    # Step 2: Train the policy
+    result = train_with_lerobot_api(
+        args=args,
+        lerobot_dataset_dir=lerobot_dataset_dir,
+        image_height=image_height,
+        image_width=image_width,
+        has_wrist=has_wrist,
+        include_gripper=args.include_gripper,
+        train_episodes=train_episodes,
+        val_episodes=val_episodes,
+    )
+    
+    print("\n" + "=" * 60)
+    print("Training Complete!")
+    print("=" * 60)
+    print(f"  Output directory: {result['output_dir']}")
+    print(f"  Total steps: {result['steps']}")
+    print(f"  Action type: relative delta")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
