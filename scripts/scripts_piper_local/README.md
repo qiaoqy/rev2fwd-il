@@ -13,10 +13,13 @@ The goal is to perform a **Pick & Place** task with local data collection and fi
 3. [Coordinate System & Workspace](#3-coordinate-system--workspace)
 4. [Data Format Specification](#4-data-format-specification)
 5. [Script 0: System Test](#5-script-0-system-test)
-6. [Script 1: Data Collection](#6-script-1-data-collection)
-7. [Script 5: Model Evaluation](#7-script-5-model-evaluation)
-8. [Safety Guidelines](#8-safety-guidelines)
-9. [Debugging Guide](#9-debugging-guide--known-issues)
+6. [Script 1: PS5 Teleoperation](#6-script-1-ps5-teleoperation)
+7. [Script 2: Data Visualization](#7-script-2-data-visualization)
+8. [Script 5: Model Evaluation](#8-script-5-model-evaluation)
+9. [Script 6: FSM Data Collection](#9-script-6-fsm-data-collection)
+10. [Safety Guidelines](#10-safety-guidelines)
+11. [Debugging Guide](#11-debugging-guide--known-issues)
+12. [TODO / Open Questions](#12-todo--open-questions)
 
 ---
 
@@ -274,152 +277,86 @@ python 0_system_test.py --can can0 --front-cam 0 --wrist-cam 2 --speed 20
 
 ---
 
-## 6. Script 1: Data Collection
+## 6. Script 1: PS5 Teleoperation
 
 ### 6.1 Overview
 
-`1_collect_data_piper.py` collects **Task B** trajectories using a finite state machine (FSM) expert:
-- **Task B**: Pick from **plate center** → Place at **random table position**
+`1_teleop_ps5_controller.py` enables manual teleoperation of the Piper arm using a PS5 DualSense controller. This is the primary method for collecting demonstration data.
 
-The collected trajectories will later be **time-reversed** to generate Task A training data.
+**Features**:
+- Real-time end-effector position/orientation control via joysticks
+- Gripper control via triggers
+- Gyro mode for intuitive orientation control
+- Built-in data recording with episode management
+- Force estimation and display
 
-### 6.2 Finite State Machine (FSM) Design
+### 6.2 PS5 Controller Mapping
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        FSM State Diagram                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ┌──────────┐                                                       │
-│   │  IDLE    │ ──── Press SPACE to start ────┐                      │
-│   └──────────┘                                │                      │
-│        ▲                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ GO_TO_HOME   │               │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ HOVER_PLATE  │ (above plate) │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ LOWER_GRASP  │ (descend)     │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ CLOSE_GRIP   │ (grasp obj)   │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ LIFT_OBJECT  │ (lift up)     │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ HOVER_PLACE  │ (above random)│
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ LOWER_PLACE  │ (descend)     │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        │                              │ OPEN_GRIP    │ (release)     │
-│        │                              └──────────────┘               │
-│        │                                      │                      │
-│        │                                      ▼                      │
-│        │                              ┌──────────────┐               │
-│        └───────── Episode Done ────── │   DONE       │               │
-│                                       └──────────────┘               │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Control           | Action                                              |
+|-------------------|-----------------------------------------------------|
+| Left Stick        | Move EE in X/Y axis                                 |
+| Right Stick       | Move EE in Z axis / Rotate around Z (yaw)           |
+| L2/R2 Triggers    | Close/Open gripper                                  |
+| L1/R1 Bumpers     | Decrease/Increase motion speed                      |
+| D-pad             | Pitch/Roll end-effector                             |
+| Cross (✕)         | Go to home position                                 |
+| Circle (⭕) HOLD  | Gyro mode: controller tilt controls EE orientation  |
+| Triangle (△)      | Toggle gripper (open/close)                         |
+| Square (▢)        | Toggle recording / Print pose                       |
+| Share             | Emergency stop / Resume                             |
+| Options           | Re-enable arm                                       |
+| PS Button         | Quit program                                        |
 
-### 6.3 FSM State Definitions
-
-| State | Target Position | Gripper | Transition Condition |
-|-------|-----------------|---------|---------------------|
-| `IDLE` | - | - | SPACE key pressed |
-| `GO_TO_HOME` | Home position | Open | Position reached |
-| `HOVER_PLATE` | (plate_x, plate_y, hover_z) | Open | Position reached |
-| `LOWER_GRASP` | (plate_x, plate_y, grasp_z) | Open | Position reached |
-| `CLOSE_GRIP` | Hold position | Close | Gripper closed + delay |
-| `LIFT_OBJECT` | (plate_x, plate_y, hover_z) | Close | Position reached |
-| `HOVER_PLACE` | (random_x, random_y, hover_z) | Close | Position reached |
-| `LOWER_PLACE` | (random_x, random_y, grasp_z) | Close | Position reached |
-| `OPEN_GRIP` | Hold position | Open | Gripper opened + delay |
-| `LIFT_RETREAT` | (random_x, random_y, hover_z) | Open | Position reached |
-| `DONE` | - | - | Return to IDLE |
-
-### 6.4 Key Parameters
-
-```python
-# === Workspace Parameters ===
-PLATE_CENTER = (0.0, 0.15, 0.0)      # Pick position (fixed)
-GRASP_HEIGHT = 0.15                   # Z height for grasping
-HOVER_HEIGHT = 0.25                   # Safe height for safe movement
-RANDOM_RANGE_X = (-0.1, 0.1)          # Random X offset from plate center
-RANDOM_RANGE_Y = (-0.1, 0.1)          # Random Y offset from plate center
-
-# === Control Parameters ===
-CONTROL_FREQ = 30                     # Hz
-POSITION_TOLERANCE = 0.005            # 5mm position tolerance
-GRIPPER_OPEN_POS = 70000              # Gripper open position (0.001mm)
-GRIPPER_CLOSE_POS = 0                 # Gripper closed position
-GRIPPER_SPEED = 1000                  # Gripper speed
-GRIPPER_EFFORT = 500                  # Gripper force
-
-# === Motion Parameters ===
-MOTION_SPEED_PERCENT = 20             # Conservative speed (0-100%)
-SETTLE_TIME = 0.5                     # Seconds to wait after reaching position
-GRIPPER_WAIT_TIME = 0.5               # Seconds to wait for gripper action
-```
-
-### 6.5 Command Line Interface
+### 6.3 Usage
 
 ```bash
-# Basic usage
-python 1_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
+# Basic teleoperation with data recording (default)
+python 1_teleop_ps5_controller.py
 
-# Full options
-python 1_collect_data_piper.py \
-    --can_interface can0 \
-    --num_episodes 100 \
-    --out_dir data/piper_pick_place \
-    --control_freq 30 \
-    --image_width 640 \
-    --image_height 480 \
-    --fixed_cam_id 0 \
-    --wrist_cam_id 1 \
-    --seed 42
+# Specify CAN interface and speed
+python 1_teleop_ps5_controller.py --can_interface can0 --speed 30
+
+# Custom output directory
+python 1_teleop_ps5_controller.py --out_dir data/teleop_data
+
+# With camera display
+python 1_teleop_ps5_controller.py --show_camera
 ```
-
-### 6.6 Keyboard Controls
-
-| Key | Action |
-|-----|--------|
-| `SPACE` | Start new episode |
-| `ESC` | Emergency stop (freeze arm) |
-| `Q` | Quit and save all data |
-| `R` | Reset to home position |
-| `S` | Skip current episode (discard) |
 
 ---
 
-## 7. Script 5: Model Evaluation
+## 7. Script 2: Data Visualization
 
 ### 7.1 Overview
+
+`2_visualize_collected_data.py` creates comprehensive visualization videos of collected data, showing:
+- Side-by-side camera views (front + wrist camera)
+- XYZ trajectory curves for observation and action
+- FSM state indicator (for scripted data) or teleop mode indicator
+
+### 7.2 Usage
+
+```bash
+# Visualize a specific episode (tar.gz archive)
+python 2_visualize_collected_data.py --episode data/teleop_data/episode_0000.tar.gz
+
+# Visualize a specific episode (directory format)
+python 2_visualize_collected_data.py --episode data/piper_pick_place/episode_0000
+
+# Custom output path and fps
+python 2_visualize_collected_data.py --episode data/teleop_data/episode_0000.tar.gz --output viz.mp4 --fps 15
+```
+
+---
+
+## 8. Script 5: Model Evaluation
+
+### 8.1 Overview
 
 `5_eval_diffusion_piper.py` evaluates a trained diffusion policy on the real Piper arm:
 - **Task A**: Pick from **random table position** → Place at **plate center**
 
-### 7.2 Inference Pipeline
+### 8.2 Inference Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -440,7 +377,7 @@ python 1_collect_data_piper.py \
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.3 Action Chunking
+### 8.3 Action Chunking
 
 The diffusion policy predicts **8-step action chunks**. Execution strategy:
 
@@ -454,7 +391,7 @@ current_action = action_chunk[step % n_action_steps]
 send_to_robot(current_action)
 ```
 
-### 7.4 Success Criteria
+### 8.4 Success Criteria
 
 An episode is considered **successful** if:
 1. The gripper closes on the object (object detected in grasp)
@@ -462,7 +399,7 @@ An episode is considered **successful** if:
 3. No emergency stop was triggered
 4. Episode completed within **max_steps** (default: 500)
 
-### 7.5 Command Line Interface
+### 8.5 Command Line Interface
 
 ```bash
 # Basic evaluation
@@ -483,7 +420,7 @@ python 5_eval_diffusion_piper.py \
     --seed 42
 ```
 
-### 7.6 Output
+### 8.6 Output
 
 ```
 runs/piper_diffusion/eval_videos/
@@ -508,9 +445,55 @@ runs/piper_diffusion/eval_videos/
 
 ---
 
-## 8. Safety Guidelines
+## 9. Script 6: FSM Data Collection
 
-### 8.1 Pre-Flight Checklist
+### 9.1 Overview
+
+`6_collect_data_piper.py` collects **Task B** trajectories using a finite state machine (FSM) expert:
+- **Task B**: Pick from **plate center** → Place at **random table position**
+
+The collected trajectories will later be **time-reversed** to generate Task A training data.
+
+### 9.2 FSM State Diagram
+
+```
+IDLE → GO_TO_HOME → HOVER_PLATE → LOWER_GRASP → CLOSE_GRIP → LIFT_OBJECT 
+     → HOVER_PLACE → LOWER_PLACE → OPEN_GRIP → LIFT_RETREAT → RETURN_HOME → DONE → IDLE
+```
+
+### 9.3 Usage
+
+```bash
+# Basic usage with default cameras
+python 6_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
+
+# Specify cameras by device name
+python 6_collect_data_piper.py -f Orbbec_Gemini_335L -w Dabai_DC1
+
+# Custom workspace parameters
+python 6_collect_data_piper.py \
+    --can_interface can0 \
+    --num_episodes 100 \
+    --out_dir data/piper_pick_place \
+    --plate_x 0.25 --plate_y 0.0 \
+    --speed 20
+```
+
+### 9.4 Keyboard Controls
+
+| Input         | Action                              |
+|---------------|-------------------------------------|
+| ENTER / start | Start new episode                   |
+| e / esc       | Emergency stop (freeze arm)         |
+| q / quit      | Quit and save all data              |
+| r / reset     | Reset to home position              |
+| s / skip      | Skip current episode (discard)      |
+
+---
+
+## 10. Safety Guidelines
+
+### 10.1 Pre-Flight Checklist
 
 - [ ] CAN interface is properly configured and connected
 - [ ] Arm is powered on and in slave mode
@@ -519,7 +502,7 @@ runs/piper_diffusion/eval_videos/
 - [ ] Cameras are connected and recognized
 - [ ] Object is placed on the plate
 
-### 8.2 Emergency Stop Procedures
+### 10.2 Emergency Stop Procedures
 
 1. **Software E-Stop**: Press `ESC` key → Arm freezes in place
 2. **Hardware E-Stop**: Press physical emergency stop button
@@ -531,7 +514,7 @@ runs/piper_diffusion/eval_videos/
    python -c "from piper_sdk import *; p=C_PiperInterface_V2(); p.ConnectPort(); p.EnablePiper()"
    ```
 
-### 8.3 Workspace Limits (Soft Limits)
+### 10.3 Workspace Limits (Soft Limits)
 
 ```python
 # Enforce these limits in software to prevent collisions
@@ -544,9 +527,9 @@ WORKSPACE_LIMITS = {
 
 ---
 
-## 9. Debugging Guide & Known Issues
+## 11. Debugging Guide & Known Issues
 
-### 9.1 Critical Parameters to Calibrate
+### 11.1 Critical Parameters to Calibrate
 
 | Parameter | Location | Issue | How to Calibrate |
 |-----------|----------|-------|------------------|
@@ -555,14 +538,14 @@ WORKSPACE_LIMITS = {
 | `GRASP_HEIGHT` | Both scripts | `0.15m` may be too high/low | Adjust based on object height |
 | `GRIPPER_OPEN_POS` | Both scripts | `70000` (70mm) may not match your gripper | Check SDK docs or test with `piper.GetArmGripperMsgs()` |
 
-### 9.2 Known Issues & Bugs
+### 11.2 Known Issues & Bugs
 
-#### Script 1: Data Collection
+#### Script 6: FSM Data Collection
 
 1. **Keyboard module requires root on Linux**
    ```bash
    # Solution: run with sudo or use alternative input method
-   sudo python 1_collect_data_piper.py ...
+   sudo python 6_collect_data_piper.py ...
    ```
 
 2. **Camera ID may change on reconnect**
@@ -599,7 +582,7 @@ WORKSPACE_LIMITS = {
    - Manual `/ 255.0` normalization in `build_observation()` may conflict with preprocessor
    - Check if preprocessor already handles image normalization
 
-### 9.3 Pre-Run Checklist
+### 11.3 Pre-Run Checklist
 
 ```bash
 # 1. Test CAN connection
@@ -633,7 +616,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 "
 ```
 
-### 9.4 Recommended Debugging Steps
+### 11.4 Recommended Debugging Steps
 
 1. **First run with arm disabled** (comment out `piper.connect()`)
    - Verify cameras work
@@ -661,7 +644,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 
 ---
 
-## 10. TODO / Open Questions
+## 12. TODO / Open Questions
 
 - [ ] Determine exact home position by reading from `piper_ctrl_go_zero.py`
 - [ ] Calibrate camera intrinsics if needed for future visual servoing

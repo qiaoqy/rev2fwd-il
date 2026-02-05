@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Script 2: PS5 Controller Teleoperation for Piper Arm.
+"""Script 1: PS5 Controller Teleoperation for Piper Arm.
 
 This script allows teleoperation of the Piper robotic arm using
 PS5 DualSense controller connected via Bluetooth.
@@ -61,19 +61,19 @@ PS5 CONTROLLER MAPPING
 USAGE EXAMPLES
 =============================================================================
 # Basic usage
-python 2_teleop_ps5_controller.py
+python 1_teleop_ps5_controller.py
 
 # Specify CAN interface
-python 2_teleop_ps5_controller.py --can_interface can0
+python 1_teleop_ps5_controller.py --can_interface can0
 
 # Adjust speed and sensitivity
-python 2_teleop_ps5_controller.py --speed 30 --linear_scale 0.1 --angular_scale 0.5
+python 1_teleop_ps5_controller.py --speed 30 --linear_scale 0.1 --angular_scale 0.5
 
 # With camera display
-python 2_teleop_ps5_controller.py --show_camera
+python 1_teleop_ps5_controller.py --show_camera
 
 # Teleoperation with data recording
-python 2_teleop_ps5_controller.py --record --out_dir data/teleop_data
+python 1_teleop_ps5_controller.py --record --out_dir data/teleop_data
 
 """
 

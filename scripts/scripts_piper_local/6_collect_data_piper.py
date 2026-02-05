@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Script 1: Data Collection for Piper Pick & Place Task.
+"""Script 6: Data Collection for Piper Pick & Place Task.
 
 This script collects Task B trajectories using a finite state machine (FSM) expert:
 - Task B: Pick from **desk center** → Place at **random table position**

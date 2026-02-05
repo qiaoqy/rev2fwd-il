@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Script 3: Visualize Collected Piper Data.
+"""Script 2: Visualize Collected Piper Data.
 
 This script creates a comprehensive visualization video of collected data:
 - Side-by-side camera views (front camera + wrist camera)
@@ -15,19 +15,19 @@ Supports both:
 USAGE EXAMPLES
 =============================================================================
 # Visualize a specific episode (tar.gz archive)
-python scripts/scripts_piper_local/3_visualize_collected_data.py \
+python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode data/teleop_data/episode_0000.tar.gz
 
 # Visualize a specific episode (directory format)
-python scripts/scripts_piper_local/3_visualize_collected_data.py \
+python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode data/piper_pick_place/episode_0000
 
 # Custom output path and fps
-python scripts/scripts_piper_local/3_visualize_collected_data.py \
+python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode data/teleop_data/episode_0000.tar.gz --output data/viz_output.mp4 --fps 15
 
 # Skip XYZ curves (faster rendering)
-python scripts/scripts_piper_local/3_visualize_collected_data.py \
+python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode data/teleop_data/episode_0000.tar.gz --no_xyz_curves
 
 =============================================================================
