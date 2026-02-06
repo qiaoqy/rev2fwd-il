@@ -223,10 +223,12 @@ class CameraCapture:
                 pass
             
             # Search in /dev/v4l/by-id/ for matching name
+            # Must match "video-index0" to get the streaming node,
+            # NOT "video-index1" which is a metadata-only node.
             by_id_dir = Path("/dev/v4l/by-id")
             if by_id_dir.exists():
                 for entry in sorted(by_id_dir.iterdir()):
-                    if camera_id in entry.name and "video" in entry.name:
+                    if camera_id in entry.name and "video-index0" in entry.name:
                         resolved = entry.resolve()
                         print(f"[Camera] Resolved '{camera_id}' -> {resolved}")
                         return str(resolved)
@@ -951,12 +953,15 @@ def build_observation(
     wrist_image: Optional[np.ndarray],
     pose: Dict[str, float],
     policy_config: Dict,
-) -> Dict[str, np.ndarray]:
+) -> Dict[str, torch.Tensor]:
     """Build observation dict matching the training data format.
     
-    IMPORTANT: This returns numpy arrays that will be processed by LeRobot's
-    preprocessor pipeline (to_batch -> device -> normalize). The preprocessor
-    handles all tensor conversion and normalization.
+    IMPORTANT: This returns torch tensors matching the format that LeRobot's
+    dataset __getitem__ produces. The LeRobot video decoder returns images as
+    float32 tensors in [0,1] range with shape (C, H, W). The preprocessor
+    pipeline (AddBatchDim -> Device -> Normalize) expects tensors, not numpy
+    arrays. Passing uint8 numpy arrays causes the normalizer to attempt
+    converting float stats to uint8 dtype, resulting in overflow errors.
     
     Args:
         fixed_image: Fixed camera RGB image (H, W, 3) uint8
@@ -965,7 +970,14 @@ def build_observation(
         policy_config: Policy configuration dict
         
     Returns:
-        Dictionary of numpy arrays matching LeRobot dataset format
+        Dictionary of torch tensors matching LeRobot dataset format.
+        All tensors include a leading batch dimension so that the preprocessor's
+        AddBatchDimensionProcessorStep (which only recognizes ``observation.image``,
+        ``observation.state``, and keys starting with ``observation.images.``)
+        does not leave ``observation.wrist_image`` without a batch dim while
+        adding one to ``observation.image``.
+        - Images: float32 (1, C, H, W) in [0, 1]
+        - State: float32 (1, state_dim)
     """
     # Get target image size from model config: image_shape is (C, H, W)
     image_shape = policy_config.get("image_shape", (3, 240, 320))
@@ -977,14 +989,18 @@ def build_observation(
     # Resize to match training size
     fixed_resized = cv2.resize(fixed_image, (target_w, target_h), 
                                 interpolation=cv2.INTER_LINEAR)
-    # Keep as uint8 (H, W, 3) - LeRobot preprocessor converts to tensor and normalizes
-    obs["observation.image"] = fixed_resized
+    # Convert to float32 (1, C, H, W) in [0, 1] — matching LeRobot dataset format
+    # LeRobot video decoder does: tensor.type(torch.float32) / 255
+    # We add the batch dim here so that ALL image keys are consistently shaped.
+    fixed_tensor = torch.from_numpy(fixed_resized).permute(2, 0, 1).float() / 255.0
+    obs["observation.image"] = fixed_tensor.unsqueeze(0)
     
     # Process wrist camera image if policy expects it  
     if policy_config.get("has_wrist", False) and wrist_image is not None:
         wrist_resized = cv2.resize(wrist_image, (target_w, target_h),
                                     interpolation=cv2.INTER_LINEAR)
-        obs["observation.wrist_image"] = wrist_resized
+        wrist_tensor = torch.from_numpy(wrist_resized).permute(2, 0, 1).float() / 255.0
+        obs["observation.wrist_image"] = wrist_tensor.unsqueeze(0)
     
     # Build state vector matching training format exactly:
     # ee_pose: [x, y, z, qw, qx, qy, qz] from euler degrees
@@ -1003,7 +1019,8 @@ def build_observation(
     else:
         state = ee_pose
     
-    obs["observation.state"] = state
+    # Add batch dim to state as well for consistency
+    obs["observation.state"] = torch.from_numpy(state).float().unsqueeze(0)
     
     return obs
 
@@ -1170,8 +1187,6 @@ def run_episode(
     
     control_period = 1.0 / control_freq
     step = 0
-    action_chunk = None
-    action_chunk_idx = 0
     episode_start_time = time.time()
     user_stopped = False
     gripper_manual_override = None  # None = follow policy, float = manual angle
@@ -1307,53 +1322,49 @@ def run_episode(
             video_recorder.add_combined_frame(fixed_img, wrist_img)
         
         # =================================================================
-        # Run policy inference if needed (every n_action_steps or at start)
+        # Run policy inference
         # =================================================================
-        if action_chunk is None or action_chunk_idx >= n_action_steps:
-            # Build observation matching training format
-            obs = build_observation(
-                fixed_image=fixed_img,
-                wrist_image=wrist_img,
-                pose=pose,
-                policy_config=policy_config,
-            )
-            
-            # Preprocess (to_batch -> device -> normalize)
-            obs_normalized = preprocessor(obs)
-            
-            # Run policy inference
-            with torch.no_grad():
-                action_dict = policy.select_action(obs_normalized)
-            
-            # Postprocess (unnormalize -> cpu)
-            action_dict = postprocessor(action_dict)
-            
-            # Extract action chunk
-            action_chunk = action_dict["action"]  # Tensor
-            
-            # Convert to numpy
-            if isinstance(action_chunk, torch.Tensor):
-                action_chunk = action_chunk.cpu().numpy()
-            
-            # Ensure proper shape: (n_action_steps, action_dim)
-            if action_chunk.ndim == 1:
-                action_chunk = action_chunk.reshape(1, -1)
-            elif action_chunk.ndim == 3:
-                action_chunk = action_chunk[0]  # Remove batch dim
-            
-            action_chunk_idx = 0
-            
-            if step % log_freq == 0:
-                print(f"  Step {step}: new chunk, shape={action_chunk.shape}, "
-                      f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
+        # NOTE: select_action() internally manages an action queue:
+        #   - It runs diffusion to generate a full horizon of actions
+        #   - It caches n_action_steps actions and pops one per call
+        #   - So we call it every step; it only runs inference when
+        #     the internal queue is empty.
+        
+        # Build observation matching training format
+        obs = build_observation(
+            fixed_image=fixed_img,
+            wrist_image=wrist_img,
+            pose=pose,
+            policy_config=policy_config,
+        )
+        
+        # Preprocess (to_batch -> device -> normalize)
+        obs_normalized = preprocessor(obs)
+        
+        # Run policy inference (returns a single action tensor)
+        with torch.no_grad():
+            action_tensor = policy.select_action(obs_normalized)
+        
+        # Postprocess (unnormalize -> cpu)
+        action_tensor = postprocessor(action_tensor)
+        
+        # Convert to numpy
+        if isinstance(action_tensor, torch.Tensor):
+            action = action_tensor.cpu().numpy()
+        else:
+            action = np.asarray(action_tensor)
+        
+        # Flatten if needed: (1, action_dim) -> (action_dim,)
+        if action.ndim == 2:
+            action = action[0]
+        
+        if step % log_freq == 0:
+            print(f"  Step {step}: action={action[:3].round(4)}, "
+                  f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
         
         # =================================================================
-        # Get current action from chunk and apply
+        # Apply action to robot
         # =================================================================
-        action = action_chunk[action_chunk_idx]
-        action_chunk_idx += 1
-        
-        # Apply RELATIVE delta action to current pose
         target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg = \
             apply_delta_action(pose, action)
         

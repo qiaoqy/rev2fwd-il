@@ -1,0 +1,35 @@
+{
+  "num_episodes": 4,
+  "avg_steps": 500.0,
+  "avg_duration": 90.08121490478516,
+  "episodes": [
+    {
+      "id": 0,
+      "steps": 500,
+      "duration": 88.75628972053528,
+      "emergency_stopped": false,
+      "notes": ""
+    },
+    {
+      "id": 1,
+      "steps": 500,
+      "duration": 90.19270443916321,
+      "emergency_stopped": false,
+      "notes": ""
+    },
+    {
+      "id": 2,
+      "steps": 500,
+      "duration": 90.5510036945343,
+      "emergency_stopped": false,
+      "notes": ""
+    },
+    {
+      "id": 3,
+      "steps": 500,
+      "duration": 90.82486176490784,
+      "emergency_stopped": false,
+      "notes": ""
+    }
+  ]
+}

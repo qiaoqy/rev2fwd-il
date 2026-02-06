@@ -75,6 +75,8 @@ python 1_teleop_ps5_controller.py --show_camera
 # Teleoperation with data recording
 python 1_teleop_ps5_controller.py --record --out_dir data/teleop_data
 
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/insert_piper
 """
 
 from __future__ import annotations
