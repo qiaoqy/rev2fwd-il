@@ -1,8 +1,43 @@
 #!/usr/bin/env python3
-"""Step 4: Train Diffusion Policy using LeRobot.
+"""Step 7: Train DiT Flow Policy using LeRobot.
 
-This script trains a vision-based Diffusion Policy on the teleoperation data
-collected by script 1 (1_teleop_ps5_controller.py).
+This script trains a vision-based DiT Flow Policy (Diffusion Transformer with Flow Matching)
+on the teleoperation data collected by script 1 (1_teleop_ps5_controller.py).
+
+This is based on the paper: "DiT Policy: Scaling Diffusion Policy with Transformers"
+The key difference from standard Diffusion Policy is:
+- Uses Diffusion Transformer (DiT) instead of U-Net
+- Uses Flow Matching instead of DDPM/DDIM
+- Generally faster inference with similar or better quality
+
+=============================================================================
+LIBRARY MODIFICATIONS REQUIRED
+=============================================================================
+This script requires the following modifications to the lerobot_policy_ditflow
+library at: /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/lerobot_policy_ditflow
+
+FILE: src/lerobot_policy_ditflow/modeling_ditflow.py
+
+1. DiTFlowPolicy.__init__() (around line 345-358):
+   Added `dataset_meta=None` parameter for compatibility with lerobot factory:
+   
+   def __init__(
+       self,
+       config: DiTFlowConfig,
+       dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+       dataset_meta=None,  # Added for compatibility with lerobot factory
+   ):
+       ...
+       # dataset_meta is accepted but not used, only for API compatibility
+
+2. _prepare_global_conditioning() (around line 555-615):
+   Added debug print statements (can be removed in production):
+   
+   print(f"[DEBUG _prepare_global_conditioning] OBS_STATE shape: ...")
+   print(f"[DEBUG _prepare_global_conditioning] OBS_IMAGES shape: ...")
+   print(f"[DEBUG _prepare_global_conditioning] img_features after encoder: ...")
+   print(f"[DEBUG _prepare_global_conditioning] global_cond_feats shapes: ...")
+   print(f"[DEBUG _prepare_global_conditioning] final global_cond shape: ...")
 
 =============================================================================
 INPUT DATA FORMAT (from script 1)
@@ -54,48 +89,44 @@ IMAGE HANDLING
 =============================================================================
 If fixed camera and wrist camera have different resolutions, all images are
 resized to a common size (default: 240x320) during conversion to ensure
-compatibility with the diffusion policy's multi-camera stacking.
+compatibility with the DiT Flow policy's multi-camera stacking.
+
+=============================================================================
+DITFLOW vs DIFFUSION POLICY
+=============================================================================
+DiT Flow uses:
+- Transformer architecture instead of U-Net (better scaling)
+- Flow Matching objective instead of DDPM (faster inference, ~100 steps)
+- AdaLN-Zero conditioning for time step (more stable training)
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
 # Basic training
-CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop \
+    --out runs/ditflow_piper_teleop \
     --batch_size 64 --steps 50000 --wandb
 
 # With gripper in observation (state_dim=8)
-CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop \
+    --out runs/ditflow_piper_teleop \
     --batch_size 64 --steps 50000 \
     --include_gripper --wandb
 
-# Custom image size (both cameras resized to this)
-CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+# Multi-GPU training
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+    scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop \
-    --image_size 240 320 \
-    --batch_size 64 --steps 50000 --wandb
+    --out runs/ditflow_piper_teleop \
+    --batch_size 32 --steps 100000 --wandb
 
 # Data conversion only (for debugging)
-CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop \
+    --out runs/ditflow_piper_teleop \
     --convert_only
-
-# Multi-GPU training
-CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
-    scripts/scripts_piper_local/4_train_diffusion.py \
-    --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop \
-    --batch_size 32 --steps 20000 --include_gripper --wandb
-
-python scripts/scripts_piper_local/4_train_diffusion.py \
-    --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop_A_0205 \
-    --batch_size 64 --steps 200000 --include_gripper --wandb
 =============================================================================
 """
 
@@ -127,7 +158,7 @@ os.environ["FFMPEG_LOG_LEVEL"] = "quiet"
 def _parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train Diffusion Policy on Piper teleoperation data with relative actions.",
+        description="Train DiT Flow Policy on Piper teleoperation data with relative actions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -143,7 +174,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=str,
-        default="runs/diffusion_piper_teleop",
+        default="runs/ditflow_piper_teleop",
         help="Output directory for saving model checkpoints and logs.",
     )
     parser.add_argument(
@@ -241,7 +272,7 @@ def _parse_args() -> argparse.Namespace:
     )
 
     # =========================================================================
-    # Diffusion Policy Architecture
+    # DiT Flow Policy Architecture
     # =========================================================================
     parser.add_argument(
         "--n_obs_steps",
@@ -253,7 +284,7 @@ def _parse_args() -> argparse.Namespace:
         "--horizon",
         type=int,
         default=16,
-        help="Diffusion horizon (action sequence length). Default: 16.",
+        help="DiT Flow horizon (action sequence length). Default: 16.",
     )
     parser.add_argument(
         "--n_action_steps",
@@ -271,20 +302,59 @@ def _parse_args() -> argparse.Namespace:
         "--crop_shape",
         type=int,
         nargs=2,
-        default=[128, 128],
-        help="Image crop shape (H, W). Default: 128 128.",
+        default=[84, 84],
+        help="Image crop shape (H, W). Default: 84 84.",
     )
     parser.add_argument(
-        "--num_train_timesteps",
+        "--num_inference_steps",
         type=int,
         default=100,
-        help="Number of diffusion timesteps. Default: 100.",
+        help="Number of flow integration steps for inference. Default: 100.",
     )
     parser.add_argument(
         "--pretrained_backbone_weights",
         type=str,
         default=None,
         help="Pretrained weights for vision backbone. Default: None.",
+    )
+    
+    # DiT specific parameters
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=512,
+        help="Hidden dimension of the DiT transformer. Default: 512.",
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=int,
+        default=6,
+        help="Number of transformer blocks in DiT. Default: 6.",
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=16,
+        help="Number of attention heads in DiT. Default: 16.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate in DiT. Default: 0.1.",
+    )
+    parser.add_argument(
+        "--dim_feedforward",
+        type=int,
+        default=4096,
+        help="Feedforward dimension in DiT. Default: 4096.",
+    )
+    parser.add_argument(
+        "--training_noise_sampling",
+        type=str,
+        default="uniform",
+        choices=["uniform", "beta"],
+        help="Noise sampling strategy for training. 'beta' is from Pi0 paper. Default: uniform.",
     )
 
     # =========================================================================
@@ -312,17 +382,6 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Overwrite existing checkpoints. Default: True. Use --no-overwrite to disable.",
-    )
-    parser.add_argument(
-        "--viz_save_freq",
-        type=int,
-        default=20000,
-        help="Save XYZ visualization every N steps. Default: 20000.",
-    )
-    parser.add_argument(
-        "--enable_xyz_viz",
-        action="store_true",
-        help="Enable XYZ curve visualization during training.",
     )
 
     # =========================================================================
@@ -355,8 +414,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb_project",
         type=str,
-        default="piper-diffusion-teleop",
-        help="WandB project name. Default: piper-diffusion-teleop.",
+        default="piper-ditflow-teleop",
+        help="WandB project name. Default: piper-ditflow-teleop.",
     )
 
     # =========================================================================
@@ -570,7 +629,7 @@ def convert_episodes_to_lerobot_format(
     data_dir: str,
     output_dir: str,
     fps: int = 20,
-    repo_id: str = "local/piper_teleop",
+    repo_id: str = "local/piper_ditflow",
     force: bool = False,
     num_episodes: int = -1,
     include_gripper: bool = False,
@@ -797,7 +856,7 @@ def convert_episodes_to_lerobot_format(
                 "observation.image": img,
                 "observation.state": state.astype(np.float32),
                 "action": action.astype(np.float32),
-                "task": "piper_teleop",
+                "task": "piper_ditflow",
             }
             
             # Add wrist camera image if available - resize to same target size
@@ -842,7 +901,7 @@ def train_with_lerobot_api(
     train_episodes: list[int] | None = None,
     val_episodes: list[int] | None = None,
 ) -> dict:
-    """Train using LeRobot's Python API.
+    """Train DiT Flow using LeRobot's Python API.
     
     Args:
         args: Parsed command-line arguments.
@@ -857,18 +916,24 @@ def train_with_lerobot_api(
     Returns:
         Dictionary with training results.
     """
+    # Register third-party plugins (this imports lerobot_policy_ditflow)
+    from lerobot.utils.import_utils import register_third_party_plugins
+    register_third_party_plugins()
+    
+    # Import DiTFlowConfig after registering plugins
+    try:
+        from lerobot_policy_ditflow import DiTFlowConfig
+    except ImportError as e:
+        raise ImportError(
+            f"DiTFlow policy not found. Make sure lerobot_policy_ditflow is installed. "
+            f"You can install it with: pip install -e /path/to/lerobot_policy_ditflow\n"
+            f"Error: {e}"
+        )
+    
     from lerobot.configs.default import DatasetConfig, WandBConfig
     from lerobot.configs.train import TrainPipelineConfig
-    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
     from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.scripts.lerobot_train import train
-    
-    # Try to import custom training with viz
-    try:
-        from rev2fwd_il.train.lerobot_train_with_viz import train_with_xyz_visualization
-        HAS_VIZ_TRAIN = True
-    except ImportError:
-        HAS_VIZ_TRAIN = False
     
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -925,8 +990,8 @@ def train_with_lerobot_api(
         ),
     }
     
-    # Create Diffusion Policy configuration
-    policy_cfg = DiffusionConfig(
+    # Create DiT Flow Policy configuration
+    policy_cfg = DiTFlowConfig(
         n_obs_steps=args.n_obs_steps,
         horizon=args.horizon,
         n_action_steps=args.n_action_steps,
@@ -934,10 +999,18 @@ def train_with_lerobot_api(
         output_features=output_features,
         vision_backbone=args.vision_backbone,
         crop_shape=tuple(args.crop_shape),
-        num_train_timesteps=args.num_train_timesteps,
         pretrained_backbone_weights=args.pretrained_backbone_weights,
         device=device,
         push_to_hub=False,
+        # DiT-specific parameters
+        hidden_dim=args.hidden_dim,
+        num_blocks=args.num_blocks,
+        num_heads=args.num_heads,
+        dropout=args.dropout,
+        dim_feedforward=args.dim_feedforward,
+        num_inference_steps=args.num_inference_steps,
+        training_noise_sampling=args.training_noise_sampling,
+        # Optimizer settings
         optimizer_lr=args.lr,
     )
     
@@ -952,7 +1025,7 @@ def train_with_lerobot_api(
     
     # Create dataset configuration
     dataset_cfg = DatasetConfig(
-        repo_id="local/piper_teleop",
+        repo_id="local/piper_ditflow",
         root=str(lerobot_dataset_dir),
         episodes=train_episodes,
     )
@@ -961,7 +1034,7 @@ def train_with_lerobot_api(
     val_dataset_cfg = None
     if val_episodes is not None and len(val_episodes) > 0:
         val_dataset_cfg = DatasetConfig(
-            repo_id="local/piper_teleop",
+            repo_id="local/piper_ditflow",
             root=str(lerobot_dataset_dir),
             episodes=val_episodes,
         )
@@ -1041,7 +1114,7 @@ def train_with_lerobot_api(
     
     # Print training info
     print("\n" + "=" * 60)
-    print("Starting Diffusion Policy Training")
+    print("Starting DiT Flow Policy Training")
     print("=" * 60)
     print(f"  Dataset: {args.dataset}")
     print(f"  LeRobot dataset: {lerobot_dataset_dir}")
@@ -1061,7 +1134,15 @@ def train_with_lerobot_api(
     print(f"  Vision backbone: {args.vision_backbone}")
     print(f"  Device: {device}")
     print(f"  WandB: {args.wandb}")
-    print(f"  XYZ visualization: {args.enable_xyz_viz}")
+    print("")
+    print("  DiT-specific parameters:")
+    print(f"    Hidden dim: {args.hidden_dim}")
+    print(f"    Num blocks: {args.num_blocks}")
+    print(f"    Num heads: {args.num_heads}")
+    print(f"    Dropout: {args.dropout}")
+    print(f"    Feedforward dim: {args.dim_feedforward}")
+    print(f"    Inference steps: {args.num_inference_steps}")
+    print(f"    Noise sampling: {args.training_noise_sampling}")
     if train_episodes is not None:
         print(f"  Train episodes: {len(train_episodes)}")
     if val_episodes is not None:
@@ -1069,25 +1150,12 @@ def train_with_lerobot_api(
     print("=" * 60 + "\n")
     
     # Run training
-    import sys
     original_argv = sys.argv.copy()
     if resume_config_path is not None:
         sys.argv = [sys.argv[0], f"--config_path={resume_config_path}"]
     
     try:
-        if args.enable_xyz_viz and HAS_VIZ_TRAIN:
-            xyz_viz_dir = out_dir / "xyz_viz"
-            train_with_xyz_visualization(
-                train_cfg,
-                viz_save_freq=args.viz_save_freq,
-                xyz_viz_dir=xyz_viz_dir,
-                val_dataset_cfg=val_dataset_cfg,
-                val_freq=args.val_freq,
-            )
-        else:
-            if args.enable_xyz_viz and not HAS_VIZ_TRAIN:
-                print("Warning: XYZ visualization not available, using standard training")
-            train(train_cfg)
+        train(train_cfg)
     finally:
         sys.argv = original_argv
     
@@ -1141,7 +1209,7 @@ def main() -> None:
                 data_dir=args.dataset,
                 output_dir=lerobot_dataset_dir,
                 fps=args.fps,
-                repo_id="local/piper_teleop",
+                repo_id="local/piper_ditflow",
                 force=args.force_convert,
                 num_episodes=args.num_episodes,
                 include_gripper=args.include_gripper,
@@ -1196,6 +1264,21 @@ def main() -> None:
                 image_width = img_shape[2]
             else:
                 raise ValueError("observation.image not found in dataset features")
+            
+            # Read state dimension from dataset - this is critical!
+            if "observation.state" in features:
+                actual_state_dim = features["observation.state"]["shape"][0]
+                # Override include_gripper based on actual data
+                if actual_state_dim == 7:
+                    include_gripper = False
+                    print(f"  State dim: {actual_state_dim} (ee_pose only - overriding --include_gripper)")
+                elif actual_state_dim == 8:
+                    include_gripper = True
+                    print(f"  State dim: {actual_state_dim} (ee_pose + gripper)")
+                else:
+                    print(f"  State dim: {actual_state_dim} (unexpected dimension)")
+            else:
+                raise ValueError("observation.state not found in dataset features")
             
             has_wrist = "observation.wrist_image" in features
             
@@ -1269,6 +1352,7 @@ def main() -> None:
     print(f"  Output directory: {result['output_dir']}")
     print(f"  Total steps: {result['steps']}")
     print(f"  Action type: relative delta")
+    print(f"  Policy type: DiT Flow (Diffusion Transformer + Flow Matching)")
     print("=" * 60)
 
 
