@@ -6,6 +6,9 @@ Upload/download datasets and model checkpoints
 Login first: huggingface-cli login
 
 Usage:
+
+python scripts/hf_sync.py download-model qiaoqy/diffusion_piper_teleop_A --local_dir /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_A
+
     # Upload model (entire experiment folder, ignores lerobot_dataset)
     python scripts/hf_sync.py upload-model runs/diffusion_piper_teleop_A
     

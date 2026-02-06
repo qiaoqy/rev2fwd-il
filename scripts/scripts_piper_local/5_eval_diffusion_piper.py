@@ -61,6 +61,8 @@ python 5_eval_diffusion_piper.py \
     --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model \
     --n_action_steps 4 \
     --num_inference_steps 10
+
+(rev2fwd_il) qiyuan@vcg-ROG-Strix-SCAR-16:~/workspace/rev2fwd-il$ python scripts/scripts_piper_local/5_eval_diffusion_piper.py     --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_B/checkpoints/checkpoints/020000/pretrained_model     --device cuda:0
 """
 
 from __future__ import annotations
@@ -339,11 +341,14 @@ class PiperController:
             print(f"[Piper] Connecting via {self.can_interface}...")
             self.piper = C_PiperInterface_V2(self.can_interface)
             self.piper.ConnectPort()
+            time.sleep(0.5)
             self.connected = True
             print("[Piper] Connected!")
             return True
         except Exception as e:
             print(f"[Piper] Connection failed: {e}")
+            print(f"[Piper] Hint: Make sure CAN interface is up. Run:")
+            print(f"  sudo ip link set {self.can_interface} up type can bitrate 1000000")
             return False
     
     def enable(self) -> bool:
@@ -354,42 +359,35 @@ class PiperController:
         
         try:
             print("[Piper] Enabling arm...")
-            # Set motion mode: CAN command, MOVE_P, speed
-            self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0x00)
-            time.sleep(0.1)
+            # Send enable commands multiple times for reliability
+            for attempt in range(3):
+                self.piper.EnableArm(7)
+                time.sleep(0.1)
             
-            # Enable gripper first
+            # Set motion control mode
+            self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
+            
+            # Enable gripper
             self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
-            time.sleep(0.1)
             
-            # Send enable commands repeatedly
+            # Wait for enable completion with detailed checking
             start_time = time.time()
             while time.time() - start_time < ENABLE_TIMEOUT:
-                self.piper.EnablePiper()
-                time.sleep(0.1)
-                
-                # Check motor driver status
                 arm_ok, gripper_ok = self._check_motor_enable_status()
                 if arm_ok and gripper_ok:
                     self.enabled = True
                     print("[Piper] Arm enabled successfully!")
-                    # Re-send motion mode after enable
-                    self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0x00)
                     return True
-            
-            # Timeout - try once more with aggressive enable
-            for _ in range(20):
-                self.piper.EnablePiper()
-                time.sleep(0.05)
-            
-            arm_ok, gripper_ok = self._check_motor_enable_status()
-            if arm_ok:
-                self.enabled = True
-                print("[Piper] Arm enabled (gripper may need re-enable)!")
-                self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0x00)
-                return True
+                elif arm_ok:
+                    # Arm enabled but gripper not yet
+                    self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
+                else:
+                    # Keep sending enable
+                    self.piper.EnableArm(7)
+                time.sleep(0.1)
             
             print("[Piper] Enable timeout!")
+            self._print_enable_status()
             return False
             
         except Exception as e:
@@ -399,40 +397,48 @@ class PiperController:
     def _check_motor_enable_status(self) -> Tuple[bool, bool]:
         """Check if arm motors and gripper are enabled via driver status."""
         try:
-            status = self.piper.GetArmLowSpdInfoMsgs()
-            arm_enabled = True
-            for i in range(1, 7):
-                driver = getattr(status, f'motor_driver{i}', None)
-                if driver is not None:
-                    foc_status = getattr(driver, 'foc_status', None)
-                    if foc_status is not None:
-                        driver_mode = (foc_status.driver_enable_status) & 0x01
-                        if driver_mode == 0:
-                            arm_enabled = False
-                            break
+            arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
+            arm_enabled = (
+                arm_msgs.motor_1.foc_status.driver_enable_status and
+                arm_msgs.motor_2.foc_status.driver_enable_status and
+                arm_msgs.motor_3.foc_status.driver_enable_status and
+                arm_msgs.motor_4.foc_status.driver_enable_status and
+                arm_msgs.motor_5.foc_status.driver_enable_status and
+                arm_msgs.motor_6.foc_status.driver_enable_status
+            )
             
-            gripper_enabled = True
-            driver7 = getattr(status, 'motor_driver7', None)
-            if driver7 is not None:
-                foc_status = getattr(driver7, 'foc_status', None)
-                if foc_status is not None:
-                    if (foc_status.driver_enable_status & 0x01) == 0:
-                        gripper_enabled = False
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_enabled = gripper_msgs.gripper_state.foc_status.driver_enable_status
             
             return arm_enabled, gripper_enabled
         except Exception:
             return False, False
     
+    def _print_enable_status(self):
+        """Print detailed enable status for debugging (called on failure)."""
+        try:
+            arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
+            print("[Debug] Motor enable status:")
+            for i in range(1, 7):
+                motor = getattr(arm_msgs, f"motor_{i}")
+                status = motor.foc_status.driver_enable_status
+                print(f"  Motor {i}: {'✓' if status else '✗'}")
+            
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            gripper_status = gripper_msgs.gripper_state.foc_status.driver_enable_status
+            print(f"  Gripper: {'✓' if gripper_status else '✗'}")
+        except Exception as e:
+            print(f"[Debug] Failed to read enable status: {e}")
+    
     def disconnect(self):
         """Disable and disconnect from the arm."""
         if self.piper is not None and self.enabled:
             try:
-                self.piper.MotionCtrl_2(0x01, MOVE_MODE, 0, 0x00)
-                self.piper.DisablePiper()
-            except Exception:
-                pass
+                self.piper.DisableArm(7)
+                self.enabled = False
+            except Exception as e:
+                print(f"[Piper] Disable error: {e}")
         self.connected = False
-        self.enabled = False
         self.piper = None
         print("[Piper] Disconnected")
     
@@ -441,26 +447,30 @@ class PiperController:
         self._emergency_stop = True
         if self.piper is not None:
             try:
-                self.piper.MotionCtrl_2(0x01, MOVE_MODE, 0, 0x02)
-            except Exception:
-                pass
-        print("[Piper] EMERGENCY STOP!")
+                self.piper.MotionCtrl_2(0x02, MOVE_MODE, 0, 0)
+            except Exception as e:
+                print(f"[Piper] Emergency stop error: {e}")
+        print("[Piper] 🛑 EMERGENCY STOP ACTIVATED!")
     
     def clear_emergency_stop(self):
         """Clear emergency stop and resume."""
         self._emergency_stop = False
         if self.piper is not None:
             try:
-                self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0x00)
-            except Exception:
+                self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
+            except:
                 pass
-        print("[Piper] Emergency stop cleared")
+        print("[Piper] ✓ Emergency stop cleared, motion resumed")
     
     def set_speed(self, speed_percent: int):
         """Set motion speed percentage."""
         self._speed_percent = max(MIN_SPEED_PERCENT, min(MAX_SPEED_PERCENT, speed_percent))
         if self.piper is not None and self.enabled:
-            self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0x00)
+            try:
+                self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
+            except:
+                pass
+        print(f"[Piper] Speed set to {self._speed_percent}%")
     
     def get_ee_pose_meters(self) -> Optional[Dict[str, float]]:
         """Get current end-effector pose in meters and radians.
@@ -517,17 +527,17 @@ class PiperController:
         
         try:
             # Convert to SDK units
-            X = round(x * 1_000_000)         # meters -> 0.001mm
-            Y = round(y * 1_000_000)
-            Z = round(z * 1_000_000)
-            RX = round(np.rad2deg(rx) * 1000) # radians -> 0.001 degrees
-            RY = round(np.rad2deg(ry) * 1000)
-            RZ = round(np.rad2deg(rz) * 1000)
+            X = int(x * 1_000_000)         # meters -> 0.001mm
+            Y = int(y * 1_000_000)
+            Z = int(z * 1_000_000)
+            RX = int(np.rad2deg(rx) * 1000) # radians -> 0.001 degrees
+            RY = int(np.rad2deg(ry) * 1000)
+            RZ = int(np.rad2deg(rz) * 1000)
             
             self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
             return True
         except Exception as e:
-            print(f"[Piper] Move error: {e}")
+            print(f"[Piper] Move failed: {e}")
             return False
     
     def set_gripper_angle(self, angle_deg: float, effort: int = GRIPPER_EFFORT) -> bool:
@@ -538,11 +548,11 @@ class PiperController:
             return False
         try:
             angle_deg = max(0.0, min(GRIPPER_OPEN_ANGLE, angle_deg))
-            gripper_sdk = round(angle_deg * 1000)
-            self.piper.GripperCtrl(gripper_sdk, 1000, 0x01, 0)
+            angle_sdk = int(angle_deg * 1000)
+            self.piper.GripperCtrl(angle_sdk, effort, 0x01, 0)
             return True
         except Exception as e:
-            print(f"[Piper] Gripper error: {e}")
+            print(f"[Piper] Gripper control failed: {e}")
             return False
     
     def open_gripper(self) -> bool:
@@ -558,9 +568,9 @@ class PiperController:
         if not self.connected or self.piper is None:
             return None
         try:
-            msg = self.piper.GetArmGripperMsgs()
-            return msg.gripper_state.grippers_angle / 1000.0
-        except Exception:
+            gripper_msgs = self.piper.GetArmGripperMsgs()
+            return gripper_msgs.gripper_state.grippers_angle / 1000.0
+        except:
             return None
     
     def go_to_home(self) -> bool:
@@ -573,13 +583,18 @@ class PiperController:
         return self.move_to_pose(x, y, z, rx, ry, rz)
     
     def is_arm_ready(self) -> bool:
-        """Check if arm is ready for motion."""
+        """Check if arm is ready for motion (enabled and not in error)."""
         if not self.enabled or self.piper is None:
             return False
         try:
-            arm_ok, _ = self._check_motor_enable_status()
-            return arm_ok
-        except Exception:
+            arm_ok, gripper_ok = self._check_motor_enable_status()
+            if not (arm_ok and gripper_ok):
+                return False
+            # Also check control mode
+            status = self.piper.GetArmStatus()
+            ctrl_mode = getattr(status.arm_status, 'ctrl_mode', 0)
+            return int(ctrl_mode) != 0
+        except:
             return False
     
     def wait_until_ready(self, timeout: float = 10.0) -> bool:
@@ -590,6 +605,7 @@ class PiperController:
                 return True
             time.sleep(0.1)
         print("[Piper] Arm not ready after timeout")
+        self._print_enable_status()
         return False
 
 
@@ -1622,21 +1638,26 @@ def main():
         
         return cams
     
-    def init_policy():
-        """Load diffusion policy."""
-        return load_diffusion_policy(
-            pretrained_dir=args.checkpoint,
-            device=args.device,
-            num_inference_steps=args.num_inference_steps,
-            n_action_steps=args.n_action_steps,
-        )
+    print("\n[Init] Starting parallel initialization (arm + cameras)...")
     
-    print("\n[Init] Starting parallel initialization...")
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         arm_future = executor.submit(init_arm)
         cam_future = executor.submit(init_cameras)
-        policy_future = executor.submit(init_policy)
+        
+        # Load policy on MAIN THREAD (CUDA must be initialized on main thread)
+        print("[Init] Loading policy on main thread...", flush=True)
+        try:
+            policy, preprocessor, postprocessor, _, n_action_steps_loaded = \
+                load_diffusion_policy(
+                    pretrained_dir=args.checkpoint,
+                    device=args.device,
+                    num_inference_steps=args.num_inference_steps,
+                    n_action_steps=args.n_action_steps,
+                )
+        except Exception as e:
+            init_errors.append(f"Policy: {e}")
+            import traceback
+            traceback.print_exc()
         
         try:
             piper = arm_future.result(timeout=30)
@@ -1649,29 +1670,48 @@ def main():
             wrist_cam = cams["wrist"]
         except Exception as e:
             init_errors.append(f"Cameras: {e}")
+
+    def cleanup_and_exit(exit_code: int = 1):
+        """Clean up all resources and force exit.
         
+        Uses os._exit() because daemon threads (e.g. StdinController's input()
+        blocking thread) prevent a clean sys.exit().
+        """
+        print(f"\n[Cleanup] Shutting down (exit_code={exit_code})...")
         try:
-            policy, preprocessor, postprocessor, _, n_action_steps_loaded = \
-                policy_future.result(timeout=120)
-        except Exception as e:
-            init_errors.append(f"Policy: {e}")
-            import traceback
-            traceback.print_exc()
-    
+            if piper:
+                piper.disconnect()
+        except Exception:
+            pass
+        try:
+            if fixed_cam:
+                fixed_cam.stop()
+        except Exception:
+            pass
+        try:
+            if wrist_cam:
+                wrist_cam.stop()
+        except Exception:
+            pass
+        try:
+            if ps5:
+                ps5.close()
+        except Exception:
+            pass
+        try:
+            if CV2_AVAILABLE:
+                cv2.destroyAllWindows()
+        except Exception:
+            pass
+        print("[Cleanup] Done. Exiting.")
+        os._exit(exit_code)
+
     # Check for errors
     if init_errors:
         print("\n[Error] Initialization failed:")
         for err in init_errors:
             print(f"  - {err}")
-        if piper:
-            piper.disconnect()
-        if fixed_cam:
-            fixed_cam.stop()
-        if wrist_cam:
-            wrist_cam.stop()
-        if ps5:
-            ps5.close()
-        sys.exit(1)
+        cleanup_and_exit(1)
     
     # Use loaded n_action_steps if not overridden
     if args.n_action_steps is None:
@@ -1680,13 +1720,7 @@ def main():
     # Verify arm is ready
     if not piper.wait_until_ready(timeout=10.0):
         print("[Error] Arm not ready. Try power cycling.")
-        piper.disconnect()
-        fixed_cam.stop()
-        if wrist_cam:
-            wrist_cam.stop()
-        if ps5:
-            ps5.close()
-        sys.exit(1)
+        cleanup_and_exit(1)
     
     # Go to home position
     print("\n[Init] Going to home position...")
@@ -1898,24 +1932,53 @@ def main():
         # Cleanup
         print("\n[Main] Cleaning up...")
         
-        if not piper._emergency_stop:
-            piper.open_gripper()
-            time.sleep(0.5)
-            piper.go_to_home()
-            time.sleep(2.0)
+        try:
+            if piper and not piper._emergency_stop:
+                piper.open_gripper()
+                time.sleep(0.5)
+                piper.go_to_home()
+                time.sleep(2.0)
+        except Exception:
+            pass
         
-        piper.disconnect()
-        fixed_cam.stop()
-        if wrist_cam:
-            wrist_cam.stop()
-        if ps5:
-            ps5.close()
+        # Disconnect arm properly
+        try:
+            if piper:
+                piper.disconnect()
+        except Exception:
+            pass
+        
+        # Close controllers
+        try:
+            if ps5:
+                ps5.close()
+        except Exception:
+            pass
+        
+        # Stop cameras
+        try:
+            if fixed_cam:
+                fixed_cam.stop()
+        except Exception:
+            pass
+        try:
+            if wrist_cam:
+                wrist_cam.stop()
+        except Exception:
+            pass
+        
         if CV2_AVAILABLE:
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         
-        # Save results
+        # Save results before final exit
         if results.num_episodes > 0:
-            results.save(str(out_dir / "eval_results.json"))
+            try:
+                results.save(str(out_dir / "eval_results.json"))
+            except Exception:
+                pass
         
         # Print summary
         print("\n" + "=" * 60)
