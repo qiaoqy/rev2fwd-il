@@ -62,7 +62,9 @@ python 5_eval_diffusion_piper.py \
     --n_action_steps 4 \
     --num_inference_steps 10
 
-(rev2fwd_il) qiyuan@vcg-ROG-Strix-SCAR-16:~/workspace/rev2fwd-il$ python scripts/scripts_piper_local/5_eval_diffusion_piper.py     --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_B/checkpoints/checkpoints/020000/pretrained_model     --device cuda:0
+python scripts/scripts_piper_local/5_eval_diffusion_piper.py     \
+    --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_B/checkpoints/checkpoints/020000/pretrained_model     \
+    --device cuda:0
 """
 
 from __future__ import annotations
