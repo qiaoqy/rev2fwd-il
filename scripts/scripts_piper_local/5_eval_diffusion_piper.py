@@ -774,8 +774,14 @@ class VideoRecorder:
         
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
         h, w = self.frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # Use H.264 (avc1) for broad browser compatibility (Chrome, Firefox, Safari)
+        # Fallback to mp4v if H.264 codec is not available
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
+        if not writer.isOpened():
+            print("[Video] H.264 (avc1) not available, falling back to mp4v")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
         
         for frame in self.frames:
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
