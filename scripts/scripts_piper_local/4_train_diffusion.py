@@ -1369,6 +1369,24 @@ def main() -> None:
             print("Data conversion complete. Exiting (--convert_only flag).")
         return
     
+    # Auto-detect include_gripper from actual dataset metadata
+    # This prevents model/data dimension mismatch when reusing a dataset
+    # that was converted with a different --include_gripper setting.
+    ds_meta_path = lerobot_dataset_dir / "meta" / "info.json"
+    if ds_meta_path.exists():
+        with open(ds_meta_path, "r") as f:
+            ds_info = json.load(f)
+        ds_features = ds_info.get("features", {})
+        if "observation.state" in ds_features:
+            actual_state_dim = ds_features["observation.state"]["shape"][0]
+            expected_state_dim = 8 if args.include_gripper else 7
+            if actual_state_dim != expected_state_dim:
+                old_flag = args.include_gripper
+                args.include_gripper = (actual_state_dim == 8)
+                print(f"\n[AUTO-DETECT] Dataset state_dim={actual_state_dim} "
+                      f"(expected {expected_state_dim} from --include_gripper={old_flag}). "
+                      f"Overriding --include_gripper to {args.include_gripper}.")
+    
     # Initialize distributed process group AFTER data conversion is complete
     # This avoids NCCL timeout issues during long-running conversions
     if world_size > 1 and not torch.distributed.is_initialized():
