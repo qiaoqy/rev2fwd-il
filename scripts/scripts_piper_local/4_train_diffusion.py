@@ -95,7 +95,7 @@ CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
 python scripts/scripts_piper_local/4_train_diffusion.py \
     --dataset data/pick_place_piper_A \
     --out runs/diffusion_piper_teleop_A_0205 \
-    --batch_size 64 --steps 200000 --include_gripper --wandb
+    --batch_size 32 --steps 200000 --include_gripper --wandb
 =============================================================================
 """
 
@@ -566,6 +566,128 @@ def load_episodes_from_data_dir(
     return episodes
 
 
+def verify_lerobot_dataset_integrity(
+    output_dir: Path,
+    repo_id: str = "local/piper_teleop",
+    verify_all_episodes: bool = True,
+) -> bool:
+    """Verify integrity of a LeRobot dataset by attempting to decode video frames.
+    
+    This catches corruption from:
+    - Incomplete video encoding (interrupted finalize/save_episode)
+    - Silent PNG write failures leading to missing frames
+    - Corrupt video concatenation
+    - NFS transient I/O errors during encoding
+    - AV1 codec encoding issues
+    
+    Args:
+        output_dir: Path to the LeRobot dataset.
+        repo_id: Repository ID.
+        verify_all_episodes: If True, verify ALL episodes. If False, sample ~5.
+        
+    Returns:
+        True if dataset is valid, False otherwise.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    
+    output_dir = Path(output_dir)
+    meta_path = output_dir / "meta" / "info.json"
+    
+    if not meta_path.exists():
+        print(f"  [VERIFY] No metadata found at {meta_path}")
+        return False
+    
+    try:
+        with open(meta_path, "r") as f:
+            info = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"  [VERIFY] Corrupted metadata: {e}")
+        return False
+    
+    n_episodes = info.get("total_episodes", 0)
+    total_frames = info.get("total_frames", 0)
+    
+    if n_episodes == 0 or total_frames == 0:
+        print(f"  [VERIFY] Empty dataset (episodes={n_episodes}, frames={total_frames})")
+        return False
+    
+    # Check video files exist and have non-zero size
+    videos_dir = output_dir / "videos"
+    if videos_dir.exists():
+        for video_file in videos_dir.rglob("*.mp4"):
+            if video_file.stat().st_size == 0:
+                print(f"  [VERIFY] Empty video file: {video_file}")
+                return False
+    
+    # Determine which episodes to verify
+    if verify_all_episodes:
+        episodes_to_check = list(range(n_episodes))
+    else:
+        episodes_to_check = sorted(set(
+            [0, n_episodes - 1] + 
+            list(np.linspace(0, n_episodes - 1, min(5, n_episodes), dtype=int))
+        ))
+    
+    print(f"  [VERIFY] Checking {len(episodes_to_check)}/{n_episodes} episodes "
+          f"({total_frames} total frames)...")
+    
+    failed_episodes = []
+    for i, ep_idx in enumerate(episodes_to_check):
+        try:
+            ep_dataset = LeRobotDataset(
+                repo_id=repo_id,
+                root=output_dir,
+                episodes=[ep_idx],
+            )
+            if len(ep_dataset) == 0:
+                failed_episodes.append((ep_idx, "empty episode"))
+                continue
+            
+            # Check first, middle, and last frame of each episode
+            check_indices = sorted(set([0, len(ep_dataset) // 2, len(ep_dataset) - 1]))
+            for frame_idx in check_indices:
+                _ = ep_dataset[frame_idx]
+            
+            del ep_dataset
+        except Exception as e:
+            failed_episodes.append((ep_idx, str(e)))
+        
+        # Progress
+        if (i + 1) % max(1, len(episodes_to_check) // 10) == 0:
+            print(f"    [{i + 1}/{len(episodes_to_check)}] verified...")
+    
+    if failed_episodes:
+        print(f"  [VERIFY] FAILED: {len(failed_episodes)} episodes have errors:")
+        for ep_idx, err in failed_episodes[:10]:  # Show first 10
+            print(f"    Episode {ep_idx}: {err[:200]}")
+        if len(failed_episodes) > 10:
+            print(f"    ... and {len(failed_episodes) - 10} more")
+        return False
+    
+    print(f"  [VERIFY] All {len(episodes_to_check)} episodes verified successfully.")
+    return True
+
+
+def _clear_video_decoder_cache():
+    """Clear LeRobot's module-level video decoder cache.
+    
+    CRITICAL: Must be called after any dataset verification/loading in the main
+    process and before DataLoader forks workers. Otherwise, forked workers inherit
+    stale cached file descriptors from the main process, causing 'Invalid data
+    found when processing input' errors when multiple workers try to seek/read
+    the same duplicated file descriptors concurrently.
+    """
+    try:
+        from lerobot.datasets.video_utils import _default_decoder_cache
+        cache_size = _default_decoder_cache.size()
+        if cache_size > 0:
+            _default_decoder_cache.clear()
+            print(f"  [Cache] Cleared {cache_size} cached video decoders "
+                  f"(prevents stale fd inheritance by DataLoader workers)")
+    except (ImportError, AttributeError):
+        pass
+
+
 def convert_episodes_to_lerobot_format(
     data_dir: str,
     output_dir: str,
@@ -619,17 +741,18 @@ def convert_episodes_to_lerobot_format(
                     image_height, image_width = 270, 320  # Default from metadata
                 has_wrist = "observation.wrist_image" in features
                 
-                # Verify dataset is actually loadable (check parquet files are valid)
+                # Verify dataset integrity (check ALL episodes' video frames)
                 print(f"Verifying existing dataset at {output_dir}...")
                 try:
-                    test_dataset = LeRobotDataset(
-                        repo_id=repo_id,
-                        root=output_dir,
+                    is_valid = verify_lerobot_dataset_integrity(
+                        output_dir, repo_id=repo_id, verify_all_episodes=True,
                     )
-                    # Quick sanity check - try to access first item
-                    if len(test_dataset) > 0:
-                        _ = test_dataset[0]
-                    del test_dataset
+                    # Clear decoder cache after verification to prevent stale
+                    # file descriptors from being inherited by DataLoader workers
+                    _clear_video_decoder_cache()
+                    
+                    if not is_valid:
+                        raise RuntimeError("Dataset integrity check failed")
                     
                     # Dataset is valid
                     print(f"LeRobot dataset already exists at {output_dir}")
@@ -817,6 +940,33 @@ def convert_episodes_to_lerobot_format(
     print("\nFinalizing dataset (encoding videos)...")
     dataset.finalize()
     
+    # Post-conversion integrity verification
+    # This catches: corrupt videos, missing frames, encoding errors, NFS I/O issues
+    print("\nRunning post-conversion integrity verification...")
+    verify_start = time.time()
+    is_valid = verify_lerobot_dataset_integrity(
+        output_dir, repo_id=repo_id, verify_all_episodes=True,
+    )
+    verify_time = time.time() - verify_start
+    
+    if not is_valid:
+        print(f"\n{'!'*60}")
+        print("ERROR: Post-conversion verification FAILED!")
+        print(f"{'!'*60}")
+        print("The converted dataset has corrupted video files.")
+        print("Possible causes:")
+        print("  1. NFS/network filesystem transient I/O errors during encoding")
+        print("  2. Interrupted video encoding (OOM, signal, etc.)")
+        print("  3. AV1 codec encoding issues")
+        print("  4. Disk full or write permission issues")
+        print(f"\nRemoving corrupted dataset at {output_dir}...")
+        shutil.rmtree(output_dir)
+        raise RuntimeError(
+            "Post-conversion verification failed. The dataset has been removed. "
+            "Please re-run the script to try again. If the problem persists, "
+            "check disk space, NFS mount health, and try reducing convert_workers."
+        )
+    
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")
     print("Conversion Complete!")
@@ -825,6 +975,7 @@ def convert_episodes_to_lerobot_format(
     print(f"  Total frames: {total_frames}")
     print(f"  Has wrist camera: {has_wrist}")
     print(f"  Action type: relative delta")
+    print(f"  Verification: PASSED ({verify_time:.1f}s)")
     print(f"  Time: {elapsed:.1f}s")
     print(f"  Dataset saved to: {output_dir}")
     print(f"{'='*60}\n")
@@ -862,6 +1013,10 @@ def train_with_lerobot_api(
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
     from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.scripts.lerobot_train import train
+    
+    # Clear decoder cache before training to prevent stale file descriptors
+    # from being inherited by DataLoader worker processes (fork-safety)
+    _clear_video_decoder_cache()
     
     # Try to import custom training with viz
     try:

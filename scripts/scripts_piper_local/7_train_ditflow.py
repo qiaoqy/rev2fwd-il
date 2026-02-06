@@ -11,33 +11,27 @@ The key difference from standard Diffusion Policy is:
 - Generally faster inference with similar or better quality
 
 =============================================================================
-LIBRARY MODIFICATIONS REQUIRED
+DEPENDENCIES
 =============================================================================
-This script requires the following modifications to the lerobot_policy_ditflow
-library at: /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/lerobot_policy_ditflow
+Requires:
+  - lerobot >= 0.4.3 (installed from source):
+        git clone https://github.com/danielsanjosepro/lerobot.git
+        pip install -e ./lerobot
 
-FILE: src/lerobot_policy_ditflow/modeling_ditflow.py
+  - lerobot_policy_ditflow >= 0.1.0 (installed from source):
+        git clone https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
+        pip install -e ./lerobot_policy_ditflow
 
-1. DiTFlowPolicy.__init__() (around line 345-358):
-   Added `dataset_meta=None` parameter for compatibility with lerobot factory:
-   
-   def __init__(
-       self,
-       config: DiTFlowConfig,
-       dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-       dataset_meta=None,  # Added for compatibility with lerobot factory
-   ):
-       ...
-       # dataset_meta is accepted but not used, only for API compatibility
+The lerobot_policy_ditflow library registers itself as a third-party plugin
+via the lerobot plugin system (register_third_party_plugins). On import, it
+registers the "ditflow" policy type via @PreTrainedConfig.register_subclass.
 
-2. _prepare_global_conditioning() (around line 555-615):
-   Added debug print statements (can be removed in production):
-   
-   print(f"[DEBUG _prepare_global_conditioning] OBS_STATE shape: ...")
-   print(f"[DEBUG _prepare_global_conditioning] OBS_IMAGES shape: ...")
-   print(f"[DEBUG _prepare_global_conditioning] img_features after encoder: ...")
-   print(f"[DEBUG _prepare_global_conditioning] global_cond_feats shapes: ...")
-   print(f"[DEBUG _prepare_global_conditioning] final global_cond shape: ...")
+To verify installation:
+    python -c "from lerobot.utils.import_utils import register_third_party_plugins; \
+               register_third_party_plugins(); \
+               from lerobot.configs.policies import PreTrainedConfig; \
+               print(PreTrainedConfig.get_known_choices().keys())"
+    # Should include 'ditflow' in the output
 
 =============================================================================
 INPUT DATA FORMAT (from script 1)
@@ -115,6 +109,27 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --batch_size 64 --steps 50000 \
     --include_gripper --wandb
 
+# With XYZ visualization during training
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/ditflow_piper_teleop \
+    --batch_size 64 --steps 50000 \
+    --include_gripper --enable_xyz_viz --viz_save_freq 5000 --wandb
+
+# Custom DiT architecture (smaller model for faster training)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/ditflow_piper_teleop \
+    --hidden_dim 256 --num_blocks 4 --num_heads 8 --dim_feedforward 2048 \
+    --batch_size 64 --steps 50000 --wandb
+
+# Use beta noise scheduling (from Pi0 paper)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/ditflow_piper_teleop \
+    --training_noise_sampling beta \
+    --batch_size 64 --steps 50000 --wandb
+
 # Multi-GPU training
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
     scripts/scripts_piper_local/7_train_ditflow.py \
@@ -127,6 +142,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
     --out runs/ditflow_piper_teleop \
     --convert_only
+
+# Overfit mode (1 episode, useful for debugging)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/ditflow_piper_overfit \
+    --overfit --steps 1000 --include_gripper
+
+# Resume training from checkpoint
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper_A \
+    --out runs/ditflow_piper_teleop \
+    --resume --steps 200000
 =============================================================================
 """
 
@@ -382,6 +409,34 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Overwrite existing checkpoints. Default: True. Use --no-overwrite to disable.",
+    )
+    parser.add_argument(
+        "--viz_save_freq",
+        type=int,
+        default=20000,
+        help="Save XYZ visualization every N steps. Default: 20000.",
+    )
+    parser.add_argument(
+        "--enable_xyz_viz",
+        action="store_true",
+        help="Enable XYZ curve visualization during training.",
+    )
+
+    # =========================================================================
+    # DiT Flow Sampling
+    # =========================================================================
+    parser.add_argument(
+        "--clip_sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clip action samples to [-clip_sample_range, +clip_sample_range] during inference. "
+             "Default: True. Use --no-clip_sample to disable.",
+    )
+    parser.add_argument(
+        "--clip_sample_range",
+        type=float,
+        default=1.0,
+        help="Range for clipping action samples during inference. Default: 1.0.",
     )
 
     # =========================================================================
@@ -935,6 +990,13 @@ def train_with_lerobot_api(
     from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.scripts.lerobot_train import train
     
+    # Try to import custom training with viz
+    try:
+        from rev2fwd_il.train.lerobot_train_with_viz import train_with_xyz_visualization
+        HAS_VIZ_TRAIN = True
+    except ImportError:
+        HAS_VIZ_TRAIN = False
+    
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     
@@ -990,6 +1052,15 @@ def train_with_lerobot_api(
         ),
     }
     
+    # Dynamically calculate drop_n_last_frames based on user's parameters
+    # Formula: horizon - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames = args.horizon - args.n_action_steps - args.n_obs_steps + 1
+    if drop_n_last_frames < 0:
+        print(f"Warning: drop_n_last_frames would be {drop_n_last_frames}, clamping to 0.")
+        print(f"  Check: horizon({args.horizon}) - n_action_steps({args.n_action_steps}) "
+              f"- n_obs_steps({args.n_obs_steps}) + 1 = {drop_n_last_frames}")
+        drop_n_last_frames = 0
+    
     # Create DiT Flow Policy configuration
     policy_cfg = DiTFlowConfig(
         n_obs_steps=args.n_obs_steps,
@@ -1010,6 +1081,10 @@ def train_with_lerobot_api(
         dim_feedforward=args.dim_feedforward,
         num_inference_steps=args.num_inference_steps,
         training_noise_sampling=args.training_noise_sampling,
+        clip_sample=args.clip_sample,
+        clip_sample_range=args.clip_sample_range,
+        # Dynamically calculated
+        drop_n_last_frames=drop_n_last_frames,
         # Optimizer settings
         optimizer_lr=args.lr,
     )
@@ -1134,6 +1209,7 @@ def train_with_lerobot_api(
     print(f"  Vision backbone: {args.vision_backbone}")
     print(f"  Device: {device}")
     print(f"  WandB: {args.wandb}")
+    print(f"  XYZ visualization: {args.enable_xyz_viz}")
     print("")
     print("  DiT-specific parameters:")
     print(f"    Hidden dim: {args.hidden_dim}")
@@ -1143,6 +1219,8 @@ def train_with_lerobot_api(
     print(f"    Feedforward dim: {args.dim_feedforward}")
     print(f"    Inference steps: {args.num_inference_steps}")
     print(f"    Noise sampling: {args.training_noise_sampling}")
+    print(f"    Clip sample: {args.clip_sample} (range: {args.clip_sample_range})")
+    print(f"    Drop N last frames: {drop_n_last_frames}")
     if train_episodes is not None:
         print(f"  Train episodes: {len(train_episodes)}")
     if val_episodes is not None:
@@ -1155,7 +1233,19 @@ def train_with_lerobot_api(
         sys.argv = [sys.argv[0], f"--config_path={resume_config_path}"]
     
     try:
-        train(train_cfg)
+        if args.enable_xyz_viz and HAS_VIZ_TRAIN:
+            xyz_viz_dir = out_dir / "xyz_viz"
+            train_with_xyz_visualization(
+                train_cfg,
+                viz_save_freq=args.viz_save_freq,
+                xyz_viz_dir=xyz_viz_dir,
+                val_dataset_cfg=val_dataset_cfg,
+                val_freq=args.val_freq,
+            )
+        else:
+            if args.enable_xyz_viz and not HAS_VIZ_TRAIN:
+                print("Warning: XYZ visualization not available, using standard training")
+            train(train_cfg)
     finally:
         sys.argv = original_argv
     
@@ -1270,10 +1360,10 @@ def main() -> None:
                 actual_state_dim = features["observation.state"]["shape"][0]
                 # Override include_gripper based on actual data
                 if actual_state_dim == 7:
-                    include_gripper = False
+                    args.include_gripper = False
                     print(f"  State dim: {actual_state_dim} (ee_pose only - overriding --include_gripper)")
                 elif actual_state_dim == 8:
-                    include_gripper = True
+                    args.include_gripper = True
                     print(f"  State dim: {actual_state_dim} (ee_pose + gripper)")
                 else:
                     print(f"  State dim: {actual_state_dim} (unexpected dimension)")

@@ -19,9 +19,10 @@ The goal is to perform a **Pick & Place** task with local data collection and fi
 9. [Script 4: Train Diffusion Policy](#9-script-4-train-diffusion-policy)
 10. [Script 5: Model Evaluation](#10-script-5-model-evaluation)
 11. [Script 6: FSM Data Collection](#11-script-6-fsm-data-collection)
-12. [Safety Guidelines](#12-safety-guidelines)
-13. [Debugging Guide](#13-debugging-guide--known-issues)
-14. [TODO / Open Questions](#14-todo--open-questions)
+12. [Script 7: Train DiT Flow Policy](#12-script-7-train-dit-flow-policy)
+13. [Safety Guidelines](#13-safety-guidelines)
+14. [Debugging Guide](#14-debugging-guide--known-issues)
+15. [TODO / Open Questions](#15-todo--open-questions)
 
 ---
 
@@ -750,7 +751,190 @@ python 6_collect_data_piper.py \
 
 ---
 
-## 12. Safety Guidelines
+## 12. Script 7: Train DiT Flow Policy
+
+### 12.1 Overview
+
+`7_train_ditflow.py` trains a vision-based **DiT Flow Policy** (Diffusion Transformer + Flow Matching) using the `lerobot_policy_ditflow` plugin on the teleoperation data collected by Script 1 (or time-reversed data from Script 3).
+
+This script provides the **same functionality as Script 4** (Diffusion Policy) but uses a different underlying architecture:
+
+| Feature | Script 4 (Diffusion) | Script 7 (DiT Flow) |
+|---------|----------------------|----------------------|
+| Architecture | U-Net (CNN) | DiT (Transformer) |
+| Noise Model | DDPM (diffusion) | Flow Matching (ODE) |
+| Default crop_shape | 128 × 128 | 84 × 84 |
+| Inference | DDPM reverse process | Euler ODE integration |
+| Parameters | ~61M | ~53M |
+| Config class | `DiffusionConfig` | `DiTFlowConfig` |
+
+**Key Features** (same as Script 4):
+- Uses **relative delta actions** (position + quaternion + gripper)
+- Supports dual cameras (fixed + wrist) with automatic resolution alignment
+- LeRobot v3.0 dataset format with video encoding
+- Multi-GPU training via `torchrun`
+- WandB logging integration
+- XYZ trajectory visualization during training
+
+### 12.2 Dependencies
+
+DiT Flow requires two additional packages (not included in the base installation):
+
+```bash
+# 1. LeRobot (danielsanjosepro's fork with plugin support)
+git clone https://github.com/danielsanjosepro/lerobot.git
+pip install -e ./lerobot
+
+# 2. DiT Flow Policy plugin
+git clone https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
+pip install -e ./lerobot_policy_ditflow
+```
+
+Verify installation:
+```bash
+python -c "from lerobot.utils.import_utils import register_third_party_plugins; \
+           register_third_party_plugins(); \
+           from lerobot.configs.policies import PreTrainedConfig; \
+           print('ditflow' in PreTrainedConfig.get_known_choices())"
+# Should print: True
+```
+
+### 12.3 Usage Examples
+
+```bash
+# Basic training (single GPU)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --batch_size 64 --steps 50000 --wandb
+
+# With gripper state in observation (state_dim=8)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --include_gripper \
+    --batch_size 64 --steps 50000 --wandb
+
+# With XYZ visualization during training
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --include_gripper --enable_xyz_viz --viz_save_freq 5000 --wandb
+
+# Custom DiT architecture (smaller model)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --hidden_dim 256 --num_blocks 4 --num_heads 8 --dim_feedforward 2048 \
+    --batch_size 64 --steps 50000 --wandb
+
+# Beta noise scheduling (from Pi0 paper)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --training_noise_sampling beta \
+    --batch_size 64 --steps 50000 --wandb
+
+# Multi-GPU training (4 GPUs)
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --batch_size 32 --steps 100000 --wandb
+
+# Data conversion only (for debugging)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --convert_only
+
+# Overfit mode (1 episode for debugging)
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_overfit \
+    --overfit --steps 1000 --include_gripper
+
+# Resume training from checkpoint
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pick_place_piper \
+    --out runs/ditflow_piper_teleop \
+    --resume --steps 200000
+```
+
+### 12.4 Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--dataset` | `data/pick_place_piper` | Path to episode tar.gz files |
+| `--out` | `runs/ditflow_piper_teleop` | Output directory for checkpoints |
+| `--steps` | `100000` | Number of training steps |
+| `--batch_size` | `32` | Mini-batch size |
+| `--lr` | `1e-4` | Learning rate |
+| `--image_size` | `240 320` | Target image size (H, W) |
+| `--include_gripper` | `False` | Include gripper state in observation |
+| `--num_episodes` | `-1` | Number of episodes to use (-1 = all) |
+| `--convert_only` | `False` | Only convert data, don't train |
+| `--skip_convert` | `False` | Skip conversion (use existing dataset) |
+| `--force_convert` | `False` | Force re-conversion |
+| `--resume` | `False` | Resume from checkpoint |
+| `--overfit` | `False` | Overfit mode (1 episode) |
+| `--wandb` | `False` | Enable WandB logging |
+| `--wandb_project` | `piper-ditflow-teleop` | WandB project name |
+| `--enable_xyz_viz` | `False` | Enable XYZ trajectory plots during training |
+| `--viz_save_freq` | `5000` | Steps between visualization saves |
+| `--clip_sample` | `True` | Clip denoised actions to a fixed range |
+| `--clip_sample_range` | `1.0` | Clipping range |
+
+### 12.5 DiT Flow Architecture Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--n_obs_steps` | `2` | Number of observation steps |
+| `--horizon` | `16` | Action sequence length |
+| `--n_action_steps` | `8` | Number of action steps to execute |
+| `--vision_backbone` | `resnet18` | Vision backbone architecture |
+| `--crop_shape` | `84 84` | Image crop shape (DiT default) |
+| `--hidden_dim` | `512` | Transformer hidden dimension |
+| `--num_blocks` | `6` | Number of DiT transformer blocks |
+| `--num_heads` | `16` | Number of attention heads |
+| `--dim_feedforward` | `4096` | Feedforward dimension |
+| `--dropout` | `0.1` | Dropout rate |
+| `--num_inference_steps` | `100` | Euler steps for ODE sampling |
+| `--training_noise_sampling` | `uniform` | Noise schedule: `uniform` or `beta` |
+
+### 12.6 Output Structure
+
+Same as Script 4:
+
+```
+runs/ditflow_piper_teleop/
+├── lerobot_dataset/           # Converted LeRobot dataset
+│   ├── data/
+│   ├── meta/
+│   └── videos/
+├── checkpoints/               # Training checkpoints
+│   └── checkpoints/
+│       ├── 020000/
+│       │   ├── model.safetensors
+│       │   └── pretrained_model/
+│       ├── 040000/
+│       └── last/              # Latest checkpoint
+├── xyz_visualizations/        # (if --enable_xyz_viz)
+│   ├── xyz_viz_step_005000.png
+│   └── xyz_viz_step_010000.png
+└── .conversion_meta.json      # Metadata for distributed training
+```
+
+### 12.7 Training Tips
+
+1. **GPU Memory**: With ResNet18 backbone + DiT, batch_size=64 requires ~18GB VRAM
+2. **DiT vs Diffusion**: DiT Flow tends to converge faster but may need tuning of `num_inference_steps`
+3. **Noise Scheduling**: `beta` scheduling (from Pi0) may improve sample quality at the cost of slightly slower convergence
+4. **Crop Shape**: Default (84, 84) is smaller than Diffusion's (128, 128); adjust if needed
+
+---
+
+## 13. Safety Guidelines
 
 ### 12.1 Pre-Flight Checklist
 
@@ -786,9 +970,9 @@ WORKSPACE_LIMITS = {
 
 ---
 
-## 13. Debugging Guide & Known Issues
+## 14. Debugging Guide & Known Issues
 
-### 13.1 Critical Parameters to Calibrate
+### 14.1 Critical Parameters to Calibrate
 
 | Parameter | Location | Issue | How to Calibrate |
 |-----------|----------|-------|------------------|
@@ -797,7 +981,7 @@ WORKSPACE_LIMITS = {
 | `GRASP_HEIGHT` | Both scripts | `0.15m` may be too high/low | Adjust based on object height |
 | `GRIPPER_OPEN_POS` | Both scripts | `70000` (70mm) may not match your gripper | Check SDK docs or test with `piper.GetArmGripperMsgs()` |
 
-### 13.2 Known Issues & Bugs
+### 14.2 Known Issues & Bugs
 
 #### Script 6: FSM Data Collection
 
@@ -841,7 +1025,7 @@ WORKSPACE_LIMITS = {
    - Manual `/ 255.0` normalization in `build_observation()` may conflict with preprocessor
    - Check if preprocessor already handles image normalization
 
-### 13.3 Pre-Run Checklist
+### 14.3 Pre-Run Checklist
 # 1. Test CAN connection
 python -c "from piper_sdk import *; p=C_PiperInterface_V2('can0'); p.ConnectPort(); print('OK')"
 
@@ -873,7 +1057,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 "
 ```
 
-### 13.4 Recommended Debugging Steps
+### 14.4 Recommended Debugging Steps
 
 1. **First run with arm disabled** (comment out `piper.connect()`)
    - Verify cameras work
@@ -901,7 +1085,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 
 ---
 
-## 14. TODO / Open Questions
+## 15. TODO / Open Questions
 
 - [ ] Determine exact home position by reading from `piper_ctrl_go_zero.py`
 - [ ] Calibrate camera intrinsics if needed for future visual servoing

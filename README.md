@@ -37,6 +37,22 @@ sudo apt-get install -y libhidapi-hidraw0 libhidapi-dev
 pip install hidapi
 ```
 
+### (Optional) DiT Flow Policy for Real-Robot Experiments
+
+To use DiT Flow (Diffusion Transformer + Flow Matching) as an alternative to Diffusion Policy, install the following:
+
+```bash
+# 1. LeRobot (fork with third-party plugin support)
+git clone https://github.com/danielsanjosepro/lerobot.git
+pip install -e ./lerobot
+
+# 2. DiT Flow Policy plugin (registers as "ditflow" policy type)
+git clone https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
+pip install -e ./lerobot_policy_ditflow
+```
+
+> **Note**: `lerobot_policy_ditflow` uses LeRobot's plugin system — it registers itself automatically via `register_third_party_plugins()`. No manual code modifications are needed. See [Script 7](scripts/scripts_piper_local/README.md#12-script-7-train-dit-flow-policy) for training instructions.
+
 ---
 
 ## 2. Workflow
