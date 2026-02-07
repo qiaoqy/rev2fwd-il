@@ -79,9 +79,11 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import imageio
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
@@ -767,27 +769,29 @@ class VideoRecorder:
         self.frames.append(combined)
     
     def save(self):
-        """Save recorded frames to video file."""
+        """Save recorded frames to video file using imageio + libx264.
+        
+        Uses imageio with libx264 codec and yuv420p pixel format for broad
+        compatibility (matching script 2's encoding approach).
+        """
         if not self.frames:
             print("[Video] No frames to save!")
             return
         
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
-        h, w = self.frames[0].shape[:2]
-        # Use H.264 (avc1) for broad browser compatibility (Chrome, Firefox, Safari)
-        # Fallback to mp4v if H.264 codec is not available
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
-        if not writer.isOpened():
-            print("[Video] H.264 (avc1) not available, falling back to mp4v")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
+        
+        writer = imageio.get_writer(
+            self.output_path,
+            fps=self.fps,
+            codec='libx264',
+            quality=8,
+            pixelformat='yuv420p',
+        )
         
         for frame in self.frames:
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            writer.write(bgr)
+            writer.append_data(frame)
         
-        writer.release()
+        writer.close()
         print(f"[Video] Saved {len(self.frames)} frames to {self.output_path}")
     
     def clear(self):
@@ -1530,10 +1534,10 @@ PS5 Controller:
                         help="Show camera feed with overlay during evaluation (requires OpenCV)")
     
     # Output options
-    parser.add_argument("--out_dir", type=str, default="eval_results",
-                        help="Output directory (default: eval_results)")
-    parser.add_argument("--record_video", action="store_true",
-                        help="Record video of each episode")
+    parser.add_argument("--out_dir", type=str, default=None,
+                        help="Output directory (default: auto-generated under checkpoint run dir with date)")
+    parser.add_argument("--no_record_video", action="store_true",
+                        help="Disable video recording (video is recorded by default)")
     
     # Device
     parser.add_argument("--device", type=str, default="cuda",
@@ -1557,13 +1561,37 @@ def normalize_camera_value(value: str) -> Union[int, str]:
 def main():
     args = parse_args()
     
+    # Flip record_video: default is True, --no_record_video disables it
+    args.record_video = not args.no_record_video
+    
+    # Auto-derive output directory from checkpoint path if not specified
+    if args.out_dir is None:
+        # Checkpoint path example:
+        #   /media/.../runs/diffusion_piper_teleop_B/checkpoints/checkpoints/020000/pretrained_model
+        # We want the run root:  /media/.../runs/diffusion_piper_teleop_B/
+        checkpoint_path = Path(args.checkpoint).resolve()
+        # Walk up from checkpoint to find the run directory (parent of "checkpoints")
+        run_dir = checkpoint_path
+        while run_dir.name != '' and run_dir.name != run_dir.root:
+            if run_dir.name == 'checkpoints' and run_dir.parent.name != 'checkpoints':
+                run_dir = run_dir.parent
+                break
+            run_dir = run_dir.parent
+        else:
+            # Fallback: use checkpoint parent
+            run_dir = checkpoint_path.parent
+        
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = run_dir / f"eval_{date_str}"
+    else:
+        out_dir = Path(args.out_dir)
+    
     # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
     # Create output directory
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
     print("\n" + "=" * 60)
@@ -1574,7 +1602,8 @@ def main():
     print(f"  Max steps:     {args.max_steps}")
     print(f"  Control freq:  {args.control_freq} Hz")
     print(f"  Device:        {args.device}")
-    print(f"  Output dir:    {args.out_dir}")
+    print(f"  Output dir:    {out_dir}")
+    print(f"  Record video:  {args.record_video}")
     print("=" * 60)
     
     # =========================================================================
