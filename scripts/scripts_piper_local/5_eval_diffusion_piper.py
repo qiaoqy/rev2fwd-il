@@ -63,7 +63,8 @@ python 5_eval_diffusion_piper.py \
     --num_inference_steps 10
 
 python scripts/scripts_piper_local/5_eval_diffusion_piper.py     \
-    --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_B/checkpoints/checkpoints/020000/pretrained_model     \
+    --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_A/checkpoints/checkpoints/020000/pretrained_model     \
+    --max_steps 1000 \
     --device cuda:0
 """
 
@@ -84,6 +85,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import imageio
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for headless rendering
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
@@ -760,9 +764,8 @@ class VideoRecorder:
     def add_combined_frame(self, fixed_frame: np.ndarray, wrist_frame: Optional[np.ndarray]):
         """Add a combined frame with both camera views."""
         if wrist_frame is not None:
-            h = min(fixed_frame.shape[0], wrist_frame.shape[0])
-            fixed_resized = cv2.resize(fixed_frame, (self.width // 2, h))
-            wrist_resized = cv2.resize(wrist_frame, (self.width // 2, h))
+            fixed_resized = cv2.resize(fixed_frame, (self.width // 2, self.height))
+            wrist_resized = cv2.resize(wrist_frame, (self.width // 2, self.height))
             combined = np.concatenate([fixed_resized, wrist_resized], axis=1)
         else:
             combined = cv2.resize(fixed_frame, (self.width, self.height))
@@ -797,6 +800,75 @@ class VideoRecorder:
     def clear(self):
         """Clear recorded frames."""
         self.frames = []
+
+
+# =============================================================================
+# Trajectory Comparison Plot
+# =============================================================================
+
+def generate_trajectory_plot(
+    actual_positions: List[np.ndarray],
+    integrated_positions: List[np.ndarray],
+    episode_id: int,
+    width: int = 960,
+    height: int = 720,
+    dpi: int = 100,
+) -> np.ndarray:
+    """Generate a comparison plot of actual EE trajectory vs action-integrated trajectory.
+    
+    Creates 3 subplots (X, Y, Z) each showing:
+      - Actual arm end-effector position (blue solid line)
+      - Cumulative integral of policy output deltas (red dashed line)
+    
+    The gap between the two lines illustrates positions the arm cannot
+    reach due to structural / kinematic limitations.
+    
+    Args:
+        actual_positions: List of [x, y, z] actual EE positions per step.
+        integrated_positions: List of [x, y, z] cumulative-sum of commanded
+            deltas starting from the initial actual position.
+        episode_id: Episode number (for the title).
+        width, height: Output image size in pixels.
+        dpi: Matplotlib DPI.
+    
+    Returns:
+        RGB image as uint8 numpy array (H, W, 3).
+    """
+    actual = np.array(actual_positions)      # (T, 3)
+    integrated = np.array(integrated_positions)  # (T, 3)
+    steps = np.arange(len(actual))
+    
+    labels = ['X (m)', 'Y (m)', 'Z (m)']
+    colors_actual = ['#1f77b4', '#2ca02c', '#9467bd']   # blue, green, purple
+    colors_cmd = ['#ff7f0e', '#d62728', '#e377c2']      # orange, red, pink
+    
+    fig, axes = plt.subplots(3, 1, figsize=(width / dpi, height / dpi), dpi=dpi,
+                             sharex=True)
+    fig.suptitle(f'Episode {episode_id}: Commanded (integral) vs Actual Trajectory',
+                 fontsize=13, fontweight='bold')
+    
+    for i, (ax, label) in enumerate(zip(axes, labels)):
+        ax.plot(steps, actual[:, i], color=colors_actual[i], linewidth=1.5,
+                label='Actual EE pos')
+        ax.plot(steps, integrated[:, i], color=colors_cmd[i], linewidth=1.5,
+                linestyle='--', label='Action integral (commanded)')
+        # Shade the gap
+        ax.fill_between(steps, actual[:, i], integrated[:, i],
+                        alpha=0.15, color=colors_cmd[i])
+        ax.set_ylabel(label, fontsize=11)
+        ax.legend(loc='upper right', fontsize=9)
+        ax.grid(True, alpha=0.3)
+    
+    axes[-1].set_xlabel('Step', fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    
+    # Render to RGB numpy array
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)[:, :, :3].copy()  # RGBA -> RGB
+    plt.close(fig)
+    
+    return img
 
 
 # =============================================================================
@@ -1201,6 +1273,11 @@ def run_episode(
     user_stopped = False
     gripper_manual_override = None  # None = follow policy, float = manual angle
     
+    # Trajectory tracking for comparison plot
+    actual_positions = []       # actual EE [x, y, z] each step
+    integrated_positions = []   # cumulative sum of action deltas [x, y, z]
+    integrated_xyz = None       # running sum, initialized on first step
+    
     # Log frequency for status messages
     log_freq = max(1, control_freq)  # Print once per second
     
@@ -1373,6 +1450,20 @@ def run_episode(
                   f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
         
         # =================================================================
+        # Track trajectory for comparison plot
+        # =================================================================
+        current_xyz = np.array([pose['x'], pose['y'], pose['z']])
+        actual_positions.append(current_xyz.copy())
+        
+        if integrated_xyz is None:
+            # Initialize integrated trajectory at the actual starting position
+            integrated_xyz = current_xyz.copy()
+        
+        # Accumulate position deltas from action output
+        integrated_xyz = integrated_xyz + np.array([action[0], action[1], action[2]])
+        integrated_positions.append(integrated_xyz.copy())
+        
+        # =================================================================
         # Apply action to robot
         # =================================================================
         target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg = \
@@ -1465,6 +1556,36 @@ def run_episode(
     duration = time.time() - episode_start_time
     status = "stopped by user" if user_stopped else "completed"
     print(f"[Episode {episode_id}] {status}: {step} steps in {duration:.1f}s ({step/duration:.1f}Hz)")
+    
+    # =================================================================
+    # Generate trajectory comparison plot and attach to video
+    # =================================================================
+    if len(actual_positions) > 1 and video_recorder is not None:
+        try:
+            plot_img = generate_trajectory_plot(
+                actual_positions=actual_positions,
+                integrated_positions=integrated_positions,
+                episode_id=episode_id,
+                width=max(960, video_recorder.width),
+                height=max(720, video_recorder.height),
+            )
+            # Resize plot to match video frame dimensions
+            plot_resized = cv2.resize(plot_img,
+                                      (video_recorder.frames[0].shape[1],
+                                       video_recorder.frames[0].shape[0]),
+                                      interpolation=cv2.INTER_LINEAR)
+            # Append plot as extra frames at the end of the video (show for 5 seconds)
+            plot_hold_frames = video_recorder.fps * 5
+            for _ in range(plot_hold_frames):
+                video_recorder.frames.append(plot_resized)
+            print(f"[Episode {episode_id}] Trajectory plot appended to video ({plot_hold_frames} frames)")
+            
+            # Also save the plot as a standalone PNG next to the video
+            plot_save_path = Path(video_recorder.output_path).with_suffix('.trajectory.png')
+            imageio.imwrite(str(plot_save_path), plot_img)
+            print(f"[Episode {episode_id}] Trajectory plot saved to {plot_save_path}")
+        except Exception as e:
+            print(f"[Episode {episode_id}] Warning: Failed to generate trajectory plot: {e}")
     
     return EpisodeResult(
         episode_id=episode_id,
