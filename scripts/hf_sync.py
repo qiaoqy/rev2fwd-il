@@ -10,7 +10,10 @@ Usage:
 python scripts/hf_sync.py download-model qiaoqy/diffusion_piper_teleop_A --local_dir /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_A
 
     # Upload model (entire experiment folder, ignores lerobot_dataset)
-    python scripts/hf_sync.py upload-model runs/diffusion_piper_teleop_A
+    python scripts/hf_sync.py upload-model runs/ditflow_piper_teleop_B
+    python scripts/hf_sync.py upload-model runs/ditflow_piper_teleop_B_0206
+
+    python scripts/hf_sync.py upload-model runs/diffusion_piper_teleop_B_0205
     
     # Download model
     python scripts/hf_sync.py download-model diffusion_piper_teleop_A --local_dir runs/diffusion_piper_teleop_A
