@@ -20,9 +20,10 @@ The goal is to perform a **Pick & Place** task with local data collection and fi
 10. [Script 5: Model Evaluation](#10-script-5-model-evaluation)
 11. [Script 6: FSM Data Collection](#11-script-6-fsm-data-collection)
 12. [Script 7: Train DiT Flow Policy](#12-script-7-train-dit-flow-policy)
-13. [Safety Guidelines](#13-safety-guidelines)
-14. [Debugging Guide](#14-debugging-guide--known-issues)
-15. [TODO / Open Questions](#15-todo--open-questions)
+13. [Script 8: Evaluate DiT Flow Policy](#13-script-8-evaluate-dit-flow-policy)
+14. [Safety Guidelines](#14-safety-guidelines)
+15. [Debugging Guide](#15-debugging-guide--known-issues)
+16. [TODO / Open Questions](#16-todo--open-questions)
 
 ---
 
@@ -778,26 +779,20 @@ This script provides the **same functionality as Script 4** (Diffusion Policy) b
 
 ### 12.2 Dependencies
 
-DiT Flow requires two additional packages (not included in the base installation):
+DiT Flow requires the `lerobot_policy_ditflow` plugin package (standard `lerobot >= 0.4.2` works fine; **no fork needed**):
 
 ```bash
-# 1. LeRobot (danielsanjosepro's fork with plugin support)
-git clone https://github.com/danielsanjosepro/lerobot.git
-pip install -e ./lerobot
-
-# 2. DiT Flow Policy plugin
-git clone https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
-pip install -e ./lerobot_policy_ditflow
+# Install DiT Flow Policy plugin
+pip install git+https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
 ```
 
 Verify installation:
 ```bash
-python -c "from lerobot.utils.import_utils import register_third_party_plugins; \
-           register_third_party_plugins(); \
-           from lerobot.configs.policies import PreTrainedConfig; \
-           print('ditflow' in PreTrainedConfig.get_known_choices())"
-# Should print: True
+python -c "from lerobot_policy_ditflow import DiTFlowConfig, DiTFlowPolicy; print('OK')"
+# Should print: OK
 ```
+
+> **Note**: The plugin auto-registers itself via `@PreTrainedConfig.register_subclass("ditflow")` when imported. No manual plugin registration is required.
 
 ### 12.3 Usage Examples
 
@@ -934,9 +929,133 @@ runs/ditflow_piper_teleop/
 
 ---
 
-## 13. Safety Guidelines
+## 13. Script 8: Evaluate DiT Flow Policy
 
-### 12.1 Pre-Flight Checklist
+**File**: `8_eval_ditflow_piper.py`
+
+This script evaluates a trained **DiT Flow** (Diffusion Transformer with Flow Matching) policy on the real Piper arm.  It is the evaluation counterpart of **Script 7** (`7_train_ditflow.py`), analogous to how **Script 5** evaluates the standard Diffusion Policy trained by Script 4.
+
+### 13.1 Script 8 vs Script 5 Comparison
+
+| Feature | Script 5 (Diffusion) | Script 8 (DiT Flow) |
+|---------|----------------------|----------------------|
+| Policy class | `DiffusionPolicy` | `DiTFlowPolicy` |
+| Config class | `DiffusionConfig` | `DiTFlowConfig` |
+| Architecture | U-Net (CNN) | DiT (Transformer) |
+| Noise model | DDPM (diffusion) | Flow Matching (ODE) |
+| Inference | DDPM reverse process | Euler ODE integration |
+| Plugin package | built-in lerobot | `lerobot_policy_ditflow` |
+| Hardware interface | Identical | Identical |
+| Observation format | Identical | Identical |
+| PS5 controller | Identical | Identical |
+
+> All shared infrastructure (CameraCapture, PiperController, PS5Controller, `build_observation`, `apply_delta_action`, `run_episode`, main loop) is **identical** between Script 5 and Script 8.  The only difference is the policy loading function.
+
+### 13.2 Dependencies
+
+Requires the same packages as Script 7 (see [Section 12.2](#122-dependencies)):
+- `lerobot >= 0.4.2`
+- `lerobot_policy_ditflow >= 0.1.0`
+
+### 13.3 Usage Examples
+
+```bash
+# Basic evaluation
+python 8_eval_ditflow_piper.py \
+    --checkpoint /path/to/ditflow_checkpoint/pretrained_model
+
+# Full options
+python 8_eval_ditflow_piper.py \
+    --checkpoint /path/to/pretrained_model \
+    --can_interface can0 \
+    --num_episodes 10 \
+    --max_steps 500 \
+    --control_freq 20 \
+    --device cuda:0 \
+    --show_camera
+
+# Override inference steps (fewer = faster but noisier)
+python 8_eval_ditflow_piper.py \
+    --checkpoint /path/to/pretrained_model \
+    --num_inference_steps 50
+
+# Override action steps
+python 8_eval_ditflow_piper.py \
+    --checkpoint /path/to/pretrained_model \
+    --n_action_steps 4 --num_inference_steps 100
+```
+
+### 13.4 CLI Options
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint` | *(required)* | Path to pretrained model directory |
+| `--can_interface` / `-c` | `can0` | CAN interface name |
+| `--num_episodes` | `10` | Number of evaluation episodes |
+| `--max_steps` | `500` | Maximum steps per episode |
+| `--n_action_steps` | model config | Action steps per inference cycle |
+| `--num_inference_steps` | model config (~100) | Flow integration steps |
+| `--control_freq` | `20` | Control frequency in Hz |
+| `--speed` / `-s` | `20` | Motion speed percentage |
+| `--front_cam` / `-f` | `Orbbec_Gemini_335L` | Front camera ID or name |
+| `--wrist_cam` / `-w` | `Dabai_DC1` | Wrist camera ID or name (`-1` to disable) |
+| `--image_width` | `320` | Camera capture width |
+| `--image_height` | `270` | Camera capture height |
+| `--show_camera` | off | Show live camera feed with overlay |
+| `--out_dir` | auto | Output directory for results |
+| `--no_record_video` | off | Disable video recording |
+| `--device` | `cuda` | PyTorch device |
+| `--seed` | `42` | Random seed |
+
+### 13.5 PS5 Controller Mapping
+
+| Button | Action |
+|--------|--------|
+| **Square** | Start / Stop episode |
+| **Cross** | Go to home position / Abort episode |
+| **Triangle** | Toggle gripper manually (overrides policy) |
+| **Share** | Emergency stop / Resume |
+| **Options** | Re-enable arm |
+| **PS Button** | Quit |
+
+### 13.6 Inference Pipeline
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│  Fixed Camera    │───▶│  build_          │───▶│  DiT Flow       │
+│  Wrist Camera    │    │  observation()   │    │  Policy         │
+│  Robot State     │    │  normalize +     │    │  (Flow Matching │
+│  (7D EE pose)    │    │  preprocess      │    │   Euler ODE)    │
+└─────────────────┘    └──────────────────┘    └────────┬────────┘
+                                                        │
+                                                        ▼
+                       ┌──────────────────┐    ┌─────────────────┐
+                       │  Piper Arm       │◀───│  apply_delta_   │
+                       │  (CAN bus)       │    │  action()       │
+                       │                  │    │  denorm + apply │
+                       └──────────────────┘    └─────────────────┘
+```
+
+### 13.7 Output Structure
+
+```
+<out_dir>/
+├── eval_results.json      # Summary: per-episode steps, durations, etc.
+└── episode_XXX.mp4        # Video recording of each episode (if enabled)
+```
+
+### 13.8 Tips
+
+- **`num_inference_steps`**: Flow matching typically needs 50–100 steps. Fewer steps = faster inference but noisier actions.
+- **`n_action_steps`**: Controls how many actions from the predicted chunk are executed before re-querying the model. Smaller values = more reactive but higher GPU load.
+- **Checkpoint path**: Must point to the `pretrained_model` directory containing `config.json` and `model.safetensors`.
+- **First run**: Use `--show_camera` to verify camera feeds and arm state before letting the policy control the arm.
+
+---
+
+## 14. Safety Guidelines
+
+### 14.1 Pre-Flight Checklist
 
 - [ ] CAN interface is properly configured and connected
 - [ ] Arm is powered on and in slave mode
@@ -945,7 +1064,7 @@ runs/ditflow_piper_teleop/
 - [ ] Cameras are connected and recognized
 - [ ] Object is placed on the plate
 
-### 12.2 Emergency Stop Procedures
+### 14.2 Emergency Stop Procedures
 
 1. **Software E-Stop**: Press `ESC` key → Arm freezes in place
 2. **Hardware E-Stop**: Press physical emergency stop button
@@ -957,7 +1076,7 @@ runs/ditflow_piper_teleop/
    python -c "from piper_sdk import *; p=C_PiperInterface_V2(); p.ConnectPort(); p.EnablePiper()"
    ```
 
-### 12.3 Workspace Limits (Soft Limits)
+### 14.3 Workspace Limits (Soft Limits)
 
 ```python
 # Enforce these limits in software to prevent collisions
@@ -970,9 +1089,9 @@ WORKSPACE_LIMITS = {
 
 ---
 
-## 14. Debugging Guide & Known Issues
+## 15. Debugging Guide & Known Issues
 
-### 14.1 Critical Parameters to Calibrate
+### 15.1 Critical Parameters to Calibrate
 
 | Parameter | Location | Issue | How to Calibrate |
 |-----------|----------|-------|------------------|
@@ -981,7 +1100,7 @@ WORKSPACE_LIMITS = {
 | `GRASP_HEIGHT` | Both scripts | `0.15m` may be too high/low | Adjust based on object height |
 | `GRIPPER_OPEN_POS` | Both scripts | `70000` (70mm) may not match your gripper | Check SDK docs or test with `piper.GetArmGripperMsgs()` |
 
-### 14.2 Known Issues & Bugs
+### 15.2 Known Issues & Bugs
 
 #### Script 6: FSM Data Collection
 
@@ -1025,7 +1144,7 @@ WORKSPACE_LIMITS = {
    - Manual `/ 255.0` normalization in `build_observation()` may conflict with preprocessor
    - Check if preprocessor already handles image normalization
 
-### 14.3 Pre-Run Checklist
+### 15.3 Pre-Run Checklist
 # 1. Test CAN connection
 python -c "from piper_sdk import *; p=C_PiperInterface_V2('can0'); p.ConnectPort(); print('OK')"
 
@@ -1057,7 +1176,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 "
 ```
 
-### 14.4 Recommended Debugging Steps
+### 15.4 Recommended Debugging Steps
 
 1. **First run with arm disabled** (comment out `piper.connect()`)
    - Verify cameras work
@@ -1085,7 +1204,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 
 ---
 
-## 15. TODO / Open Questions
+## 16. TODO / Open Questions
 
 - [ ] Determine exact home position by reading from `piper_ctrl_go_zero.py`
 - [ ] Calibrate camera intrinsics if needed for future visual servoing

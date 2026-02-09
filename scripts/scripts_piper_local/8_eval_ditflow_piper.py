@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Script 5: Evaluate Diffusion Policy on Real Piper Arm.
+"""Script 8: Evaluate DiT Flow Policy on Real Piper Arm.
 
-This script evaluates a trained diffusion policy on the real Piper robotic arm.
-It matches script 1 (teleop) interaction patterns and script 4 (training) model
-format exactly.
+This script evaluates a trained DiT Flow policy (Diffusion Transformer with
+Flow Matching) on the real Piper robotic arm.  It is the evaluation counterpart
+of script 7 (7_train_ditflow.py), analogous to how script 5 evaluates the
+standard Diffusion Policy trained by script 4.
 
 =============================================================================
 KEY DESIGN PRINCIPLES
@@ -16,10 +17,10 @@ KEY DESIGN PRINCIPLES
      current euler radians
    - Gripper target: [0, 1] mapped to [0, GRIPPER_OPEN_ANGLE] degrees
 
-2. Observation format matches training (script 4):
+2. Observation format matches training (script 7):
    - observation.image: (3, H, W) from front camera (Orbbec_Gemini_335L)
    - observation.wrist_image: (3, H, W) from wrist camera (Dabai_DC1)
-   - observation.state: [x, y, z, qw, qx, qy, qz, gripper] (8D with gripper)
+   - observation.state: [x, y, z, qw, qx, qy, qz] (7D) or + gripper (8D)
    - Image size read from model config, NOT hardcoded
 
 3. Hardware interface matches teleop (script 1):
@@ -38,34 +39,49 @@ KEY DESIGN PRINCIPLES
    - PS Button: Quit
 
 =============================================================================
+DITFLOW vs DIFFUSION POLICY
+=============================================================================
+DiT Flow uses:
+- Transformer architecture instead of U-Net (better scaling)
+- Flow Matching objective instead of DDPM (faster inference)
+- AdaLN-Zero conditioning for time step (more stable training)
+- num_inference_steps: flow integration steps (default ~100)
+
+=============================================================================
+DEPENDENCIES
+=============================================================================
+Requires:
+  - lerobot >= 0.4.2
+  - lerobot_policy_ditflow >= 0.1.0:
+        pip install git+https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
+
+=============================================================================
 USAGE EXAMPLES
 =============================================================================
 # Basic evaluation
-python 5_eval_diffusion_piper.py \
-    --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model
+python 8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model
 
-# Full options with camera display
-python 5_eval_diffusion_piper.py \
-    --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model \
+# Full options
+python 8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
     --can_interface can0 \
     --num_episodes 10 \
     --max_steps 500 \
     --control_freq 20 \
     --device cuda:0 \
-    --record_video \
-    --show_camera \
-    --out_dir eval_results
+    --show_camera
 
-# Override action steps and inference steps
-python 5_eval_diffusion_piper.py \
-    --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model \
-    --n_action_steps 4 \
-    --num_inference_steps 10
+# Override inference steps (fewer = faster but noisier)
+python 8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
+    --num_inference_steps 50
 
-python scripts/scripts_piper_local/5_eval_diffusion_piper.py     \
-    --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_A/checkpoints/checkpoints/020000/pretrained_model     \
-    --max_steps 1000 \
-    --device cuda:0
+# Override action steps
+python 8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
+    --n_action_steps 4 --num_inference_steps 100
+=============================================================================
 """
 
 from __future__ import annotations
@@ -204,7 +220,7 @@ def is_camera_enabled(camera_id: Union[int, str]) -> bool:
 
 class CameraCapture:
     """Camera capture with string name support via /dev/v4l/by-id lookup."""
-    
+
     def __init__(self, camera_id: Union[int, str], width: int = 640, height: int = 480, name: str = ""):
         self.camera_id = camera_id
         self.width = width
@@ -217,22 +233,18 @@ class CameraCapture:
         self._consecutive_failures = 0
         self._running = False
         self._thread = None
-    
+
     def _resolve_camera_source(self, camera_id: Union[int, str]):
         """Resolve camera identifier (supports string names via /dev/v4l/by-id)."""
         if isinstance(camera_id, int):
             return camera_id
-        
+
         if isinstance(camera_id, str):
-            # Try as integer first
             try:
                 return int(camera_id)
             except ValueError:
                 pass
-            
-            # Search in /dev/v4l/by-id/ for matching name
-            # Must match "video-index0" to get the streaming node,
-            # NOT "video-index1" which is a metadata-only node.
+
             by_id_dir = Path("/dev/v4l/by-id")
             if by_id_dir.exists():
                 for entry in sorted(by_id_dir.iterdir()):
@@ -240,41 +252,40 @@ class CameraCapture:
                         resolved = entry.resolve()
                         print(f"[Camera] Resolved '{camera_id}' -> {resolved}")
                         return str(resolved)
-            
+
             print(f"[Camera] Warning: Could not resolve '{camera_id}', trying as device path")
             return camera_id
-        
+
         return camera_id
-    
+
     def start(self) -> bool:
         """Start camera capture."""
         source = self._resolve_camera_source(self.camera_id)
         self.cap = cv2.VideoCapture(source)
-        
+
         if not self.cap.isOpened():
             print(f"[Camera {self.name}] Failed to open: {source}")
             return False
-        
+
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        
+
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
-        
-        # Wait for first frame
+
         for _ in range(50):
             if self._latest_frame is not None:
                 break
             time.sleep(0.1)
-        
+
         if self._latest_frame is None:
             print(f"[Camera {self.name}] Warning: No frames after 5s")
             return False
-        
+
         print(f"[Camera {self.name}] Started ({self.width}x{self.height})")
         return True
-    
+
     def _capture_loop(self):
         """Background capture loop."""
         while self._running:
@@ -290,29 +301,29 @@ class CameraCapture:
             else:
                 self._consecutive_failures += 1
             time.sleep(0.001)
-    
+
     def get_frame(self) -> Optional[np.ndarray]:
         """Get latest frame (RGB format)."""
         with self._lock:
             if self._latest_frame is not None:
                 return self._latest_frame.copy()
         return None
-    
+
     def get_frame_rgb(self) -> Optional[np.ndarray]:
-        """Get latest frame in RGB format (alias for get_frame, for script 1 compatibility)."""
+        """Get latest frame in RGB format (alias)."""
         return self.get_frame()
-    
+
     def get_frame_age(self) -> float:
         """Get age of latest frame in seconds."""
         with self._lock:
             if self._frame_timestamp > 0:
                 return time.time() - self._frame_timestamp
         return float('inf')
-    
+
     def is_healthy(self, max_age: float = 1.0) -> bool:
         """Check if camera is producing fresh frames."""
         return self.get_frame_age() < max_age
-    
+
     def stop(self):
         """Stop camera."""
         self._running = False
@@ -328,15 +339,8 @@ class CameraCapture:
 # =============================================================================
 
 class PiperController:
-    """High-level controller for Piper robotic arm.
-    
-    Matches script 1 interface:
-    - get_ee_pose_meters() returns dict with {x, y, z, rx, ry, rz, rx_deg, ry_deg, rz_deg}
-    - move_to_pose() takes (x, y, z, rx, ry, rz) in meters and radians
-    - MOVE_P mode (0x00)
-    - Robust enable with motor status checking
-    """
-    
+    """High-level controller for Piper robotic arm."""
+
     def __init__(self, can_interface: str = "can0"):
         self.can_interface = can_interface
         self.piper: Optional[Any] = None
@@ -348,7 +352,7 @@ class PiperController:
         self.connected = False
         self.enabled = False
         self._speed_percent = DEFAULT_SPEED_PERCENT
-        
+
     def connect(self) -> bool:
         """Connect to the Piper arm."""
         try:
@@ -364,27 +368,22 @@ class PiperController:
             print(f"[Piper] Hint: Make sure CAN interface is up. Run:")
             print(f"  sudo ip link set {self.can_interface} up type can bitrate 1000000")
             return False
-    
+
     def enable(self) -> bool:
-        """Enable the arm with robust checking (matching script 1)."""
+        """Enable the arm with robust checking."""
         if not self.connected or self.piper is None:
             print("[Piper] Not connected!")
             return False
-        
+
         try:
             print("[Piper] Enabling arm...")
-            # Send enable commands multiple times for reliability
             for attempt in range(3):
                 self.piper.EnableArm(7)
                 time.sleep(0.1)
-            
-            # Set motion control mode
+
             self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
-            
-            # Enable gripper
             self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
-            
-            # Wait for enable completion with detailed checking
+
             start_time = time.time()
             while time.time() - start_time < ENABLE_TIMEOUT:
                 arm_ok, gripper_ok = self._check_motor_enable_status()
@@ -393,23 +392,21 @@ class PiperController:
                     print("[Piper] Arm enabled successfully!")
                     return True
                 elif arm_ok:
-                    # Arm enabled but gripper not yet
                     self.piper.GripperCtrl(0x01, 1000, 0x01, 0)
                 else:
-                    # Keep sending enable
                     self.piper.EnableArm(7)
                 time.sleep(0.1)
-            
+
             print("[Piper] Enable timeout!")
             self._print_enable_status()
             return False
-            
+
         except Exception as e:
             print(f"[Piper] Enable error: {e}")
             return False
-    
+
     def _check_motor_enable_status(self) -> Tuple[bool, bool]:
-        """Check if arm motors and gripper are enabled via driver status."""
+        """Check if arm motors and gripper are enabled."""
         try:
             arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
             arm_enabled = (
@@ -420,16 +417,14 @@ class PiperController:
                 arm_msgs.motor_5.foc_status.driver_enable_status and
                 arm_msgs.motor_6.foc_status.driver_enable_status
             )
-            
             gripper_msgs = self.piper.GetArmGripperMsgs()
             gripper_enabled = gripper_msgs.gripper_state.foc_status.driver_enable_status
-            
             return arm_enabled, gripper_enabled
         except Exception:
             return False, False
-    
+
     def _print_enable_status(self):
-        """Print detailed enable status for debugging (called on failure)."""
+        """Print detailed enable status for debugging."""
         try:
             arm_msgs = self.piper.GetArmLowSpdInfoMsgs()
             print("[Debug] Motor enable status:")
@@ -437,13 +432,12 @@ class PiperController:
                 motor = getattr(arm_msgs, f"motor_{i}")
                 status = motor.foc_status.driver_enable_status
                 print(f"  Motor {i}: {'✓' if status else '✗'}")
-            
             gripper_msgs = self.piper.GetArmGripperMsgs()
             gripper_status = gripper_msgs.gripper_state.foc_status.driver_enable_status
             print(f"  Gripper: {'✓' if gripper_status else '✗'}")
         except Exception as e:
             print(f"[Debug] Failed to read enable status: {e}")
-    
+
     def disconnect(self):
         """Disable and disconnect from the arm."""
         if self.piper is not None and self.enabled:
@@ -455,7 +449,7 @@ class PiperController:
         self.connected = False
         self.piper = None
         print("[Piper] Disconnected")
-    
+
     def emergency_stop(self):
         """Trigger emergency stop."""
         self._emergency_stop = True
@@ -465,95 +459,76 @@ class PiperController:
             except Exception as e:
                 print(f"[Piper] Emergency stop error: {e}")
         print("[Piper] 🛑 EMERGENCY STOP ACTIVATED!")
-    
+
     def clear_emergency_stop(self):
         """Clear emergency stop and resume."""
         self._emergency_stop = False
         if self.piper is not None:
             try:
                 self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
-            except:
+            except Exception:
                 pass
         print("[Piper] ✓ Emergency stop cleared, motion resumed")
-    
+
     def set_speed(self, speed_percent: int):
         """Set motion speed percentage."""
         self._speed_percent = max(MIN_SPEED_PERCENT, min(MAX_SPEED_PERCENT, speed_percent))
         if self.piper is not None and self.enabled:
             try:
                 self.piper.MotionCtrl_2(0x01, MOVE_MODE, self._speed_percent, 0)
-            except:
+            except Exception:
                 pass
         print(f"[Piper] Speed set to {self._speed_percent}%")
-    
+
     def get_ee_pose_meters(self) -> Optional[Dict[str, float]]:
-        """Get current end-effector pose in meters and radians.
-        
-        Returns dict with keys: x, y, z, rx, ry, rz (radians), 
-        rx_deg, ry_deg, rz_deg (degrees)
-        
-        Matches script 1 interface exactly.
-        """
+        """Get current end-effector pose in meters and radians."""
         if not self.connected or self.piper is None:
             return None
-        
         try:
             msg = self.piper.GetArmEndPoseMsgs()
             pose = msg.end_pose
-            
-            # SDK units: position in 0.001mm, rotation in 0.001 degrees
-            x = pose.X_axis / 1_000_000.0   # to meters
+            x = pose.X_axis / 1_000_000.0
             y = pose.Y_axis / 1_000_000.0
             z = pose.Z_axis / 1_000_000.0
-            rx_deg = pose.RX_axis / 1000.0   # to degrees
+            rx_deg = pose.RX_axis / 1000.0
             ry_deg = pose.RY_axis / 1000.0
             rz_deg = pose.RZ_axis / 1000.0
-            
             return {
                 'x': x, 'y': y, 'z': z,
-                'rx': np.deg2rad(rx_deg),     # radians
+                'rx': np.deg2rad(rx_deg),
                 'ry': np.deg2rad(ry_deg),
                 'rz': np.deg2rad(rz_deg),
-                'rx_deg': rx_deg,             # degrees
+                'rx_deg': rx_deg,
                 'ry_deg': ry_deg,
                 'rz_deg': rz_deg,
             }
         except Exception as e:
             print(f"[Piper] Error reading pose: {e}")
             return None
-    
+
     def move_to_pose(self, x: float, y: float, z: float,
                      rx: float, ry: float, rz: float) -> bool:
-        """Move to specified pose (meters and radians).
-        
-        Matches script 1 interface: position in meters, rotation in radians.
-        """
+        """Move to specified pose (meters and radians)."""
         if not self.enabled or self.piper is None:
             return False
-        
         if self._emergency_stop:
             return False
-        
-        # Safety clamp
         x = max(WORKSPACE_LIMITS["x_min"], min(WORKSPACE_LIMITS["x_max"], x))
         y = max(WORKSPACE_LIMITS["y_min"], min(WORKSPACE_LIMITS["y_max"], y))
         z = max(WORKSPACE_LIMITS["z_min"], min(WORKSPACE_LIMITS["z_max"], z))
-        
         try:
-            # Convert to SDK units
-            X = int(x * 1_000_000)         # meters -> 0.001mm
+            X = int(x * 1_000_000)
             Y = int(y * 1_000_000)
             Z = int(z * 1_000_000)
-            RX = int(np.rad2deg(rx) * 1000) # radians -> 0.001 degrees
+            RX = int(np.rad2deg(rx) * 1000)
             RY = int(np.rad2deg(ry) * 1000)
             RZ = int(np.rad2deg(rz) * 1000)
-            
             self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
             return True
         except Exception as e:
             print(f"[Piper] Move failed: {e}")
             return False
-    
+
     def set_gripper_angle(self, angle_deg: float, effort: int = GRIPPER_EFFORT) -> bool:
         """Set gripper angle (0=close, 70=open)."""
         if not self.enabled or self.piper is None:
@@ -568,15 +543,13 @@ class PiperController:
         except Exception as e:
             print(f"[Piper] Gripper control failed: {e}")
             return False
-    
+
     def open_gripper(self) -> bool:
-        """Fully open the gripper."""
         return self.set_gripper_angle(GRIPPER_OPEN_ANGLE)
-    
+
     def close_gripper(self) -> bool:
-        """Fully close the gripper."""
         return self.set_gripper_angle(GRIPPER_CLOSE_ANGLE)
-    
+
     def get_gripper_angle(self) -> Optional[float]:
         """Get current gripper angle in degrees."""
         if not self.connected or self.piper is None:
@@ -584,11 +557,10 @@ class PiperController:
         try:
             gripper_msgs = self.piper.GetArmGripperMsgs()
             return gripper_msgs.gripper_state.grippers_angle / 1000.0
-        except:
+        except Exception:
             return None
-    
+
     def go_to_home(self) -> bool:
-        """Move to home position."""
         if self._emergency_stop:
             return False
         print("[Piper] Going to home position...")
@@ -597,31 +569,27 @@ class PiperController:
         return self.move_to_pose(x, y, z, rx, ry, rz)
 
     def go_to_start(self) -> bool:
-        """Move to start position (episode starting pose)."""
         if self._emergency_stop:
             return False
         print("[Piper] Going to start position...")
         x, y, z = self._start_position
         rx, ry, rz = self._start_orientation
         return self.move_to_pose(x, y, z, rx, ry, rz)
-    
+
     def is_arm_ready(self) -> bool:
-        """Check if arm is ready for motion (enabled and not in error)."""
         if not self.enabled or self.piper is None:
             return False
         try:
             arm_ok, gripper_ok = self._check_motor_enable_status()
             if not (arm_ok and gripper_ok):
                 return False
-            # Also check control mode
             status = self.piper.GetArmStatus()
             ctrl_mode = getattr(status.arm_status, 'ctrl_mode', 0)
             return int(ctrl_mode) != 0
-        except:
+        except Exception:
             return False
-    
+
     def wait_until_ready(self, timeout: float = 10.0) -> bool:
-        """Wait until arm is fully ready for motion."""
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.is_arm_ready():
@@ -638,26 +606,21 @@ class PiperController:
 
 class PS5Controller:
     """Handler for PS5 DualSense controller using pygame."""
-    
+
     def __init__(self):
         self.joystick: Optional[Any] = None
         self.connected = False
         self._prev_buttons = {}
-        
+
     def initialize(self) -> bool:
-        """Initialize pygame and find PS5 controller."""
         if not PYGAME_AVAILABLE:
             return False
-        
         pygame.init()
         pygame.joystick.init()
-        
         num_joysticks = pygame.joystick.get_count()
         if num_joysticks == 0:
             print("[PS5] No controllers found")
             return False
-        
-        # Look for PS5 controller
         for i in range(num_joysticks):
             js = pygame.joystick.Joystick(i)
             js.init()
@@ -667,73 +630,63 @@ class PS5Controller:
                 self.connected = True
                 print(f"[PS5] Found: {js.get_name()}")
                 return True
-        
-        # Use first joystick if no PS5 found
         if num_joysticks > 0:
             self.joystick = pygame.joystick.Joystick(0)
             self.joystick.init()
             self.connected = True
             print(f"[PS5] Using first gamepad: {self.joystick.get_name()}")
             return True
-        
         return False
-    
+
     def update(self):
-        """Process pygame events."""
         pygame.event.pump()
-    
+
     def get_button(self, button: int) -> bool:
-        """Get button state."""
         if not self.connected or self.joystick is None:
             return False
         try:
             return self.joystick.get_button(button)
         except Exception:
             return False
-    
+
     def get_button_pressed(self, button: int) -> bool:
-        """Check if button was just pressed (edge detection)."""
         current = self.get_button(button)
         prev = self._prev_buttons.get(button, False)
         self._prev_buttons[button] = current
         return current and not prev
-    
-    def rumble(self, low_frequency: float = 0.5, high_frequency: float = 0.5, 
+
+    def rumble(self, low_frequency: float = 0.5, high_frequency: float = 0.5,
                duration_ms: int = 200):
-        """Vibrate the controller."""
         if not self.connected or self.joystick is None:
             return
         try:
             self.joystick.rumble(low_frequency, high_frequency, duration_ms)
         except Exception:
             pass
-    
+
     def rumble_short(self, count: int = 1, intensity: float = 0.7, duration_ms: int = 100):
-        """Short vibration pulses."""
         def _do_rumble():
             for i in range(count):
                 self.rumble(intensity, intensity, duration_ms)
                 time.sleep(duration_ms / 1000.0 + 0.05)
         threading.Thread(target=_do_rumble, daemon=True).start()
-    
+
     def close(self):
-        """Close pygame."""
         if PYGAME_AVAILABLE:
             pygame.quit()
 
 
 class StdinController:
-    """Fallback controller using stdin (when no PS5 controller available)."""
-    
+    """Fallback controller using stdin."""
+
     def __init__(self):
         self._pressed = set()
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._input_loop, daemon=True)
         self._thread.start()
         print("[Input] Stdin controller active. Commands: s=start/stop, h=home, g=gripper, e=estop, q=quit")
-    
+
     def _input_loop(self):
-        """Background thread reading stdin."""
         while True:
             try:
                 line = input().strip().lower()
@@ -741,9 +694,8 @@ class StdinController:
                     self._pressed.add(line)
             except (EOFError, KeyboardInterrupt):
                 break
-    
+
     def poll(self) -> dict:
-        """Poll for events."""
         with self._lock:
             pressed = self._pressed.copy()
             self._pressed.clear()
@@ -762,20 +714,18 @@ class StdinController:
 
 class VideoRecorder:
     """Record video from camera frames."""
-    
+
     def __init__(self, output_path: str, fps: int = 20, width: int = 640, height: int = 480):
         self.output_path = output_path
         self.fps = fps
         self.width = width
         self.height = height
         self.frames = []
-        
+
     def add_frame(self, frame: np.ndarray):
-        """Add a frame (RGB format)."""
         self.frames.append(frame.copy())
-    
+
     def add_combined_frame(self, fixed_frame: np.ndarray, wrist_frame: Optional[np.ndarray]):
-        """Add a combined frame with both camera views."""
         if wrist_frame is not None:
             fixed_resized = cv2.resize(fixed_frame, (self.width // 2, self.height))
             wrist_resized = cv2.resize(wrist_frame, (self.width // 2, self.height))
@@ -783,35 +733,22 @@ class VideoRecorder:
         else:
             combined = cv2.resize(fixed_frame, (self.width, self.height))
         self.frames.append(combined)
-    
+
     def save(self):
-        """Save recorded frames to video file using imageio + libx264.
-        
-        Uses imageio with libx264 codec and yuv420p pixel format for broad
-        compatibility (matching script 2's encoding approach).
-        """
         if not self.frames:
             print("[Video] No frames to save!")
             return
-        
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
-        
         writer = imageio.get_writer(
-            self.output_path,
-            fps=self.fps,
-            codec='libx264',
-            quality=8,
-            pixelformat='yuv420p',
+            self.output_path, fps=self.fps, codec='libx264',
+            quality=8, pixelformat='yuv420p',
         )
-        
         for frame in self.frames:
             writer.append_data(frame)
-        
         writer.close()
         print(f"[Video] Saved {len(self.frames)} frames to {self.output_path}")
-    
+
     def clear(self):
-        """Clear recorded frames."""
         self.frames = []
 
 
@@ -827,137 +764,123 @@ def generate_trajectory_plot(
     height: int = 720,
     dpi: int = 100,
 ) -> np.ndarray:
-    """Generate a comparison plot of actual EE trajectory vs action-integrated trajectory.
-    
-    Creates 3 subplots (X, Y, Z) each showing:
-      - Actual arm end-effector position (blue solid line)
-      - Cumulative integral of policy output deltas (red dashed line)
-    
-    The gap between the two lines illustrates positions the arm cannot
-    reach due to structural / kinematic limitations.
-    
-    Args:
-        actual_positions: List of [x, y, z] actual EE positions per step.
-        integrated_positions: List of [x, y, z] cumulative-sum of commanded
-            deltas starting from the initial actual position.
-        episode_id: Episode number (for the title).
-        width, height: Output image size in pixels.
-        dpi: Matplotlib DPI.
-    
-    Returns:
-        RGB image as uint8 numpy array (H, W, 3).
-    """
-    actual = np.array(actual_positions)      # (T, 3)
-    integrated = np.array(integrated_positions)  # (T, 3)
+    """Generate a comparison plot of actual EE trajectory vs action-integrated trajectory."""
+    actual = np.array(actual_positions)
+    integrated = np.array(integrated_positions)
     steps = np.arange(len(actual))
-    
+
     labels = ['X (m)', 'Y (m)', 'Z (m)']
-    colors_actual = ['#1f77b4', '#2ca02c', '#9467bd']   # blue, green, purple
-    colors_cmd = ['#ff7f0e', '#d62728', '#e377c2']      # orange, red, pink
-    
+    colors_actual = ['#1f77b4', '#2ca02c', '#9467bd']
+    colors_cmd = ['#ff7f0e', '#d62728', '#e377c2']
+
     fig, axes = plt.subplots(3, 1, figsize=(width / dpi, height / dpi), dpi=dpi,
                              sharex=True)
     fig.suptitle(f'Episode {episode_id}: Commanded (integral) vs Actual Trajectory',
                  fontsize=13, fontweight='bold')
-    
+
     for i, (ax, label) in enumerate(zip(axes, labels)):
         ax.plot(steps, actual[:, i], color=colors_actual[i], linewidth=1.5,
                 label='Actual EE pos')
         ax.plot(steps, integrated[:, i], color=colors_cmd[i], linewidth=1.5,
                 linestyle='--', label='Action integral (commanded)')
-        # Shade the gap
         ax.fill_between(steps, actual[:, i], integrated[:, i],
                         alpha=0.15, color=colors_cmd[i])
         ax.set_ylabel(label, fontsize=11)
         ax.legend(loc='upper right', fontsize=9)
         ax.grid(True, alpha=0.3)
-    
+
     axes[-1].set_xlabel('Step', fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    
-    # Render to RGB numpy array
+
     fig.canvas.draw()
     buf = fig.canvas.buffer_rgba()
-    img = np.asarray(buf)[:, :, :3].copy()  # RGBA -> RGB
+    img = np.asarray(buf)[:, :, :3].copy()
     plt.close(fig)
-    
+
     return img
 
 
 # =============================================================================
-# Policy Loading (same as original, well-tested)
+# DiT Flow Policy Loading
 # =============================================================================
 
 def load_policy_config(pretrained_dir: str) -> Dict[str, Any]:
     """Load policy configuration from checkpoint.
-    
-    Returns dict with: has_wrist, image_shape, state_dim, action_dim, 
-    n_obs_steps, n_action_steps, raw_config
+
+    Returns dict with: has_wrist, image_shape, state_dim, action_dim,
+    n_obs_steps, n_action_steps, policy_type, raw_config
     """
     config_path = Path(pretrained_dir) / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"Policy config not found: {config_path}")
-    
+
     with open(config_path, "r") as f:
         config_dict = json.load(f)
-    
+
     input_features = config_dict.get("input_features", {})
     output_features = config_dict.get("output_features", {})
-    
+
     has_wrist = "observation.wrist_image" in input_features
-    
+
     image_shape = None
     if "observation.image" in input_features:
         image_shape = tuple(input_features["observation.image"]["shape"])
-    
+
     state_dim = None
     if "observation.state" in input_features:
         state_dim = input_features["observation.state"]["shape"][0]
-    
+
     action_dim = None
     if "action" in output_features:
         action_dim = output_features["action"]["shape"][0]
-    
+
+    policy_type = config_dict.get("type", "unknown")
+
     return {
         "has_wrist": has_wrist,
-        "image_shape": image_shape,    # (C, H, W) e.g. (3, 240, 320)
-        "state_dim": state_dim,        # 7 or 8
-        "action_dim": action_dim,      # 8
+        "image_shape": image_shape,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
         "n_obs_steps": config_dict.get("n_obs_steps", 2),
         "n_action_steps": config_dict.get("n_action_steps", 8),
+        "policy_type": policy_type,
         "raw_config": config_dict,
     }
 
 
-def load_diffusion_policy(
+def load_ditflow_policy(
     pretrained_dir: str,
     device: str,
     num_inference_steps: int | None = None,
     n_action_steps: int | None = None,
 ) -> Tuple[Any, Any, Any, int, int]:
-    """Load LeRobot diffusion policy from checkpoint.
-    
+    """Load LeRobot DiT Flow policy from checkpoint.
+
+    This imports lerobot_policy_ditflow which registers the 'ditflow' policy
+    type via @PreTrainedConfig.register_subclass("ditflow").
+
     Returns:
         (policy, preprocessor, postprocessor, num_inference_steps, n_action_steps)
     """
     from safetensors.torch import load_file
     from lerobot.configs.types import FeatureType, PolicyFeature, NormalizationMode
-    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-    from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
     from lerobot.policies.factory import make_pre_post_processors
+
+    # Import lerobot_policy_ditflow to register the ditflow policy type
+    from lerobot_policy_ditflow import DiTFlowConfig, DiTFlowPolicy
 
     pretrained_path = Path(pretrained_dir)
     config_path = pretrained_path / "config.json"
     model_path = pretrained_path / "model.safetensors"
-    
-    print(f"[Policy] Loading config from {config_path}...", flush=True)
+
+    print(f"[Policy] Loading DiT Flow config from {config_path}...", flush=True)
     with open(config_path, "r") as f:
         config_dict = json.load(f)
-    
-    # Remove 'type' field if present
+
+    # Remove 'type' field if present (not a constructor arg)
     if "type" in config_dict:
         del config_dict["type"]
-    
+
     # Parse input_features
     input_features_raw = config_dict.get("input_features", {})
     input_features = {}
@@ -965,7 +888,7 @@ def load_diffusion_policy(
         feat_type = FeatureType[val["type"]] if isinstance(val["type"], str) else val["type"]
         input_features[key] = PolicyFeature(type=feat_type, shape=tuple(val["shape"]))
     config_dict["input_features"] = input_features
-    
+
     # Parse output_features
     output_features_raw = config_dict.get("output_features", {})
     output_features = {}
@@ -973,7 +896,7 @@ def load_diffusion_policy(
         feat_type = FeatureType[val["type"]] if isinstance(val["type"], str) else val["type"]
         output_features[key] = PolicyFeature(type=feat_type, shape=tuple(val["shape"]))
     config_dict["output_features"] = output_features
-    
+
     # Parse normalization_mapping
     if "normalization_mapping" in config_dict:
         norm_mapping_raw = config_dict["normalization_mapping"]
@@ -982,69 +905,59 @@ def load_diffusion_policy(
             norm_mode = NormalizationMode[val] if isinstance(val, str) else val
             norm_mapping[key] = norm_mode
         config_dict["normalization_mapping"] = norm_mapping
-    
-    # Convert lists to tuples
-    for field_name in ["crop_shape", "optimizer_betas", "down_dims"]:
+
+    # Convert lists to tuples for fields that expect tuples
+    for field_name in ["crop_shape", "optimizer_betas"]:
         if field_name in config_dict and isinstance(config_dict[field_name], list):
             config_dict[field_name] = tuple(config_dict[field_name])
-    
+
     # Override parameters if specified
     if num_inference_steps is not None:
-        num_train_timesteps = config_dict.get("num_train_timesteps", 100)
-        if num_inference_steps > num_train_timesteps:
-            num_inference_steps = num_train_timesteps
         config_dict["num_inference_steps"] = num_inference_steps
-    
+        print(f"[Policy] Overriding num_inference_steps = {num_inference_steps}")
+
     if n_action_steps is not None:
         horizon = config_dict.get("horizon", 16)
         if n_action_steps > horizon:
             n_action_steps = horizon
         config_dict["n_action_steps"] = n_action_steps
-    
-    # Filter out unknown fields not accepted by DiffusionConfig
-    import dataclasses
-    valid_fields = {f.name for f in dataclasses.fields(DiffusionConfig)}
-    unknown_keys = set(config_dict.keys()) - valid_fields
-    if unknown_keys:
-        print(f"[Policy] Ignoring unknown config keys: {unknown_keys}", flush=True)
-        for k in unknown_keys:
-            del config_dict[k]
+        print(f"[Policy] Overriding n_action_steps = {n_action_steps}")
 
     # Create config and policy
-    print(f"[Policy] Creating DiffusionConfig...", flush=True)
-    cfg = DiffusionConfig(**config_dict)
-    
-    print(f"[Policy] Creating DiffusionPolicy model...", flush=True)
-    policy = DiffusionPolicy(cfg)
-    
+    print(f"[Policy] Creating DiTFlowConfig...", flush=True)
+    cfg = DiTFlowConfig(**config_dict)
+
+    print(f"[Policy] Creating DiTFlowPolicy model...", flush=True)
+    policy = DiTFlowPolicy(cfg)
+
     # Load weights
     print(f"[Policy] Loading model weights...", flush=True)
     state_dict = load_file(model_path)
     policy.load_state_dict(state_dict)
-    
+
     # Move to device
     print(f"[Policy] Moving to device {device}...", flush=True)
     policy = policy.to(device)
     policy.eval()
-    
+
     # Load preprocessor and postprocessor
     print(f"[Policy] Loading preprocessor/postprocessor...", flush=True)
     preprocessor_overrides = {"device_processor": {"device": device}}
     postprocessor_overrides = {"device_processor": {"device": device}}
-    
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg,
         pretrained_path=str(pretrained_path),
         preprocessor_overrides=preprocessor_overrides,
         postprocessor_overrides=postprocessor_overrides,
     )
-    
-    actual_inference_steps = cfg.num_inference_steps or cfg.num_train_timesteps
+
+    actual_inference_steps = cfg.num_inference_steps or 100
     actual_n_action_steps = cfg.n_action_steps
-    
-    print(f"[Policy] Loaded! (inference_steps={actual_inference_steps}, "
+
+    print(f"[Policy] DiT Flow loaded! (inference_steps={actual_inference_steps}, "
           f"n_action_steps={actual_n_action_steps})", flush=True)
-    
+
     return policy, preprocessor, postprocessor, actual_inference_steps, actual_n_action_steps
 
 
@@ -1059,78 +972,50 @@ def build_observation(
     policy_config: Dict,
 ) -> Dict[str, torch.Tensor]:
     """Build observation dict matching the training data format.
-    
-    IMPORTANT: This returns torch tensors matching the format that LeRobot's
-    dataset __getitem__ produces. The LeRobot video decoder returns images as
-    float32 tensors in [0,1] range with shape (C, H, W). The preprocessor
-    pipeline (AddBatchDim -> Device -> Normalize) expects tensors, not numpy
-    arrays. Passing uint8 numpy arrays causes the normalizer to attempt
-    converting float stats to uint8 dtype, resulting in overflow errors.
-    
-    Args:
-        fixed_image: Fixed camera RGB image (H, W, 3) uint8
-        wrist_image: Wrist camera RGB image (H, W, 3) uint8, or None
-        pose: EE pose dict from PiperController.get_ee_pose_meters()
-        policy_config: Policy configuration dict
-        
-    Returns:
-        Dictionary of torch tensors matching LeRobot dataset format.
-        All tensors include a leading batch dimension so that the preprocessor's
-        AddBatchDimensionProcessorStep (which only recognizes ``observation.image``,
-        ``observation.state``, and keys starting with ``observation.images.``)
-        does not leave ``observation.wrist_image`` without a batch dim while
-        adding one to ``observation.image``.
-        - Images: float32 (1, C, H, W) in [0, 1]
-        - State: float32 (1, state_dim)
+
+    Returns torch tensors matching the format that LeRobot's dataset __getitem__
+    produces.  Images are float32 (1, C, H, W) in [0, 1].  State is float32
+    (1, state_dim).  All tensors include a leading batch dimension.
     """
-    # Get target image size from model config: image_shape is (C, H, W)
     image_shape = policy_config.get("image_shape", (3, 240, 320))
     target_h, target_w = image_shape[1], image_shape[2]
-    
+
     obs = {}
-    
-    # Process fixed camera image
-    # Resize to match training size
-    fixed_resized = cv2.resize(fixed_image, (target_w, target_h), 
-                                interpolation=cv2.INTER_LINEAR)
-    # Convert to float32 (1, C, H, W) in [0, 1] — matching LeRobot dataset format
-    # LeRobot video decoder does: tensor.type(torch.float32) / 255
-    # We add the batch dim here so that ALL image keys are consistently shaped.
+
+    # Fixed camera image
+    fixed_resized = cv2.resize(fixed_image, (target_w, target_h),
+                               interpolation=cv2.INTER_LINEAR)
     fixed_tensor = torch.from_numpy(fixed_resized).permute(2, 0, 1).float() / 255.0
     obs["observation.image"] = fixed_tensor.unsqueeze(0)
-    
-    # Process wrist camera image if policy expects it  
+
+    # Wrist camera image
     if policy_config.get("has_wrist", False) and wrist_image is not None:
         wrist_resized = cv2.resize(wrist_image, (target_w, target_h),
-                                    interpolation=cv2.INTER_LINEAR)
+                                   interpolation=cv2.INTER_LINEAR)
         wrist_tensor = torch.from_numpy(wrist_resized).permute(2, 0, 1).float() / 255.0
         obs["observation.wrist_image"] = wrist_tensor.unsqueeze(0)
-    
-    # Build state vector matching training format exactly:
-    # ee_pose: [x, y, z, qw, qx, qy, qz] from euler degrees
-    # gripper: normalized [0, 1]
+
+    # State vector
     current_quat = np.array(euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg']))
     ee_pose = np.array([pose['x'], pose['y'], pose['z'],
                         current_quat[0], current_quat[1], current_quat[2], current_quat[3]],
                        dtype=np.float32)
-    
+
     state_dim = policy_config.get("state_dim", 8)
     if state_dim == 8:
-        # Include gripper state (normalized by GRIPPER_OPEN_ANGLE)
         gripper_angle = pose.get('gripper_angle', GRIPPER_OPEN_ANGLE)
         gripper_normalized = gripper_angle / GRIPPER_OPEN_ANGLE
         state = np.concatenate([ee_pose, [gripper_normalized]]).astype(np.float32)
     else:
         state = ee_pose
-    
-    # Add batch dim to state as well for consistency
+
     obs["observation.state"] = torch.from_numpy(state).float().unsqueeze(0)
-    
+
     return obs
 
 
 # =============================================================================
-# Action Application (RELATIVE delta - the critical fix)
+# Action Application (RELATIVE delta)
 # =============================================================================
 
 def apply_delta_action(
@@ -1138,55 +1023,38 @@ def apply_delta_action(
     action: np.ndarray,
 ) -> Tuple[float, float, float, float, float, float, float]:
     """Apply a RELATIVE delta action to the current pose.
-    
-    This reverses the recording process from script 1:
-    
-    Recording (script 1):
-        delta_rx_rad = target_rx - prev_rx  (in radians)
-        delta_quat = euler_to_quat(rad2deg(delta_rx_rad), ...)
-        action = [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper]
-    
-    Reversing (this function):
-        delta_euler_deg = quat_to_euler(delta_qw, delta_qx, delta_qy, delta_qz)  -> degrees
-        delta_euler_rad = deg2rad(delta_euler_deg)
-        new_rx = current_rx + delta_rx_rad
-        new_pos = current_pos + delta_pos
-    
+
     Args:
         pose: Current EE pose dict from PiperController.get_ee_pose_meters()
-        action: 8D action array [delta_x, delta_y, delta_z, 
+        action: 8D action array [delta_x, delta_y, delta_z,
                 delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
-    
+
     Returns:
         (target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg)
         where position is in meters, rotation in radians, gripper in degrees [0, 70]
     """
-    # Extract delta components
     delta_x, delta_y, delta_z = action[0], action[1], action[2]
     delta_qw, delta_qx, delta_qy, delta_qz = action[3], action[4], action[5], action[6]
-    gripper_target = action[7]  # normalized [0, 1]
-    
+    gripper_target = action[7]
+
     # Apply position delta (meters)
     target_x = pose['x'] + delta_x
     target_y = pose['y'] + delta_y
     target_z = pose['z'] + delta_z
-    
+
     # Apply rotation delta
-    # The delta quaternion was created from euler DEGREE deltas (which were originally radian deltas):
-    #   delta_quat = euler_to_quat(rad2deg(delta_rx_rad), rad2deg(delta_ry_rad), rad2deg(delta_rz_rad))
-    # To reverse: convert delta_quat back to euler degrees, then to radians, and add to current
     delta_euler_deg = quat_to_euler(delta_qw, delta_qx, delta_qy, delta_qz)
     delta_rx_rad = np.deg2rad(delta_euler_deg[0])
     delta_ry_rad = np.deg2rad(delta_euler_deg[1])
     delta_rz_rad = np.deg2rad(delta_euler_deg[2])
-    
-    target_rx = pose['rx'] + delta_rx_rad  # current radians + delta radians
+
+    target_rx = pose['rx'] + delta_rx_rad
     target_ry = pose['ry'] + delta_ry_rad
     target_rz = pose['rz'] + delta_rz_rad
-    
+
     # Gripper: normalized [0, 1] -> degrees [0, GRIPPER_OPEN_ANGLE]
     gripper_deg = float(np.clip(gripper_target, 0.0, 1.0)) * GRIPPER_OPEN_ANGLE
-    
+
     return target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg
 
 
@@ -1196,7 +1064,6 @@ def apply_delta_action(
 
 @dataclass
 class EpisodeResult:
-    """Result of a single evaluation episode."""
     episode_id: int
     steps: int
     duration: float
@@ -1206,25 +1073,24 @@ class EpisodeResult:
 
 @dataclass
 class EvaluationResults:
-    """Aggregated evaluation results."""
     episodes: List[EpisodeResult] = field(default_factory=list)
-    
+
     @property
     def num_episodes(self) -> int:
         return len(self.episodes)
-    
+
     @property
     def avg_steps(self) -> float:
         if not self.episodes:
             return 0.0
         return sum(ep.steps for ep in self.episodes) / len(self.episodes)
-    
+
     @property
     def avg_duration(self) -> float:
         if not self.episodes:
             return 0.0
         return sum(ep.duration for ep in self.episodes) / len(self.episodes)
-    
+
     def to_dict(self) -> Dict:
         return {
             "num_episodes": self.num_episodes,
@@ -1241,9 +1107,8 @@ class EvaluationResults:
                 for ep in self.episodes
             ],
         }
-    
+
     def save(self, output_path: str):
-        """Save results to JSON file."""
         with open(output_path, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
         print(f"[Results] Saved to {output_path}")
@@ -1272,10 +1137,10 @@ def run_episode(
     show_camera: bool = False,
 ) -> EpisodeResult:
     """Run a single evaluation episode.
-    
+
     The episode runs until max_steps or until the user presses Square to stop.
     Actions are RELATIVE deltas applied to the current pose.
-    
+
     PS5 controls during episode:
         Square:   Stop episode (finish normally)
         Share:    Emergency stop / Resume
@@ -1285,45 +1150,42 @@ def run_episode(
     print(f"\n{'='*60}")
     print(f"[Episode {episode_id}] Starting...")
     print(f"{'='*60}")
-    
-    # Reset policy state (clear action queue for diffusion policy)
+
+    # Reset policy state (clear action queue)
     policy.reset()
-    
+
     control_period = 1.0 / control_freq
     step = 0
     episode_start_time = time.time()
     user_stopped = False
-    gripper_manual_override = None  # None = follow policy, float = manual angle
-    
+    gripper_manual_override = None
+
     # Trajectory tracking for comparison plot
-    actual_positions = []       # actual EE [x, y, z] each step
-    integrated_positions = []   # cumulative sum of action deltas [x, y, z]
-    integrated_xyz = None       # running sum, initialized on first step
-    
-    # Log frequency for status messages
-    log_freq = max(1, control_freq)  # Print once per second
-    
+    actual_positions = []
+    integrated_positions = []
+    integrated_xyz = None
+
+    log_freq = max(1, control_freq)
+
     print(f"[Episode {episode_id}] Running inference loop (max {max_steps} steps, {control_freq}Hz)...")
     if ps5:
         print(f"  Square=Stop | Share=E-Stop | Cross=Abort | Triangle=Toggle Gripper")
-    
+
     while step < max_steps:
         loop_start = time.time()
-        
+
         # =================================================================
-        # Poll controller events (matching script 1 interaction pattern)
+        # Poll controller events
         # =================================================================
         if ps5:
             ps5.update()
-            
-            # Square: stop episode (finish normally)
+
             if ps5.get_button_pressed(PS5Buttons.SQUARE):
                 print(f"[Episode {episode_id}] User stopped at step {step}")
                 ps5.rumble_short(2)
                 user_stopped = True
                 break
-            
-            # Share: emergency stop / resume
+
             if ps5.get_button_pressed(PS5Buttons.SHARE):
                 if piper._emergency_stop:
                     piper.clear_emergency_stop()
@@ -1331,8 +1193,7 @@ def run_episode(
                 else:
                     piper.emergency_stop()
                     ps5.rumble_short(3, intensity=1.0)
-            
-            # Cross: abort episode and go home
+
             if ps5.get_button_pressed(PS5Buttons.CROSS):
                 print(f"[Episode {episode_id}] Aborted at step {step}, going home...")
                 ps5.rumble_short(1)
@@ -1343,11 +1204,9 @@ def run_episode(
                     duration=time.time() - episode_start_time,
                     notes="aborted_by_user",
                 )
-            
-            # Triangle: toggle gripper manual override
+
             if ps5.get_button_pressed(PS5Buttons.TRIANGLE):
                 if gripper_manual_override is None:
-                    # Enter manual mode, toggle to opposite state
                     current_gripper = piper.get_gripper_angle() or 0.0
                     if current_gripper > GRIPPER_OPEN_ANGLE / 2:
                         gripper_manual_override = GRIPPER_CLOSE_ANGLE
@@ -1357,7 +1216,6 @@ def run_episode(
                         piper.open_gripper()
                     print(f"  [Gripper] Manual override: {gripper_manual_override:.0f}deg")
                 else:
-                    # Toggle within manual mode
                     if gripper_manual_override > GRIPPER_OPEN_ANGLE / 2:
                         gripper_manual_override = GRIPPER_CLOSE_ANGLE
                         piper.close_gripper()
@@ -1366,13 +1224,12 @@ def run_episode(
                         piper.open_gripper()
                     print(f"  [Gripper] Manual toggle: {gripper_manual_override:.0f}deg")
                 ps5.rumble_short(1)
-            
-            # Options: re-enable arm
+
             if ps5.get_button_pressed(PS5Buttons.OPTIONS):
                 print("[Episode] Re-enabling arm...")
                 piper.enable()
                 ps5.rumble_short(1)
-        
+
         elif stdin_ctrl:
             events = stdin_ctrl.poll()
             if events.get('start_stop', False):
@@ -1400,179 +1257,149 @@ def run_episode(
                 else:
                     piper.open_gripper()
                     gripper_manual_override = GRIPPER_OPEN_ANGLE
-        
+
         # =================================================================
         # Check emergency stop
         # =================================================================
         if piper._emergency_stop:
-            # Wait for e-stop to be cleared instead of aborting
             time.sleep(0.1)
             continue
-        
+
         # =================================================================
         # Get current observations
         # =================================================================
         fixed_img = fixed_cam.get_frame()
         wrist_img = wrist_cam.get_frame() if wrist_cam else None
         pose = piper.get_ee_pose_meters()
-        
+
         if fixed_img is None or pose is None:
             time.sleep(control_period)
             continue
-        
-        # Get gripper angle for state
+
         gripper_angle = piper.get_gripper_angle()
         if gripper_angle is None:
             gripper_angle = GRIPPER_OPEN_ANGLE
         pose['gripper_angle'] = gripper_angle
-        
-        # Record video frame
+
         if video_recorder is not None:
             video_recorder.add_combined_frame(fixed_img, wrist_img)
-        
+
         # =================================================================
         # Run policy inference
         # =================================================================
-        # NOTE: select_action() internally manages an action queue:
-        #   - It runs diffusion to generate a full horizon of actions
-        #   - It caches n_action_steps actions and pops one per call
-        #   - So we call it every step; it only runs inference when
-        #     the internal queue is empty.
-        
-        # Build observation matching training format
         obs = build_observation(
             fixed_image=fixed_img,
             wrist_image=wrist_img,
             pose=pose,
             policy_config=policy_config,
         )
-        
-        # Preprocess (to_batch -> device -> normalize)
+
         obs_normalized = preprocessor(obs)
-        
-        # Run policy inference (returns a single action tensor)
+
         with torch.no_grad():
             action_tensor = policy.select_action(obs_normalized)
-        
-        # Postprocess (unnormalize -> cpu)
+
         action_tensor = postprocessor(action_tensor)
-        
-        # Convert to numpy
+
         if isinstance(action_tensor, torch.Tensor):
             action = action_tensor.cpu().numpy()
         else:
             action = np.asarray(action_tensor)
-        
-        # Flatten if needed: (1, action_dim) -> (action_dim,)
+
         if action.ndim == 2:
             action = action[0]
-        
+
         if step % log_freq == 0:
             print(f"  Step {step}: action={action[:3].round(4)}, "
                   f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
-        
+
         # =================================================================
         # Track trajectory for comparison plot
         # =================================================================
         current_xyz = np.array([pose['x'], pose['y'], pose['z']])
         actual_positions.append(current_xyz.copy())
-        
+
         if integrated_xyz is None:
-            # Initialize integrated trajectory at the actual starting position
             integrated_xyz = current_xyz.copy()
-        
-        # Accumulate position deltas from action output
+
         integrated_xyz = integrated_xyz + np.array([action[0], action[1], action[2]])
         integrated_positions.append(integrated_xyz.copy())
-        
+
         # =================================================================
         # Apply action to robot
         # =================================================================
         target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg = \
             apply_delta_action(pose, action)
-        
-        # Execute position/rotation on robot
+
         piper.move_to_pose(target_x, target_y, target_z, target_rx, target_ry, target_rz)
-        
-        # Gripper: use manual override if set, otherwise follow policy
+
         if gripper_manual_override is not None:
             piper.set_gripper_angle(gripper_manual_override)
         else:
             piper.set_gripper_angle(gripper_deg)
-        
+
         # =================================================================
         # Camera display (optional)
         # =================================================================
         if show_camera and CV2_AVAILABLE:
             display_frame = fixed_img.copy()
-            # Convert RGB to BGR for OpenCV display
             display_frame = cv2.cvtColor(display_frame, cv2.COLOR_RGB2BGR)
-            
-            # Overlay: step info
-            cv2.putText(display_frame, f"EP {episode_id} | Step {step}/{max_steps}",
+
+            cv2.putText(display_frame, f"EP {episode_id} | Step {step}/{max_steps} [DiTFlow]",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            # Overlay: position
             cv2.putText(display_frame,
                         f"Pos: ({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})m",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
-            # Overlay: rotation (degrees)
             cv2.putText(display_frame,
                         f"Rot: ({pose['rx_deg']:.1f}, {pose['ry_deg']:.1f}, {pose['rz_deg']:.1f})deg",
                         (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
-            # Overlay: action delta
+
             delta_pos = np.linalg.norm(action[:3])
             cv2.putText(display_frame,
                         f"Delta: pos={delta_pos:.4f}m  grip={action[7]:.2f}",
                         (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            
-            # Overlay: gripper state
+
             grip_text = f"Gripper: {gripper_angle:.0f}deg"
             if gripper_manual_override is not None:
                 grip_text += " [MANUAL]"
             cv2.putText(display_frame, grip_text,
                         (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-            
-            # Emergency stop indicator
+
             if piper._emergency_stop:
                 cv2.putText(display_frame, "E-STOP",
                             (display_frame.shape[1] // 2 - 50, display_frame.shape[0] // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-            
-            # Show wrist camera side by side if available
+
             if wrist_img is not None:
                 wrist_display = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
                 h = display_frame.shape[0]
-                wrist_resized = cv2.resize(wrist_display, (int(wrist_display.shape[1] * h / wrist_display.shape[0]), h))
+                wrist_resized = cv2.resize(wrist_display,
+                                           (int(wrist_display.shape[1] * h / wrist_display.shape[0]), h))
                 display_frame = np.concatenate([display_frame, wrist_resized], axis=1)
-            
-            cv2.imshow("Piper Eval", display_frame)
+
+            cv2.imshow("Piper DiTFlow Eval", display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 user_stopped = True
                 break
-        
+
         step += 1
-        
-        # Periodic status log
+
         if step % (log_freq * 5) == 0:
             elapsed = time.time() - episode_start_time
             fps = step / elapsed if elapsed > 0 else 0
             print(f"  Step {step}/{max_steps} | {elapsed:.1f}s | {fps:.1f}Hz | "
                   f"pos=({pose['x']:.3f},{pose['y']:.3f},{pose['z']:.3f})", flush=True)
-        
-        # Maintain control frequency
+
         elapsed = time.time() - loop_start
         sleep_time = control_period - elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
-    
+
     duration = time.time() - episode_start_time
     status = "stopped by user" if user_stopped else "completed"
     print(f"[Episode {episode_id}] {status}: {step} steps in {duration:.1f}s ({step/duration:.1f}Hz)")
-    
+
     # =================================================================
     # Generate trajectory comparison plot and attach to video
     # =================================================================
@@ -1585,24 +1412,21 @@ def run_episode(
                 width=max(960, video_recorder.width),
                 height=max(720, video_recorder.height),
             )
-            # Resize plot to match video frame dimensions
             plot_resized = cv2.resize(plot_img,
                                       (video_recorder.frames[0].shape[1],
                                        video_recorder.frames[0].shape[0]),
                                       interpolation=cv2.INTER_LINEAR)
-            # Append plot as extra frames at the end of the video (show for 5 seconds)
             plot_hold_frames = video_recorder.fps * 5
             for _ in range(plot_hold_frames):
                 video_recorder.frames.append(plot_resized)
             print(f"[Episode {episode_id}] Trajectory plot appended to video ({plot_hold_frames} frames)")
-            
-            # Also save the plot as a standalone PNG next to the video
+
             plot_save_path = Path(video_recorder.output_path).with_suffix('.trajectory.png')
             imageio.imwrite(str(plot_save_path), plot_img)
             print(f"[Episode {episode_id}] Trajectory plot saved to {plot_save_path}")
         except Exception as e:
             print(f"[Episode {episode_id}] Warning: Failed to generate trajectory plot: {e}")
-    
+
     return EpisodeResult(
         episode_id=episode_id,
         steps=step,
@@ -1617,19 +1441,24 @@ def run_episode(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate diffusion policy on Piper arm.",
+        description="Evaluate DiT Flow policy on Piper arm.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic evaluation
-  python 5_eval_diffusion_piper.py \\
-      --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model
+  python 8_eval_ditflow_piper.py \\
+      --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model
 
   # With specific cameras and GPU
-  python 5_eval_diffusion_piper.py \\
-      --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model \\
+  python 8_eval_ditflow_piper.py \\
+      --checkpoint /path/to/pretrained_model \\
       --front_cam Orbbec_Gemini_335L --wrist_cam Dabai_DC1 \\
       --device cuda:0
+
+  # Fewer inference steps (faster but noisier)
+  python 8_eval_ditflow_piper.py \\
+      --checkpoint /path/to/pretrained_model \\
+      --num_inference_steps 50
 
 PS5 Controller:
   Square:    Start/Stop episode
@@ -1640,7 +1469,7 @@ PS5 Controller:
   PS Button: Quit (PlayStation logo, center)
 """
     )
-    
+
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to pretrained model directory")
     parser.add_argument("--can_interface", "-c", type=str, default="can0",
@@ -1652,12 +1481,12 @@ PS5 Controller:
     parser.add_argument("--n_action_steps", type=int, default=None,
                         help="Action steps per inference (None=use model config)")
     parser.add_argument("--num_inference_steps", type=int, default=None,
-                        help="Diffusion denoising steps (None=use model config)")
+                        help="Flow integration steps (None=use model config, typically 100)")
     parser.add_argument("--control_freq", type=int, default=20,
                         help="Control frequency in Hz (default: 20)")
     parser.add_argument("--speed", "-s", type=int, default=DEFAULT_SPEED_PERCENT,
                         help=f"Motion speed percentage (default: {DEFAULT_SPEED_PERCENT})")
-    
+
     # Camera options
     parser.add_argument("--front_cam", "-f", type=str, default=DEFAULT_FRONT_CAMERA,
                         help=f"Front camera ID/name (default: {DEFAULT_FRONT_CAMERA})")
@@ -1668,25 +1497,24 @@ PS5 Controller:
     parser.add_argument("--image_height", type=int, default=270,
                         help="Camera capture height (default: 270)")
     parser.add_argument("--show_camera", action="store_true",
-                        help="Show camera feed with overlay during evaluation (requires OpenCV)")
-    
+                        help="Show camera feed with overlay during evaluation")
+
     # Output options
     parser.add_argument("--out_dir", type=str, default=None,
                         help="Output directory (default: auto-generated under checkpoint run dir with date)")
     parser.add_argument("--no_record_video", action="store_true",
                         help="Disable video recording (video is recorded by default)")
-    
+
     # Device
     parser.add_argument("--device", type=str, default="cuda",
                         help="PyTorch device (default: cuda)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
-    
+
     return parser.parse_args()
 
 
 def normalize_camera_value(value: str) -> Union[int, str]:
-    """Normalize camera value from command line."""
     if value.strip() == "-1":
         return -1
     try:
@@ -1697,17 +1525,12 @@ def normalize_camera_value(value: str) -> Union[int, str]:
 
 def main():
     args = parse_args()
-    
-    # Flip record_video: default is True, --no_record_video disables it
+
     args.record_video = not args.no_record_video
-    
+
     # Auto-derive output directory from checkpoint path if not specified
     if args.out_dir is None:
-        # Checkpoint path example:
-        #   /media/.../runs/diffusion_piper_teleop_B/checkpoints/checkpoints/020000/pretrained_model
-        # We want the run root:  /media/.../runs/diffusion_piper_teleop_B/
         checkpoint_path = Path(args.checkpoint).resolve()
-        # Walk up from checkpoint to find the run directory (parent of "checkpoints")
         run_dir = checkpoint_path
         while run_dir.name != '' and run_dir.name != run_dir.root:
             if run_dir.name == 'checkpoints' and run_dir.parent.name != 'checkpoints':
@@ -1715,24 +1538,22 @@ def main():
                 break
             run_dir = run_dir.parent
         else:
-            # Fallback: use checkpoint parent
             run_dir = checkpoint_path.parent
-        
+
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = run_dir / f"eval_{date_str}"
+        out_dir = run_dir / f"eval_ditflow_{date_str}"
     else:
         out_dir = Path(args.out_dir)
-    
+
     # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    
-    # Create output directory
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print("\n" + "=" * 60)
-    print("Piper Diffusion Policy Evaluation")
+    print("Piper DiT Flow Policy Evaluation")
     print("=" * 60)
     print(f"  Checkpoint:    {args.checkpoint}")
     print(f"  Num episodes:  {args.num_episodes}")
@@ -1742,25 +1563,35 @@ def main():
     print(f"  Output dir:    {out_dir}")
     print(f"  Record video:  {args.record_video}")
     print("=" * 60)
-    
+
     # =========================================================================
-    # Load policy config first to determinemcamera requirements
+    # Load policy config first to determine camera requirements
     # =========================================================================
     print("\n[Init] Loading policy configuration...")
     policy_config = load_policy_config(args.checkpoint)
+    print(f"  policy_type:    {policy_config['policy_type']}")
     print(f"  has_wrist:      {policy_config['has_wrist']}")
     print(f"  image_shape:    {policy_config['image_shape']}")
     print(f"  state_dim:      {policy_config['state_dim']}")
     print(f"  action_dim:     {policy_config['action_dim']}")
     print(f"  n_obs_steps:    {policy_config['n_obs_steps']}")
     print(f"  n_action_steps: {policy_config['n_action_steps']}")
-    
+
+    if policy_config['policy_type'] != 'ditflow':
+        print(f"\n[Warning] Expected policy type 'ditflow' but got '{policy_config['policy_type']}'.")
+        print(f"  This script is designed for DiT Flow policies (trained by script 7).")
+        print(f"  For Diffusion Policy (trained by script 4), use script 5 instead.")
+        resp = input("  Continue anyway? [y/N]: ").strip().lower()
+        if resp != 'y':
+            print("Aborted.")
+            return
+
     # =========================================================================
-    # Initialize PS5 controller (or fallback to stdin)
+    # Initialize PS5 controller
     # =========================================================================
     ps5 = None
     stdin_ctrl = None
-    
+
     if PYGAME_AVAILABLE:
         ps5 = PS5Controller()
         if not ps5.initialize():
@@ -1770,7 +1601,7 @@ def main():
             stdin_ctrl = StdinController()
     else:
         stdin_ctrl = StdinController()
-    
+
     # =========================================================================
     # Parallel initialization: Arm + Cameras + Policy
     # =========================================================================
@@ -1782,9 +1613,8 @@ def main():
     postprocessor = None
     init_errors = []
     n_action_steps_loaded = args.n_action_steps or policy_config['n_action_steps']
-    
+
     def init_arm():
-        """Initialize and enable Piper arm."""
         arm = PiperController(args.can_interface)
         arm._speed_percent = args.speed
         if not arm.connect():
@@ -1792,14 +1622,13 @@ def main():
         if not arm.enable():
             raise RuntimeError("Arm enable failed")
         return arm
-    
+
     def init_cameras():
-        """Initialize cameras."""
         cams = {"fixed": None, "wrist": None}
-        
+
         front_cam_id = normalize_camera_value(args.front_cam)
         if is_camera_enabled(front_cam_id):
-            cam = CameraCapture(front_cam_id, args.image_width, args.image_height, 
+            cam = CameraCapture(front_cam_id, args.image_width, args.image_height,
                                name="front")
             if cam.start():
                 cams["fixed"] = cam
@@ -1807,12 +1636,11 @@ def main():
                 raise RuntimeError(f"Front camera failed: {front_cam_id}")
         else:
             raise RuntimeError("Front camera is required!")
-        
-        # Wrist camera (only if policy expects it)
+
         if policy_config['has_wrist']:
             wrist_cam_id = normalize_camera_value(args.wrist_cam)
             if is_camera_enabled(wrist_cam_id):
-                cam = CameraCapture(wrist_cam_id, args.image_width, args.image_height, 
+                cam = CameraCapture(wrist_cam_id, args.image_width, args.image_height,
                                    name="wrist")
                 if cam.start():
                     cams["wrist"] = cam
@@ -1820,20 +1648,20 @@ def main():
                     raise RuntimeError(f"Wrist camera failed: {wrist_cam_id}")
             else:
                 print("[Warning] Policy expects wrist camera but it's disabled (-1)")
-        
+
         return cams
-    
+
     print("\n[Init] Starting parallel initialization (arm + cameras)...")
-    
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         arm_future = executor.submit(init_arm)
         cam_future = executor.submit(init_cameras)
-        
+
         # Load policy on MAIN THREAD (CUDA must be initialized on main thread)
-        print("[Init] Loading policy on main thread...", flush=True)
+        print("[Init] Loading DiT Flow policy on main thread...", flush=True)
         try:
             policy, preprocessor, postprocessor, _, n_action_steps_loaded = \
-                load_diffusion_policy(
+                load_ditflow_policy(
                     pretrained_dir=args.checkpoint,
                     device=args.device,
                     num_inference_steps=args.num_inference_steps,
@@ -1843,12 +1671,12 @@ def main():
             init_errors.append(f"Policy: {e}")
             import traceback
             traceback.print_exc()
-        
+
         try:
             piper = arm_future.result(timeout=30)
         except Exception as e:
             init_errors.append(f"Arm: {e}")
-        
+
         try:
             cams = cam_future.result(timeout=30)
             fixed_cam = cams["fixed"]
@@ -1857,11 +1685,6 @@ def main():
             init_errors.append(f"Cameras: {e}")
 
     def cleanup_and_exit(exit_code: int = 1):
-        """Clean up all resources and force exit.
-        
-        Uses os._exit() because daemon threads (e.g. StdinController's input()
-        blocking thread) prevent a clean sys.exit().
-        """
         print(f"\n[Cleanup] Shutting down (exit_code={exit_code})...")
         try:
             if piper:
@@ -1891,39 +1714,30 @@ def main():
         print("[Cleanup] Done. Exiting.")
         os._exit(exit_code)
 
-    # Check for errors
     if init_errors:
         print("\n[Error] Initialization failed:")
         for err in init_errors:
             print(f"  - {err}")
         cleanup_and_exit(1)
-    
-    # Use loaded n_action_steps if not overridden
+
     if args.n_action_steps is None:
         args.n_action_steps = n_action_steps_loaded
-    
-    # Verify arm is ready
+
     if not piper.wait_until_ready(timeout=10.0):
         print("[Error] Arm not ready. Try power cycling.")
         cleanup_and_exit(1)
-    
-    # Go to home position first (safe retracted pose)
-    print("\n[Init] Going to home position first...")
-    piper.go_to_home()
+
+    print("\n[Init] Going to start position...")
+    piper.go_to_start()
     time.sleep(2.0)
     piper.open_gripper()
     time.sleep(0.5)
-
-    # Then go to start position before evaluation banner
-    print("[Init] Going to start position...")
-    piper.go_to_start()
-    time.sleep(2.0)
 
     # =========================================================================
     # Main interaction loop
     # =========================================================================
     print("\n" + "=" * 60)
-    print("Ready for evaluation!")
+    print("Ready for DiT Flow evaluation!")
     print("=" * 60)
     if ps5:
         print("  Square:    Start/Stop episode")
@@ -1938,26 +1752,26 @@ def main():
         print("  g = Toggle gripper manually")
         print("  e = Emergency stop")
         print("  q = Quit")
-    print(f"\n  Action mode: RELATIVE delta (8D)")
+    print(f"\n  Policy type: DiT Flow")
+    print(f"  Action mode: RELATIVE delta (8D)")
     print(f"  N action steps: {args.n_action_steps}")
     print(f"  Show camera: {args.show_camera}")
     print("=" * 60 + "\n")
-    
+
     results = EvaluationResults()
     episode_id = 0
     in_episode = False
     gripper_open = True
-    
+
     try:
         while episode_id < args.num_episodes:
-            # ---- Poll controller ----
             start_stop = False
             go_home = False
             toggle_gripper = False
             e_stop = False
             quit_prog = False
             re_enable = False
-            
+
             if ps5:
                 ps5.update()
                 start_stop = ps5.get_button_pressed(PS5Buttons.SQUARE)
@@ -1973,12 +1787,11 @@ def main():
                 toggle_gripper = events.get('gripper', False)
                 e_stop = events.get('emergency_stop', False)
                 quit_prog = events.get('quit', False)
-            
-            # ---- Handle events ----
+
             if quit_prog:
                 print("\n[Main] Quit requested.")
                 break
-            
+
             if e_stop:
                 if piper._emergency_stop:
                     piper.clear_emergency_stop()
@@ -1990,7 +1803,7 @@ def main():
                         ps5.rumble_short(3, intensity=1.0)
                 time.sleep(0.5)
                 continue
-            
+
             if re_enable:
                 print("[Main] Re-enabling arm...")
                 piper.enable()
@@ -1998,14 +1811,14 @@ def main():
                 if ps5:
                     ps5.rumble_short(1)
                 continue
-            
+
             if go_home and not in_episode:
                 piper.go_to_home()
                 time.sleep(1.0)
                 if ps5:
                     ps5.rumble_short(1)
                 continue
-            
+
             if toggle_gripper and not in_episode:
                 if gripper_open:
                     piper.close_gripper()
@@ -2016,15 +1829,13 @@ def main():
                 if ps5:
                     ps5.rumble_short(1)
                 continue
-            
+
             if start_stop:
                 if not in_episode:
-                    # Start episode
                     in_episode = True
                     if ps5:
                         ps5.rumble_short(1)
-                    
-                    # Create video recorder if needed
+
                     video_recorder = None
                     if args.record_video:
                         video_path = str(out_dir / f"episode_{episode_id:03d}.mp4")
@@ -2034,8 +1845,7 @@ def main():
                             width=args.image_width,
                             height=args.image_height,
                         )
-                    
-                    # Run episode (blocking, but with PS5 polling inside)
+
                     result = run_episode(
                         piper=piper,
                         fixed_cam=fixed_cam,
@@ -2054,74 +1864,63 @@ def main():
                         stdin_ctrl=stdin_ctrl,
                         show_camera=args.show_camera,
                     )
-                    
+
                     in_episode = False
-                    
-                    # Save video
+
                     if video_recorder is not None:
                         video_recorder.save()
-                    
-                    # Record result
+
                     results.episodes.append(result)
                     episode_id += 1
-                    
+
                     if ps5:
                         ps5.rumble_short(2)
-                    
-                    # Print progress
+
                     print(f"\n[Progress] {episode_id}/{args.num_episodes} episodes completed")
                     print(f"  Avg steps: {results.avg_steps:.0f}")
                     print(f"  Avg duration: {results.avg_duration:.1f}s")
-                    
-                    # Return to start position for next episode
+
                     piper.go_to_start()
                     time.sleep(1.0)
                     piper.open_gripper()
                     gripper_open = True
-                    
+
                     print("\nPress Square for next episode (or PS to quit)...")
-            
-            # ---- Camera display during idle (between episodes) ----
+
+            # Camera display during idle
             if args.show_camera and CV2_AVAILABLE and not in_episode:
                 frame = fixed_cam.get_frame()
                 if frame is not None:
                     display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    
-                    # Overlay: idle status
-                    cv2.putText(display_frame, f"IDLE | EP {episode_id}/{args.num_episodes}",
+                    cv2.putText(display_frame, f"IDLE [DiTFlow] | EP {episode_id}/{args.num_episodes}",
                                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    
-                    # Overlay: position
                     pose = piper.get_ee_pose_meters()
                     if pose:
                         cv2.putText(display_frame,
                                     f"Pos: ({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})m",
                                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
                     cv2.putText(display_frame, "Press Square to start",
                                 (10, display_frame.shape[0] - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                    
                     if piper._emergency_stop:
                         cv2.putText(display_frame, "E-STOP",
                                     (display_frame.shape[1] // 2 - 50, display_frame.shape[0] // 2),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-                    
-                    cv2.imshow("Piper Eval", display_frame)
+                    cv2.imshow("Piper DiTFlow Eval", display_frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         print("\n[Main] Quit from camera window.")
                         break
-            
-            time.sleep(0.02)  # Small sleep in idle loop
-    
+
+            time.sleep(0.02)
+
     except KeyboardInterrupt:
         print("\n[Main] Interrupted by user.")
-    
+
     finally:
         # Cleanup: always go home before disconnecting
         print("\n[Main] Cleaning up...")
-        
+
         try:
             if piper and piper.enabled:
                 if piper._emergency_stop:
@@ -2134,21 +1933,21 @@ def main():
                 time.sleep(3.0)
         except Exception as e:
             print(f"[Main] Error returning to home: {e}")
-        
+
         # Disconnect arm properly (disables motors)
         try:
             if piper:
                 piper.disconnect()
         except Exception:
             pass
-        
+
         # Close controllers
         try:
             if ps5:
                 ps5.close()
         except Exception:
             pass
-        
+
         # Stop cameras
         try:
             if fixed_cam:
@@ -2160,24 +1959,23 @@ def main():
                 wrist_cam.stop()
         except Exception:
             pass
-        
+
         if CV2_AVAILABLE:
             try:
                 cv2.destroyAllWindows()
             except Exception:
                 pass
-        
-        # Save results before final exit
+
         if results.num_episodes > 0:
             try:
                 results.save(str(out_dir / "eval_results.json"))
             except Exception:
                 pass
-        
-        # Print summary
+
         print("\n" + "=" * 60)
         print("EVALUATION SUMMARY")
         print("=" * 60)
+        print(f"  Policy type:    DiT Flow")
         print(f"  Total episodes: {results.num_episodes}")
         print(f"  Avg steps:      {results.avg_steps:.0f}")
         print(f"  Avg duration:   {results.avg_duration:.1f}s")
