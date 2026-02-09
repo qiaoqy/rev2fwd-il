@@ -31,7 +31,7 @@ python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode data/teleop_data/episode_0000.tar.gz --no_xyz_curves
 
 python scripts/scripts_piper_local/2_visualize_collected_data.py \
-    --episode /media/qiyuan/SSDQQY/rev2fwd_data/insert_piper/episode_20260206_232811_199161.tar.gz
+    --episode /media/qiyuan/SSDQQY/rev2fwd_data/pickplace_piper_0210/episode_20260210_031459_772565.tar.gz
 =============================================================================
 """
 

@@ -713,7 +713,14 @@ class StdinController:
 # =============================================================================
 
 class VideoRecorder:
-    """Record video from camera frames."""
+    """Record video from camera frames.
+
+    The recorder uses the *actual* camera frame dimensions so that the
+    saved video faithfully represents what the cameras see.  When two
+    camera views are combined side-by-side, each view keeps its native
+    aspect ratio (both are resized to the same height before
+    concatenation).
+    """
 
     def __init__(self, output_path: str, fps: int = 20, width: int = 640, height: int = 480):
         self.output_path = output_path
@@ -723,15 +730,28 @@ class VideoRecorder:
         self.frames = []
 
     def add_frame(self, frame: np.ndarray):
+        """Add a frame (RGB format) at its native resolution."""
         self.frames.append(frame.copy())
 
     def add_combined_frame(self, fixed_frame: np.ndarray, wrist_frame: Optional[np.ndarray]):
+        """Add a combined frame with both camera views side-by-side.
+
+        Each view is resized to a common height (the taller of the two)
+        while preserving its aspect ratio, then concatenated horizontally.
+        """
         if wrist_frame is not None:
-            fixed_resized = cv2.resize(fixed_frame, (self.width // 2, self.height))
-            wrist_resized = cv2.resize(wrist_frame, (self.width // 2, self.height))
+            # Use the taller frame's height as the target
+            target_h = max(fixed_frame.shape[0], wrist_frame.shape[0])
+            # Resize each frame to target_h keeping aspect ratio
+            fixed_scale = target_h / fixed_frame.shape[0]
+            fixed_w = int(fixed_frame.shape[1] * fixed_scale)
+            wrist_scale = target_h / wrist_frame.shape[0]
+            wrist_w = int(wrist_frame.shape[1] * wrist_scale)
+            fixed_resized = cv2.resize(fixed_frame, (fixed_w, target_h))
+            wrist_resized = cv2.resize(wrist_frame, (wrist_w, target_h))
             combined = np.concatenate([fixed_resized, wrist_resized], axis=1)
         else:
-            combined = cv2.resize(fixed_frame, (self.width, self.height))
+            combined = fixed_frame.copy()
         self.frames.append(combined)
 
     def save(self):
@@ -1661,7 +1681,7 @@ def main():
 
         front_cam_id = normalize_camera_value(args.front_cam)
         if is_camera_enabled(front_cam_id):
-            cam = CameraCapture(front_cam_id, args.image_width, args.image_height,
+            cam = CameraCapture(front_cam_id, 640, 480,
                                name="front")
             if cam.start():
                 cams["fixed"] = cam
@@ -1673,7 +1693,7 @@ def main():
         if policy_config['has_wrist']:
             wrist_cam_id = normalize_camera_value(args.wrist_cam)
             if is_camera_enabled(wrist_cam_id):
-                cam = CameraCapture(wrist_cam_id, args.image_width, args.image_height,
+                cam = CameraCapture(wrist_cam_id, 640, 480,
                                    name="wrist")
                 if cam.start():
                     cams["wrist"] = cam
@@ -1881,8 +1901,8 @@ def main():
                         video_recorder = VideoRecorder(
                             video_path,
                             fps=args.control_freq,
-                            width=args.image_width,
-                            height=args.image_height,
+                            width=640,
+                            height=480,
                         )
 
                     result = run_episode(

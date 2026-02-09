@@ -54,7 +54,7 @@ PS5 CONTROLLER MAPPING
 |                   |   - Long press (~1.5s): discard recording           |
 |                   |   - 1 vibrate = started, 2 = saved, 3 = discarded   |
 | Share             | Emergency stop / Resume                             |
-| Options           | Re-enable arm (three-line button, top right)        |
+| Options           | Go to start position (three-line button, top right) |
 | PS Button         | Quit program (PlayStation logo, center)             |
 
 =============================================================================
@@ -76,7 +76,7 @@ python 1_teleop_ps5_controller.py --show_camera
 python 1_teleop_ps5_controller.py --record --out_dir data/teleop_data
 
 python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
-    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/insert_piper
+    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/pickplace_piper_0210
 """
 
 from __future__ import annotations
@@ -262,12 +262,14 @@ GRIPPER_MASS = 0.0  # kg - increased from 0.2 to better match actual gripper
 DEFAULT_FRONT_CAMERA = "Orbbec_Gemini_335L"  # Front camera name/ID
 DEFAULT_WRIST_CAMERA = "Dabai_DC1"           # Wrist camera name/ID (-1 to disable)
 
-# === Home Position (calibrated from script 0) ===
+# === Home/Start Position (calibrated from script 0 / script 8) ===
 HOME_POSITION = (0.054, 0.0, 0.175)     # X, Y, Z in meters
 HOME_ORIENTATION = (3.14, 1.2, 3.14)    # RX, RY, RZ in radians
+START_POSITION = (0.2888, 0.0010, 0.2542)     # X, Y, Z in meters
+START_ORIENTATION = (-3.1206, 0.2391, -3.1261)  # RX, RY, RZ in radians
 
 # === Control Parameters ===
-DEFAULT_SPEED_PERCENT = 20              # Default motion speed (0-100%)
+DEFAULT_SPEED_PERCENT = 10              # Default motion speed (0-100%)
 MIN_SPEED_PERCENT = 5
 MAX_SPEED_PERCENT = 50
 
@@ -624,6 +626,8 @@ class PiperController:
         self._emergency_stop = False
         self._home_position = HOME_POSITION
         self._home_orientation = HOME_ORIENTATION
+        self._start_position = START_POSITION
+        self._start_orientation = START_ORIENTATION
         self.connected = False
         self.enabled = False
         self._speed_percent = DEFAULT_SPEED_PERCENT
@@ -902,6 +906,16 @@ class PiperController:
         rx, ry, rz = self._home_orientation
         return self.move_to_pose(x, y, z, rx, ry, rz)
 
+    def go_to_start(self) -> bool:
+        """Move to start position."""
+        if self._emergency_stop:
+            return False
+
+        print("[Piper] Going to start position...")
+        x, y, z = self._start_position
+        rx, ry, rz = self._start_orientation
+        return self.move_to_pose(x, y, z, rx, ry, rz)
+
 
 # =============================================================================
 # PS5 Controller Handler
@@ -914,6 +928,8 @@ class PS5Controller:
         self.joystick: Optional[pygame.joystick.JoystickType] = None
         self.connected = False
         self.deadzone = 0.1
+        self._haptic = None
+        self._haptic_ready = False
         
         # Button states for edge detection
         self._prev_buttons = {}
@@ -948,6 +964,7 @@ class PS5Controller:
             if "dualsense" in name.lower() or "ps5" in name.lower() or "sony" in name.lower() or "wireless controller" in name.lower():
                 self.joystick = js
                 self.connected = True
+                self._init_haptics()
                 return True
         
         # If no PS5 found, use first joystick
@@ -956,9 +973,21 @@ class PS5Controller:
             self.joystick.init()
             self.connected = True
             print(f"[Warning] No PS5 controller found, using: {self.joystick.get_name()}")
+            self._init_haptics()
             return True
         
         return False
+
+    def _init_haptics(self):
+        """Initialize haptics (rumble) if supported by SDL."""
+        try:
+            if pygame.haptic.get_count() > 0:
+                self._haptic = pygame.haptic.Haptic(self.joystick)
+                self._haptic.init()
+                self._haptic_ready = self._haptic.rumble_init()
+        except Exception:
+            self._haptic = None
+            self._haptic_ready = False
     
     def update(self):
         """Process pygame events (call this each frame)."""
@@ -1025,9 +1054,18 @@ class PS5Controller:
             return
         
         try:
-            self.joystick.rumble(low_frequency, high_frequency, duration_ms)
+            if self.joystick.rumble(low_frequency, high_frequency, duration_ms):
+                return
         except Exception as e:
             pass  # Rumble not supported or failed
+
+        # Fallback to SDL haptics if joystick rumble isn't available
+        try:
+            if self._haptic_ready and self._haptic is not None:
+                strength = max(low_frequency, high_frequency)
+                self._haptic.rumble_play(strength, duration_ms)
+        except Exception:
+            pass
     
     def stop_rumble(self):
         """Stop any ongoing vibration."""
@@ -1036,6 +1074,11 @@ class PS5Controller:
         try:
             self.joystick.stop_rumble()
         except Exception as e:
+            pass
+        try:
+            if self._haptic is not None:
+                self._haptic.rumble_stop()
+        except Exception:
             pass
     
     def rumble_short(self, count: int = 1, intensity: float = 0.7, duration_ms: int = 100):
@@ -1505,6 +1548,7 @@ class TeleoperationController:
         print("  L1/R1:         Decrease/Increase speed")
         print("  D-pad:         Pitch/Roll")
         print("  Cross (X):     Go to home")
+        print("  Options:       Go to start")
         print("  Circle HOLD:   Gyro mode (hold still briefly, then tilt)")
         print("  Triangle:      Toggle gripper")
         if self._record_data:
@@ -1557,14 +1601,9 @@ class TeleoperationController:
         if self.piper._emergency_stop:
             return True
         
-        # Options button - reset/re-enable
+        # Options button - go to start position
         if self.ps5.get_button_pressed(PS5Buttons.OPTIONS):
-            print("[Teleop] Resetting arm...")
-            self.piper.enable()
-            # Keep gripper open after re-enable (enable() sets gripper to closed state)
-            self.piper.open_gripper()
-            self._gripper_open = True
-            self._gripper_target_angle = GRIPPER_OPEN_ANGLE
+            self.piper.go_to_start()
             return True
         
         # Cross button - go home
@@ -2274,7 +2313,7 @@ def main():
             piper.open_gripper()
             time.sleep(0.5)
             piper.go_to_home()
-            time.sleep(2.0)
+            time.sleep(5.0)
         
         piper.disconnect()
         
@@ -2346,6 +2385,8 @@ def main():
                 # === Home Position ===
                 "home_position_m": list(HOME_POSITION),
                 "home_orientation_rad": list(HOME_ORIENTATION),
+                "start_position_m": list(START_POSITION),
+                "start_orientation_rad": list(START_ORIENTATION),
                 
                 # === Workspace Limits ===
                 "workspace_limits_m": WORKSPACE_LIMITS,
