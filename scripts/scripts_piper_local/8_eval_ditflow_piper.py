@@ -59,12 +59,12 @@ Requires:
 USAGE EXAMPLES
 =============================================================================
 # Basic evaluation
-python 8_eval_ditflow_piper.py \
-    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model
 
 # Full options
-python 8_eval_ditflow_piper.py \
-    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
     --can_interface can0 \
     --num_episodes 10 \
     --max_steps 500 \
@@ -73,13 +73,13 @@ python 8_eval_ditflow_piper.py \
     --show_camera
 
 # Override inference steps (fewer = faster but noisier)
-python 8_eval_ditflow_piper.py \
-    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
     --num_inference_steps 50
 
 # Override action steps
-python 8_eval_ditflow_piper.py \
-    --checkpoint /media/qiyuan/SSDQQY/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
     --n_action_steps 4 --num_inference_steps 100
 =============================================================================
 """
@@ -923,6 +923,15 @@ def load_ditflow_policy(
         config_dict["n_action_steps"] = n_action_steps
         print(f"[Policy] Overriding n_action_steps = {n_action_steps}")
 
+    # Filter out unknown fields not accepted by DiTFlowConfig
+    import dataclasses
+    valid_fields = {f.name for f in dataclasses.fields(DiTFlowConfig)}
+    unknown_keys = set(config_dict.keys()) - valid_fields
+    if unknown_keys:
+        print(f"[Policy] Ignoring unknown config keys: {unknown_keys}", flush=True)
+        for k in unknown_keys:
+            del config_dict[k]
+
     # Create config and policy
     print(f"[Policy] Creating DiTFlowConfig...", flush=True)
     cfg = DiTFlowConfig(**config_dict)
@@ -933,7 +942,31 @@ def load_ditflow_policy(
     # Load weights
     print(f"[Policy] Loading model weights...", flush=True)
     state_dict = load_file(model_path)
-    policy.load_state_dict(state_dict)
+
+    # Use strict=False to handle version mismatches in lerobot_policy_ditflow.
+    # Newer versions wrap linear1/linear2 inside an nn.Sequential called `mlp`,
+    # creating alias keys (mlp.0 == linear1, mlp.3 == linear2).  Checkpoints
+    # trained with the older version only have linear1/linear2 keys.  Because
+    # the underlying nn.Linear objects are shared, loading linear1/linear2
+    # automatically populates mlp.0/mlp.3 — so missing mlp.* keys are safe.
+    result = policy.load_state_dict(state_dict, strict=False)
+    if result.missing_keys:
+        # Only allow missing keys that are mlp.N aliases of linear1/linear2
+        unexpected_missing = [
+            k for k in result.missing_keys
+            if not ((".mlp.0." in k or ".mlp.3." in k) and "decoder.layers" in k)
+        ]
+        if unexpected_missing:
+            raise RuntimeError(
+                f"[Policy] Unexpected missing keys in state_dict:\n"
+                f"  {unexpected_missing}\n"
+                f"This usually means lerobot_policy_ditflow version mismatch."
+            )
+        print(f"[Policy] Note: {len(result.missing_keys)} aliased mlp keys auto-populated "
+              f"via shared linear1/linear2 parameters (safe).", flush=True)
+    if result.unexpected_keys:
+        print(f"[Policy] Warning: unexpected keys in checkpoint: {result.unexpected_keys}",
+              flush=True)
 
     # Move to device
     print(f"[Policy] Moving to device {device}...", flush=True)
@@ -1727,11 +1760,17 @@ def main():
         print("[Error] Arm not ready. Try power cycling.")
         cleanup_and_exit(1)
 
-    print("\n[Init] Going to start position...")
-    piper.go_to_start()
+    # Go to home position first (safe retracted pose)
+    print("\n[Init] Going to home position first...")
+    piper.go_to_home()
     time.sleep(2.0)
     piper.open_gripper()
     time.sleep(0.5)
+
+    # Then go to start position for first episode
+    print("[Init] Going to start position...")
+    piper.go_to_start()
+    time.sleep(2.0)
 
     # =========================================================================
     # Main interaction loop

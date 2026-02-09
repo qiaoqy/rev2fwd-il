@@ -53,6 +53,64 @@ pip install -e ./lerobot_policy_ditflow
 
 > **Note**: `lerobot_policy_ditflow` uses LeRobot's plugin system — it registers itself automatically via `register_third_party_plugins()`. No manual code modifications are needed. See [Script 7](scripts/scripts_piper_local/README.md#12-script-7-train-dit-flow-policy) for training instructions.
 
+### Pinned Environment (snapshot 2026-02-09)
+
+The `lerobot_policy_ditflow` library does **not** use strict version tags.
+Below are the exact commits and package versions used for the current working
+environment (training run `ditflow_piper_teleop_B_0206`, 200k steps).
+Use these to reproduce an identical setup.
+
+```bash
+# ── Core ──
+conda create -n rev2fwd_il python=3.11.14
+conda activate rev2fwd_il
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# ── LeRobot (PyPI release, NOT the danielsanjosepro fork) ──
+pip install lerobot==0.4.2
+
+# ── DiT Flow Policy plugin (pinned to exact commit) ──
+#   ⚠️  This library has NO version tags — the commit hash is the only
+#       reliable identifier.  Different commits change the model architecture
+#       (e.g., adding nn.Sequential wrapping), which breaks checkpoint loading.
+pip install "lerobot_policy_ditflow @ git+https://github.com/danielsanjosepro/lerobot_policy_ditflow.git@fc8db684e933c883550df406b797499b3819a644"
+
+# ── Other key packages (pinned) ──
+pip install numpy==1.26.0
+pip install scipy==1.15.3
+pip install safetensors==0.7.0
+pip install diffusers==0.35.2
+pip install accelerate==1.12.0
+pip install einops==0.8.2
+pip install draccus==0.10.0
+pip install av==15.1.0
+pip install torchcodec==0.5
+pip install wandb==0.21.4
+pip install opencv-python==4.9.0.80
+pip install pygame==2.6.1
+```
+
+**Quick reference of pinned identifiers:**
+
+| Package | Version / Commit | Notes |
+|---------|-----------------|-------|
+| `lerobot` | `0.4.2` (PyPI) | Standard release, no fork needed |
+| `lerobot_policy_ditflow` | commit [`fc8db68`](https://github.com/danielsanjosepro/lerobot_policy_ditflow/commit/fc8db684e933c883550df406b797499b3819a644) | **No version tags** — must pin by commit |
+| `torch` | `2.7.0+cu128` | CUDA 12.8 |
+| `torchvision` | `0.22.0+cu128` | |
+| `numpy` | `1.26.0` | |
+| `safetensors` | `0.7.0` | Checkpoint I/O |
+| `diffusers` | `0.35.2` | Used by lerobot internals |
+
+> **Why commit pinning matters for `lerobot_policy_ditflow`**: The library's
+> `_DiTDecoder` class changed between commits — newer versions wrap `linear1`/
+> `linear2` inside an `nn.Sequential` called `mlp`, which creates extra
+> state_dict keys (`mlp.0.*`, `mlp.3.*`).  Checkpoints trained with an older
+> commit will fail to load on a newer commit with `strict=True`.  Script 8 now
+> handles this gracefully with `strict=False`, but pinning the commit avoids
+> the mismatch entirely.
+
 ---
 
 ## 2. Workflow
