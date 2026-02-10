@@ -40,8 +40,8 @@ USAGE EXAMPLES
 =============================================================================
 # Basic usage
 python scripts/scripts_piper_local/3_make_forward_data.py \
-    --input data/pick_place_piper \
-    --output data/pick_place_piper_A
+    --input data/pickplace_piper_0210_B \
+    --output data/pickplace_piper_0210_A
 
 # With verbose output
 python scripts/scripts_piper_local/3_make_forward_data.py \

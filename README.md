@@ -46,12 +46,12 @@ To use DiT Flow (Diffusion Transformer + Flow Matching) as an alternative to Dif
 git clone https://github.com/danielsanjosepro/lerobot.git
 pip install -e ./lerobot
 
-# 2. DiT Flow Policy plugin (registers as "ditflow" policy type)
-git clone https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
+# 2. DiT Flow Policy plugin (included as a git submodule, pinned at commit fc8db68)
+git submodule update --init --recursive
 pip install -e ./lerobot_policy_ditflow
 ```
 
-> **Note**: `lerobot_policy_ditflow` uses LeRobot's plugin system — it registers itself automatically via `register_third_party_plugins()`. No manual code modifications are needed. See [Script 7](scripts/scripts_piper_local/README.md#12-script-7-train-dit-flow-policy) for training instructions.
+> **Note**: `lerobot_policy_ditflow` is included as a git submodule (pinned to commit `fc8db68`) with local patches for lerobot API compatibility. It registers itself automatically via LeRobot's `register_third_party_plugins()`. See [Script 7](scripts/scripts_piper_local/README.md#12-script-7-train-dit-flow-policy) for training instructions.
 
 ### Pinned Environment (snapshot 2026-02-09)
 
@@ -74,7 +74,9 @@ pip install lerobot==0.4.2
 #   ⚠️  This library has NO version tags — the commit hash is the only
 #       reliable identifier.  Different commits change the model architecture
 #       (e.g., adding nn.Sequential wrapping), which breaks checkpoint loading.
-pip install "lerobot_policy_ditflow @ git+https://github.com/danielsanjosepro/lerobot_policy_ditflow.git@fc8db684e933c883550df406b797499b3819a644"
+# lerobot_policy_ditflow is included as a git submodule (pinned at fc8db68)
+git submodule update --init --recursive
+pip install -e ./lerobot_policy_ditflow
 
 # ── Other key packages (pinned) ──
 pip install numpy==1.26.0

@@ -9,8 +9,8 @@ Usage:
 
 
     # Upload model (entire experiment folder, ignores lerobot_dataset)
-    python scripts/hf_sync.py upload-model runs/ditflow_piper_teleop_B
-    python scripts/hf_sync.py upload-model runs/ditflow_piper_teleop_B_0206
+    python scripts/hf_sync.py upload-model runs/ditflow_piper_0210_B
+    python scripts/hf_sync.py upload-model runs/ditflow_piper_0210_A
 
     python scripts/hf_sync.py upload-model runs/diffusion_piper_teleop_B_0205
     
