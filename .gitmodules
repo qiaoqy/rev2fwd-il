@@ -1,3 +1,6 @@
 [submodule "piper_sdk"]
 	path = piper_sdk
 	url = git@github.com:agilexrobotics/piper_sdk.git
+[submodule "lerobot_policy_ditflow"]
+	path = lerobot_policy_ditflow
+	url = https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
