@@ -237,9 +237,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--include_gripper",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Include gripper state (1D) in observation.state. "
-             "If enabled, state includes gripper open/close state. Default: False.",
+             "If enabled, state includes gripper open/close state. Default: True. "
+             "Use --no-include_gripper to disable.",
     )
     parser.add_argument(
         "--image_size",
@@ -331,11 +333,13 @@ def _parse_args() -> argparse.Namespace:
         help="Vision backbone architecture. Default: resnet18.",
     )
     parser.add_argument(
-        "--crop_shape",
-        type=int,
+        "--crop_ratio",
+        type=float,
         nargs=2,
-        default=[84, 84],
-        help="Image crop shape (H, W). Default: 84 84.",
+        default=[0.95, 0.95],
+        help="Crop ratio (H_ratio, W_ratio) relative to image_size. "
+             "Actual crop shape = (int(H * H_ratio), int(W * W_ratio)). "
+             "Default: 0.95 0.95.",
     )
     parser.add_argument(
         "--num_inference_steps",
@@ -1214,6 +1218,14 @@ def train_with_lerobot_api(
         ),
     }
     
+    # Compute crop_shape from crop_ratio and image dimensions
+    crop_shape = (
+        int(image_height * args.crop_ratio[0]),
+        int(image_width * args.crop_ratio[1]),
+    )
+    print(f"  Crop ratio: {tuple(args.crop_ratio)} -> crop shape: {crop_shape} "
+          f"(image: {image_height}x{image_width})")
+    
     # Dynamically calculate drop_n_last_frames based on user's parameters
     # Formula: horizon - n_action_steps - n_obs_steps + 1
     drop_n_last_frames = args.horizon - args.n_action_steps - args.n_obs_steps + 1
@@ -1231,7 +1243,7 @@ def train_with_lerobot_api(
         input_features=input_features,
         output_features=output_features,
         vision_backbone=args.vision_backbone,
-        crop_shape=tuple(args.crop_shape),
+        crop_shape=crop_shape,
         pretrained_backbone_weights=args.pretrained_backbone_weights,
         device=device,
         push_to_hub=False,
@@ -1364,7 +1376,7 @@ def train_with_lerobot_api(
     print(f"  Include gripper: {include_gripper}")
     print(f"  State dim: {state_dim}")
     print(f"  Action dim: 8 (relative delta)")
-    print(f"  Crop shape: {tuple(args.crop_shape)}")
+    print(f"  Crop ratio: {tuple(args.crop_ratio)} -> crop shape: {crop_shape}")
     print(f"  Horizon: {args.horizon}")
     print(f"  N obs steps: {args.n_obs_steps}")
     print(f"  N action steps: {args.n_action_steps}")
