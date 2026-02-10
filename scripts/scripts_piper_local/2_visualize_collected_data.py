@@ -31,7 +31,7 @@ python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode data/teleop_data/episode_0000.tar.gz --no_xyz_curves
 
 python scripts/scripts_piper_local/2_visualize_collected_data.py \
-    --episode /media/qiyuan/SSDQQY/rev2fwd_data/pickplace_piper_0210/episode_20260210_031459_772565.tar.gz
+    --episode /media/qiyuan/SSDQQY/rev2fwd_data/pickplace_piper_0210_B/episode_20260210_034533_933248.tar.gz
 =============================================================================
 """
 
@@ -420,6 +420,7 @@ def create_xyz_curve_frame(
     joint_torques: np.ndarray = None,
     ee_force: np.ndarray = None,
     has_force_data: bool = False,
+    gripper_state: np.ndarray = None,
     figsize: Tuple[int, int] = (10, 6),
     dpi: int = 100,
 ) -> np.ndarray:
@@ -537,15 +538,22 @@ def create_xyz_curve_frame(
         ax.set_xlim(0, total_t)
         ax.grid(True, alpha=0.3)
     
-    # Subplot 4: Gripper state
+    # Subplot 4: Gripper state (observed + action)
     ax = axes[1, 1]
-    ax.set_title("Gripper Action", fontsize=10)
-    ax.plot(timesteps, gripper, color='purple', label='Gripper', linewidth=2)
+    ax.set_title("Gripper", fontsize=10)
+    if gripper_state is not None:
+        obs_grip = gripper_state[:current_t + 1]
+        ax.plot(timesteps, obs_grip, color='#1f77b4', label='Observed', linewidth=2)
+    ax.plot(timesteps, gripper, color='#ff7f0e', label='Action', linewidth=2, linestyle='--')
+    ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.4, label='Threshold')
     ax.axvline(x=current_t, color='black', linestyle='--', alpha=0.5)
+    # Shade close region
+    ax.axhspan(-0.1, 0.5, alpha=0.05, color='red')
     ax.set_xlabel("Timestep")
     ax.set_ylabel("Gripper (0=close, 1=open)")
     ax.set_ylim(-0.1, 1.1)
     ax.set_xlim(0, total_t)
+    ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
     
     # Force visualization (for both scripted and teleop data with force data)
@@ -870,6 +878,7 @@ def create_visualization_video(
                 joint_torques=episode_data.get('joint_torques'),
                 ee_force=episode_data.get('ee_force'),
                 has_force_data=episode_data.get('has_force_data', False),
+                gripper_state=episode_data.get('gripper_state'),
             )
             
             # Compose final frame

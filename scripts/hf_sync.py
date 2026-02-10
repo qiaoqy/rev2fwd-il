@@ -20,8 +20,8 @@ Usage:
     python scripts/hf_sync.py download-model diffusion_piper_teleop_A --local_dir /media/qiyuan/SSDQQY/runs       # -> runs/diffusion_piper_teleop_A
     python scripts/hf_sync.py download-model diffusion_piper_teleop_B_0205 --local_dir /media/qiyuan/SSDQQY/runs       # -> /media/qiyuan/SSDQQY/diffusion_piper_teleop_A
     python scripts/hf_sync.py download-model ditflow_piper_teleop_B_0206 --local_dir /media/qiyuan/SSDQQY/runs
-    python scripts/hf_sync.py download-model ditflow_pickplace_piper_0210_A --local_dir /media/qiyuan/SSDQQY/runs # pick& place with new camera setup
-
+    python scripts/hf_sync.py download-model ditflow_piper_0210_A --local_dir /media/qiyuan/SSDQQY/runs # pick& place with new camera setup
+    python scripts/hf_sync.py download-model dp_pickplace_piper_0210_A --local_dir /media/qiyuan/SSDQQY/runs
 
     # Upload dataset
     python scripts/hf_sync.py upload-dataset data/pick_place_piper_A

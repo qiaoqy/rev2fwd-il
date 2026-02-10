@@ -63,9 +63,9 @@ python 5_eval_diffusion_piper.py \
     --num_inference_steps 10
 
 python scripts/scripts_piper_local/5_eval_diffusion_piper.py     \
-    --checkpoint /media/qiyuan/SSDQQY/runs/diffusion_piper_teleop_A/checkpoints/checkpoints/020000/pretrained_model     \
+    --checkpoint /media/qiyuan/SSDQQY/runs/dp_pickplace_piper_0210_B/checkpoints/checkpoints/020000/pretrained_model     \
     --max_steps 1000 \
-    --device cuda:0
+    --n_action_steps 16
 """
 
 from __future__ import annotations
@@ -1485,9 +1485,23 @@ def run_episode(
         if action.ndim == 2:
             action = action[0]
         
+        gripper_val = float(action[7]) if len(action) > 7 else 1.0
+        
+        # Every-frame gripper close detection: force to 0.1 to ensure tight closure
+        if gripper_val < 0.9:
+            action[7] = 0.3
+            # gripper_val = 0.1
+            print(f"\033[1;31m  ✊ Step {step}: GRIPPER CLOSE  gripper={gripper_val:.3f} (forced to 0.1)\033[0m", flush=True)
+        
         if step % log_freq == 0:
+            gripper_str = f"gripper={gripper_val:.3f}"
+            if gripper_val < 0.9:
+                gripper_str = f"\033[1;31m{gripper_str} CLOSE\033[0m"
+            else:
+                gripper_str = f"{gripper_str} open"
             print(f"  Step {step}: action={action[:3].round(4)}, "
-                  f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
+                  f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f}), "
+                  f"{gripper_str}", flush=True)
         
         # =================================================================
         # Track trajectory for comparison plot
