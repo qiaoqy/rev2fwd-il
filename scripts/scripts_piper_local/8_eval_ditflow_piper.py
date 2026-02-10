@@ -83,7 +83,7 @@ python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
     --n_action_steps 4 --num_inference_steps 100
 
 python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
-    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_pickplace_piper_0210_A/checkpoints/checkpoints/010000/pretrained_model \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_pickplace_piper_0210_A/checkpoints/checkpoints/050000/pretrained_model \
     --n_action_steps 16 --num_inference_steps 100
 =============================================================================
 """
@@ -94,8 +94,12 @@ import argparse
 import concurrent.futures
 import json
 import os
+import queue
 import random
+import shutil
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import warnings
@@ -777,6 +781,169 @@ class VideoRecorder:
 
 
 # =============================================================================
+# Episode Data Recording (same format as script 1)
+# =============================================================================
+
+@dataclass
+class EpisodeData:
+    """Container for episode data (matching script 1 format)."""
+    episode_id: str  # Timestamp-based ID (YYYYMMDD_HHMMSS_ffffff)
+    fixed_images: list  # List of (H, W, 3) uint8 arrays
+    wrist_images: list  # List of (H, W, 3) uint8 arrays
+    ee_pose: list       # List of (7,) arrays [x, y, z, qw, qx, qy, qz]
+    gripper_state: list # List of floats (0=closed, 1=open, normalized)
+    action: list        # List of (8,) arrays [delta_x, ..., delta_qz, gripper_target]
+    timestamp: list     # List of Unix timestamps
+    # Force/torque data (empty for eval, kept for format compatibility)
+    joint_angles: list = field(default_factory=list)
+    joint_torques: list = field(default_factory=list)
+    ee_force: list = field(default_factory=list)
+    success: bool = True
+
+
+def _save_episode_sync(episode: EpisodeData, out_dir: Path):
+    """Save episode data as a compressed tar.gz archive (same as script 1)."""
+    episode_name = f"episode_{episode.episode_id}"
+    archive_path = out_dir / f"{episode_name}.tar.gz"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        episode_dir = temp_path / episode_name
+        fixed_dir = episode_dir / "fixed_cam"
+        wrist_dir = episode_dir / "wrist_cam"
+
+        fixed_dir.mkdir(parents=True, exist_ok=True)
+        wrist_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, (fixed_img, wrist_img) in enumerate(
+            zip(episode.fixed_images, episode.wrist_images)
+        ):
+            if fixed_img is not None:
+                cv2.imwrite(
+                    str(fixed_dir / f"{i:06d}.png"),
+                    cv2.cvtColor(fixed_img, cv2.COLOR_RGB2BGR),
+                )
+            if wrist_img is not None:
+                cv2.imwrite(
+                    str(wrist_dir / f"{i:06d}.png"),
+                    cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR),
+                )
+
+        T = len(episode.ee_pose)
+        ee_pose_arr = np.array(episode.ee_pose, dtype=np.float32)
+        gripper_arr = np.array(episode.gripper_state, dtype=np.float32)
+        action_arr = np.array(episode.action, dtype=np.float32)
+        timestamp_arr = np.array(episode.timestamp, dtype=np.float64)
+        joint_angles_arr = (
+            np.array(episode.joint_angles, dtype=np.float32)
+            if episode.joint_angles
+            else np.zeros((T, 6), dtype=np.float32)
+        )
+        joint_torques_arr = (
+            np.array(episode.joint_torques, dtype=np.float32)
+            if episode.joint_torques
+            else np.zeros((T, 6), dtype=np.float32)
+        )
+        ee_force_arr = (
+            np.array(episode.ee_force, dtype=np.float32)
+            if episode.ee_force
+            else np.zeros((T, 6), dtype=np.float32)
+        )
+
+        np.savez(
+            episode_dir / "episode_data.npz",
+            ee_pose=ee_pose_arr,
+            gripper_state=gripper_arr,
+            action=action_arr,
+            timestamp=timestamp_arr,
+            joint_angles=joint_angles_arr,
+            joint_torques=joint_torques_arr,
+            ee_force=ee_force_arr,
+            success=episode.success,
+            episode_id=episode.episode_id,
+            num_timesteps=T,
+        )
+
+        with tarfile.open(archive_path, "w:gz", compresslevel=6) as tar:
+            tar.add(episode_dir, arcname=episode_name)
+
+    archive_size_mb = archive_path.stat().st_size / (1024 * 1024)
+    print(f"[Save] Saved {T} frames ({archive_size_mb:.2f} MB) -> {archive_path.name}")
+
+
+class BackgroundSaver:
+    """Background thread for saving episode data and videos without blocking.
+
+    Accepts two kinds of tasks:
+      - ("data", episode, out_dir)  -> calls _save_episode_sync
+      - ("video", video_recorder)   -> calls video_recorder.save()
+    """
+
+    def __init__(self):
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._data_saved_count = 0
+        self._video_saved_count = 0
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._save_loop, daemon=True)
+        self._thread.start()
+
+    def _save_loop(self):
+        while self._running or not self._queue.empty():
+            try:
+                task = self._queue.get(timeout=1.0)
+                try:
+                    task_type = task[0]
+                    if task_type == "data":
+                        _, episode, out_dir = task
+                        _save_episode_sync(episode, out_dir)
+                        self._data_saved_count += 1
+                    elif task_type == "video":
+                        _, video_recorder = task
+                        video_recorder.save()
+                        self._video_saved_count += 1
+                    else:
+                        print(f"[BackgroundSaver] Unknown task type: {task_type}")
+                except Exception as e:
+                    print(f"[BackgroundSaver] Error processing task: {e}")
+                finally:
+                    self._queue.task_done()
+            except queue.Empty:
+                continue
+
+    def save_episode(self, episode: EpisodeData, out_dir: Path):
+        """Queue episode data for background saving."""
+        self._queue.put(("data", episode, out_dir))
+
+    def save_video(self, video_recorder: VideoRecorder):
+        """Queue video for background saving."""
+        self._queue.put(("video", video_recorder))
+
+    def stop(self, wait: bool = True, timeout: float = 120.0):
+        self._running = False
+        if wait and self._thread is not None:
+            self._thread.join(timeout=timeout)
+        pending = self._queue.qsize()
+        if pending > 0:
+            print(f"[BackgroundSaver] Warning: {pending} tasks still in queue")
+
+    def get_saved_count(self) -> int:
+        return self._data_saved_count + self._video_saved_count
+
+    def get_data_saved_count(self) -> int:
+        return self._data_saved_count
+
+    def get_video_saved_count(self) -> int:
+        return self._video_saved_count
+
+    def get_pending_count(self) -> int:
+        return self._queue.qsize()
+
+
+# =============================================================================
 # Trajectory Comparison Plot
 # =============================================================================
 
@@ -1192,6 +1359,8 @@ def run_episode(
     ps5: Optional["PS5Controller"] = None,
     stdin_ctrl: Optional["StdinController"] = None,
     show_camera: bool = False,
+    data_dir: Optional[Path] = None,
+    bg_saver: Optional[BackgroundSaver] = None,
 ) -> EpisodeResult:
     """Run a single evaluation episode.
 
@@ -1221,6 +1390,20 @@ def run_episode(
     actual_positions = []
     integrated_positions = []
     integrated_xyz = None
+
+    # Data recording
+    episode_data = None
+    if data_dir is not None:
+        ep_id_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        episode_data = EpisodeData(
+            episode_id=ep_id_str,
+            fixed_images=[],
+            wrist_images=[],
+            ee_pose=[],
+            gripper_state=[],
+            action=[],
+            timestamp=[],
+        )
 
     log_freq = max(1, control_freq)
 
@@ -1342,6 +1525,23 @@ def run_episode(
             video_recorder.add_combined_frame(fixed_img, wrist_img)
 
         # =================================================================
+        # Record observation data
+        # =================================================================
+        if episode_data is not None:
+            current_quat = euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg'])
+            episode_data.ee_pose.append(
+                np.array([pose['x'], pose['y'], pose['z'],
+                          current_quat[0], current_quat[1], current_quat[2], current_quat[3]],
+                         dtype=np.float32)
+            )
+            episode_data.gripper_state.append(float(gripper_angle) / GRIPPER_OPEN_ANGLE)
+            episode_data.fixed_images.append(fixed_img.copy())
+            episode_data.wrist_images.append(
+                wrist_img.copy() if wrist_img is not None else np.zeros_like(fixed_img)
+            )
+            episode_data.timestamp.append(time.time())
+
+        # =================================================================
         # Run policy inference
         # =================================================================
         obs = build_observation(
@@ -1365,6 +1565,23 @@ def run_episode(
 
         if action.ndim == 2:
             action = action[0]
+
+        gripper_val = float(action[7]) if len(action) > 7 else 1.0
+
+        # Force gripper OPEN for the last 50 steps before max_steps
+        remaining_steps = max_steps - step
+        if remaining_steps <= 50:
+            action[7] = 1.0
+            if remaining_steps == 50:
+                print(f"\033[1;33m  🖐 Step {step}: FORCE GRIPPER OPEN for last 50 steps (remaining={remaining_steps})\033[0m", flush=True)
+        # Every-frame gripper close detection: force to 0.3 to ensure tight closure
+        elif gripper_val < 0.9:
+            action[7] = 0.3
+            print(f"\033[1;31m  ✊ Step {step}: GRIPPER CLOSE  gripper={gripper_val:.3f} (forced to 0.3)\033[0m", flush=True)
+
+        # Record action into episode data (after gripper forcing)
+        if episode_data is not None:
+            episode_data.action.append(action.copy())
 
         if step % log_freq == 0:
             print(f"  Step {step}: action={action[:3].round(4)}, "
@@ -1484,6 +1701,16 @@ def run_episode(
         except Exception as e:
             print(f"[Episode {episode_id}] Warning: Failed to generate trajectory plot: {e}")
 
+    # =================================================================
+    # Save episode data
+    # =================================================================
+    if episode_data is not None and data_dir is not None and len(episode_data.ee_pose) > 0:
+        print(f"[Episode {episode_id}] Saving {len(episode_data.ee_pose)} frames to {data_dir}...")
+        if bg_saver is not None:
+            bg_saver.save_episode(episode_data, data_dir)
+        else:
+            _save_episode_sync(episode_data, data_dir)
+
     return EpisodeResult(
         episode_id=episode_id,
         steps=step,
@@ -1561,6 +1788,8 @@ PS5 Controller:
                         help="Output directory (default: auto-generated under checkpoint run dir with date)")
     parser.add_argument("--no_record_video", action="store_true",
                         help="Disable video recording (video is recorded by default)")
+    parser.add_argument("--no_record_data", action="store_true",
+                        help="Disable episode data recording (data is recorded by default)")
 
     # Device
     parser.add_argument("--device", type=str, default="cuda",
@@ -1584,6 +1813,7 @@ def main():
     args = parse_args()
 
     args.record_video = not args.no_record_video
+    args.record_data = not args.no_record_data
 
     # Auto-derive output directory from checkpoint path if not specified
     if args.out_dir is None:
@@ -1609,6 +1839,13 @@ def main():
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create data directory for recording observations & actions
+    data_dir = None
+    if args.record_data:
+        # Place data/ under the run directory (parent of eval output)
+        data_dir = out_dir.parent / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
     print("\n" + "=" * 60)
     print("Piper DiT Flow Policy Evaluation")
     print("=" * 60)
@@ -1619,6 +1856,9 @@ def main():
     print(f"  Device:        {args.device}")
     print(f"  Output dir:    {out_dir}")
     print(f"  Record video:  {args.record_video}")
+    print(f"  Record data:   {args.record_data}")
+    if data_dir:
+        print(f"  Data dir:      {data_dir}")
     print("=" * 60)
 
     # =========================================================================
@@ -1821,6 +2061,19 @@ def main():
     print(f"  Show camera: {args.show_camera}")
     print("=" * 60 + "\n")
 
+    # Initialize background saver for episode data and video
+    bg_saver = None
+    if args.record_data or args.record_video:
+        bg_saver = BackgroundSaver()
+        bg_saver.start()
+        saving_targets = []
+        if args.record_data and data_dir is not None:
+            saving_targets.append(f"data -> {data_dir}")
+        if args.record_video:
+            saving_targets.append(f"video -> {out_dir}")
+        print(f"[Init] Background saver started ({', '.join(saving_targets)})")
+
+
     results = EvaluationResults()
     episode_id = 0
     in_episode = False
@@ -1926,12 +2179,17 @@ def main():
                         ps5=ps5,
                         stdin_ctrl=stdin_ctrl,
                         show_camera=args.show_camera,
+                        data_dir=data_dir,
+                        bg_saver=bg_saver,
                     )
 
                     in_episode = False
 
                     if video_recorder is not None:
-                        video_recorder.save()
+                        if bg_saver is not None:
+                            bg_saver.save_video(video_recorder)
+                        else:
+                            video_recorder.save()
 
                     results.episodes.append(result)
                     episode_id += 1
@@ -2029,6 +2287,16 @@ def main():
             except Exception:
                 pass
 
+        # Wait for background saver to finish
+        if bg_saver is not None:
+            pending = bg_saver.get_pending_count()
+            if pending > 0:
+                print(f"[Main] Waiting for {pending} tasks to finish saving...")
+            bg_saver.stop(wait=True, timeout=120.0)
+            print(f"[Main] Background saver finished. "
+                  f"Data: {bg_saver.get_data_saved_count()} episodes, "
+                  f"Video: {bg_saver.get_video_saved_count()} videos.")
+
         if results.num_episodes > 0:
             try:
                 results.save(str(out_dir / "eval_results.json"))
@@ -2042,6 +2310,8 @@ def main():
         print(f"  Total episodes: {results.num_episodes}")
         print(f"  Avg steps:      {results.avg_steps:.0f}")
         print(f"  Avg duration:   {results.avg_duration:.1f}s")
+        if data_dir is not None:
+            print(f"  Data saved to:  {data_dir}")
         print("=" * 60)
         print("\n[Main] Done!")
 
