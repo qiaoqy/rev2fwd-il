@@ -81,6 +81,10 @@ python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
 python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
     --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_teleop_B_0206/checkpoints/checkpoints/200000/pretrained_model \
     --n_action_steps 4 --num_inference_steps 100
+
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_0210_A/checkpoints/checkpoints/050000/pretrained_model \
+    --n_action_steps 16 --num_inference_steps 100
 =============================================================================
 """
 
@@ -1529,8 +1533,8 @@ PS5 Controller:
                         help="CAN interface name (default: can0)")
     parser.add_argument("--num_episodes", type=int, default=10,
                         help="Number of evaluation episodes (default: 10)")
-    parser.add_argument("--max_steps", type=int, default=500,
-                        help="Maximum steps per episode (default: 500)")
+    parser.add_argument("--max_steps", type=int, default=1000,
+                        help="Maximum steps per episode (default: 1000)")
     parser.add_argument("--n_action_steps", type=int, default=None,
                         help="Action steps per inference (None=use model config)")
     parser.add_argument("--num_inference_steps", type=int, default=None,
