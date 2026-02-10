@@ -76,11 +76,14 @@ python 1_teleop_ps5_controller.py --show_camera
 python 1_teleop_ps5_controller.py --record --out_dir data/teleop_data
 
 python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
-    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/pickplace_piper_0210
+    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/pickplace_piper_0210_B
 
 
 python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
-    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/pullout_piper_0210
+    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/pullout_piper_0210_B
+
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/unstack_piper_0211_B
 
 
 """
