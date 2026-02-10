@@ -136,12 +136,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --batch_size 64 --steps 50000 --wandb
 
 # Multi-GPU training
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 \
     scripts/scripts_piper_local/7_train_ditflow.py \
-    --dataset data/pick_place_piper_A \
-    --out runs/ditflow_piper_teleop \
-    --batch_size 32 --steps 100000 --wandb
+    --dataset data/pickplace_piper_0210_B \
+    --out runs/ditflow_pickplace_piper_0210_B  \
+    --batch_size 128 --steps 50000 --wandb
 
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29501\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0210_A \
+    --out runs/ditflow_pickplace_piper_0210_A  \
+    --batch_size 128 --steps 50000 --wandb
+    
 # Data conversion only (for debugging)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
@@ -159,6 +165,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
     --out runs/ditflow_piper_teleop \
     --resume --steps 200000
+
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0210_A \
+    --out runs/ditflow_pickplace_piper_0210_A  \
+    --batch_size 128 --steps 50000 --wandb
 =============================================================================
 """
 

@@ -92,10 +92,15 @@ CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
     --out runs/diffusion_piper_teleop \
     --batch_size 32 --steps 20000 --include_gripper --wandb
 
-python scripts/scripts_piper_local/4_train_diffusion.py \
-    --dataset data/pick_place_piper_A \
-    --out runs/diffusion_piper_teleop_A_0205 \
-    --batch_size 32 --steps 200000 --include_gripper --wandb
+CUDA_VISIBLE_DEVICES=4 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pickplace_piper_0210_B \
+    --out runs/dp_pickplace_piper_0210_B \
+    --batch_size 32 --steps 020000 --include_gripper --wandb
+
+CUDA_VISIBLE_DEVICES=5 python scripts/scripts_piper_local/4_train_diffusion.py \
+    --dataset data/pickplace_piper_0210_A \
+    --out runs/dp_pickplace_piper_0210_A \
+    --batch_size 32 --steps 020000 --include_gripper --wandb
 =============================================================================
 """
 
@@ -268,11 +273,12 @@ def _parse_args() -> argparse.Namespace:
         help="Vision backbone architecture. Default: resnet18.",
     )
     parser.add_argument(
-        "--crop_shape",
-        type=int,
+        "--crop_ratio",
+        type=float,
         nargs=2,
-        default=[128, 128],
-        help="Image crop shape (H, W). Default: 128 128.",
+        default=[0.95, 0.95],
+        help="Crop ratio (H_ratio, W_ratio) relative to image size. "
+             "crop_shape = (int(H * H_ratio), int(W * W_ratio)). Default: 0.95 0.95.",
     )
     parser.add_argument(
         "--num_train_timesteps",
@@ -1080,6 +1086,13 @@ def train_with_lerobot_api(
         ),
     }
     
+    # Compute crop_shape from crop_ratio and image size
+    crop_shape = (
+        int(image_height * args.crop_ratio[0]),
+        int(image_width * args.crop_ratio[1]),
+    )
+    print(f"  Crop ratio: {args.crop_ratio} -> crop_shape: {crop_shape}")
+
     # Create Diffusion Policy configuration
     policy_cfg = DiffusionConfig(
         n_obs_steps=args.n_obs_steps,
@@ -1088,7 +1101,7 @@ def train_with_lerobot_api(
         input_features=input_features,
         output_features=output_features,
         vision_backbone=args.vision_backbone,
-        crop_shape=tuple(args.crop_shape),
+        crop_shape=crop_shape,
         num_train_timesteps=args.num_train_timesteps,
         pretrained_backbone_weights=args.pretrained_backbone_weights,
         device=device,
@@ -1209,7 +1222,7 @@ def train_with_lerobot_api(
     print(f"  Include gripper: {include_gripper}")
     print(f"  State dim: {state_dim}")
     print(f"  Action dim: 8 (relative delta)")
-    print(f"  Crop shape: {tuple(args.crop_shape)}")
+    print(f"  Crop ratio: {args.crop_ratio} -> crop_shape: {crop_shape}")
     print(f"  Horizon: {args.horizon}")
     print(f"  N obs steps: {args.n_obs_steps}")
     print(f"  N action steps: {args.n_action_steps}")
