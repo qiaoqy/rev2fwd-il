@@ -83,7 +83,7 @@ python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
     --n_action_steps 4 --num_inference_steps 100
 
 python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
-    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_piper_0210_A/checkpoints/checkpoints/050000/pretrained_model \
+    --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_pickplace_piper_0210_A/checkpoints/checkpoints/010000/pretrained_model \
     --n_action_steps 16 --num_inference_steps 100
 =============================================================================
 """
