@@ -41,7 +41,7 @@ USAGE EXAMPLES
 # Basic usage
 python scripts/scripts_piper_local/3_make_forward_data.py \
     --input data/pickplace_piper_0210_B \
-    --output data/pickplace_piper_0210_A
+    --output data/pickplace_piper_0210_A_01gripper_action
 
 # With verbose output
 python scripts/scripts_piper_local/3_make_forward_data.py \
@@ -334,6 +334,11 @@ def reverse_episode(episode: dict, verbose: bool = False) -> dict:
     ee_pose_rev = ee_pose_orig[::-1].copy()  # (T, 7)
     gripper_state_rev = gripper_state_orig[::-1].copy()  # (T,)
     
+    # Reverse the original action's gripper targets (user commands: 0 or 1)
+    # IMPORTANT: Do NOT use gripper_state (measured position) because it can be
+    # e.g. 0.6 when gripping an object even though the command was 0 (close).
+    gripper_targets_rev = action_orig[::-1, 7].copy()  # (T,)
+    
     # Compute new relative actions from reversed ee_pose
     # action_rev[t] should transform ee_pose_rev[t] to ee_pose_rev[t+1]
     action_rev = np.zeros((T, 8), dtype=np.float32)
@@ -347,17 +352,14 @@ def reverse_episode(episode: dict, verbose: bool = False) -> dict:
         quat_curr = ee_pose_rev[t + 1, 3:7]
         delta_quat = compute_delta_quat(quat_prev, quat_curr)
         
-        # Gripper target: use the gripper state at t+1 (where we're going)
-        gripper_target = gripper_state_rev[t + 1]
-        
         action_rev[t, :3] = delta_xyz
         action_rev[t, 3:7] = delta_quat
-        action_rev[t, 7] = gripper_target
+        action_rev[t, 7] = gripper_targets_rev[t]
     
     # Last action: no movement (or could repeat second-to-last)
     action_rev[T - 1, :3] = 0.0
     action_rev[T - 1, 3:7] = [1.0, 0.0, 0.0, 0.0]  # Identity quaternion
-    action_rev[T - 1, 7] = gripper_state_rev[T - 1]
+    action_rev[T - 1, 7] = gripper_targets_rev[T - 1]
     
     # Create relative timestamps (reset to start from 0)
     dt = np.mean(np.diff(timestamp_orig)) if T > 1 else 0.05

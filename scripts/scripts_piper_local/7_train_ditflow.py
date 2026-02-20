@@ -171,6 +171,20 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --out runs/ditflow_pickplace_piper_0210_A  \
     --batch_size 128 --steps 50000 --wandb
 =============================================================================
+
+
+=============================================================================
+TMUX BACKGROUND EXECUTION (Recommended for long training)
+=============================================================================
+# Create a new tmux session and run training in background
+tmux new -s ditflow_pickplace_piper_0210_A
+tmux new -s ditflow_pickplace_piper_0210_B
+# Common tmux commands:
+#   tmux ls                  # List all sessions
+#   tmux a -t train          # Attach to session named "train"
+#   tmux kill-session -t train  # Kill session named "train"
+#   Ctrl+b d                 # Detach from current session (inside tmux)
+#   Ctrl+b [                 # Enter scroll mode (q to exit)
 """
 
 from __future__ import annotations
