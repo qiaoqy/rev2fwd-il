@@ -40,7 +40,7 @@ python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B/episode_20260221_191034_776572.tar.gz
 
 python scripts/scripts_piper_local/2_visualize_collected_data.py \
-    --episode /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B/episode_20260221_201733_831094.tar.gz
+    --episode /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B/episode_20260221_211946_247343.tar.gz
 =============================================================================
 """
 

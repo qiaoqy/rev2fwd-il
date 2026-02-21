@@ -87,7 +87,12 @@ python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
 
 python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
     --record \
-    --out_dir /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B \
+    --out_dir /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0221_B \
+    --show_camera
+
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record \
+    --out_dir /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pullout_piper_0221_B \
     --show_camera
 
 """

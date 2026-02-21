@@ -30,6 +30,8 @@ Usage:
 
     # Upload dataset
     python scripts/hf_sync.py upload-dataset data/pick_place_piper_A
+
+    python scripts/hf_sync.py upload-dataset /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0221_B
     
     # Download dataset (auto-appends dataset name as subdirectory)
     python scripts/hf_sync.py download-dataset pick_place_piper_A --local_dir /media/qiyuan/SSDQQY/           # -> /media/qiyuan/SSDQQY/pick_place_piper_A
