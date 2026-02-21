@@ -14,11 +14,11 @@ Configuration calibrated from 0_system_test.py:
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
-# Basic usage with default cameras (Orbbec_Gemini_335L + Dabai_DC1)
+# Basic usage with default cameras (Orbbec_Gemini_335L + Orbbec_Gemini_336)
 python 1_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
 
 # Specify cameras by device name
-python 1_collect_data_piper.py -f Orbbec_Gemini_335L -w Dabai_DC1
+python 1_collect_data_piper.py -f Orbbec_Gemini_335L -w Orbbec_Gemini_336
 
 # Disable wrist camera
 python 1_collect_data_piper.py --wrist_cam -1
@@ -137,7 +137,7 @@ WORKSPACE_LIMITS = {
 
 # === Camera Settings (from script 0) ===
 DEFAULT_FRONT_CAMERA = "Orbbec_Gemini_335L"  # Front camera name/ID
-DEFAULT_WRIST_CAMERA = "Dabai_DC1"           # Wrist camera name/ID (-1 to disable)
+DEFAULT_WRIST_CAMERA = "Orbbec_Gemini_336"           # Wrist camera name/ID (-1 to disable)
 
 
 # =============================================================================
@@ -222,7 +222,7 @@ class CameraCapture:
         Supports:
         - Integer index (e.g., 8)
         - /dev/videoX path
-        - Device name substring from /dev/v4l/by-id/ (e.g., Orbbec_Gemini_335L, Dabai_DC1)
+        - Device name substring from /dev/v4l/by-id/ (e.g., Orbbec_Gemini_335L, Orbbec_Gemini_336)
         
         For cameras with multiple video nodes (e.g., Orbbec depth cameras), 
         prioritizes video-index0 which is typically the RGB stream.
@@ -252,7 +252,7 @@ class CameraCapture:
                             matches.append(p)
                     
                     # Prioritize video-index0 (RGB stream), then video-index1, then others
-                    # This is critical for Orbbec/Dabai cameras with multiple video nodes
+                    # This is critical for Orbbec cameras with multiple video nodes
                     matches.sort(key=lambda p: (
                         0 if "video-index0" in p.name else 1,
                         0 if "video-index1" in p.name else 1,
@@ -1186,7 +1186,7 @@ Examples:
   python 1_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
   
   # Specify camera by name (recommended)
-  python 1_collect_data_piper.py --front_cam Orbbec_Gemini_335L --wrist_cam Dabai_DC1
+  python 1_collect_data_piper.py --front_cam Orbbec_Gemini_335L --wrist_cam Orbbec_Gemini_336
   
   # Disable wrist camera
   python 1_collect_data_piper.py --wrist_cam -1

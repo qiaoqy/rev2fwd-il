@@ -18,7 +18,7 @@ KEY DESIGN PRINCIPLES
 
 2. Observation format matches training (script 4):
    - observation.image: (3, H, W) from front camera (Orbbec_Gemini_335L)
-   - observation.wrist_image: (3, H, W) from wrist camera (Dabai_DC1)
+   - observation.wrist_image: (3, H, W) from wrist camera (Orbbec_Gemini_336)
    - observation.state: [x, y, z, qw, qx, qy, qz, gripper] (8D with gripper)
    - Image size read from model config, NOT hardcoded
 
@@ -125,7 +125,7 @@ from piper_sdk import C_PiperInterface_V2
 
 # === Camera Settings ===
 DEFAULT_FRONT_CAMERA = "Orbbec_Gemini_335L"
-DEFAULT_WRIST_CAMERA = "Dabai_DC1"
+DEFAULT_WRIST_CAMERA = "Orbbec_Gemini_336"
 
 # === Home Position (calibrated from script 0) ===
 HOME_POSITION = (0.054, 0.0, 0.175)     # X, Y, Z in meters
@@ -1660,7 +1660,7 @@ Examples:
   # With specific cameras and GPU
   python 5_eval_diffusion_piper.py \\
       --checkpoint runs/diffusion_piper_teleop_B_0205/checkpoints/checkpoints/100000/pretrained_model \\
-      --front_cam Orbbec_Gemini_335L --wrist_cam Dabai_DC1 \\
+      --front_cam Orbbec_Gemini_335L --wrist_cam Orbbec_Gemini_336 \\
       --device cuda:0
 
 PS5 Controller:

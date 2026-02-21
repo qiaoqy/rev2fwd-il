@@ -85,6 +85,10 @@ python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
 python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
     --record --out_dir /media/qiyuan/SSDQQY/rev2fwd_data/unstack_piper_0211_B
 
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record \
+    --out_dir /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B \
+    --show_camera
 
 """
 
@@ -269,7 +273,7 @@ GRIPPER_MASS = 0.0  # kg - increased from 0.2 to better match actual gripper
 
 # === Camera Settings ===
 DEFAULT_FRONT_CAMERA = "Orbbec_Gemini_335L"  # Front camera name/ID
-DEFAULT_WRIST_CAMERA = "Dabai_DC1"           # Wrist camera name/ID (-1 to disable)
+DEFAULT_WRIST_CAMERA = "Orbbec_Gemini_336"           # Wrist camera name/ID (-1 to disable)
 
 # === Home/Start Position (calibrated from script 0 / script 8) ===
 HOME_POSITION = (0.054, 0.0, 0.175)     # X, Y, Z in meters
@@ -1181,8 +1185,9 @@ class CameraCapture:
             print(f"[Error] Camera {self.name} failed to open: {source}")
             return False
         
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        # Request standard 640x480 resolution from hardware to avoid bandwidth/driver issues
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
@@ -1224,7 +1229,11 @@ class CameraCapture:
         """Get latest frame (RGB format for saving)."""
         frame = self.get_frame()
         if frame is not None:
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Resize to target dimensions if needed
+            if rgb_frame.shape[1] != self.width or rgb_frame.shape[0] != self.height:
+                rgb_frame = cv2.resize(rgb_frame, (self.width, self.height))
+            return rgb_frame
         return None
     
     def get_frame_age(self) -> float:
@@ -1325,6 +1334,9 @@ class TeleoperationController:
         self._square_press_start_time: Optional[float] = None
         self._square_long_press_triggered = False
         self._square_rumble_interval = 0.15  # seconds between rumble pulses during hold
+        
+        # Camera error state
+        self._camera_error_state = False
         
     def start_recording(self, episode_id: str = None):
         """Start recording a new episode."""
@@ -1429,78 +1441,50 @@ class TeleoperationController:
         fixed_img = self._fixed_cam.get_frame_rgb() if self._fixed_cam else None
         wrist_img = self._wrist_cam.get_frame_rgb() if self._wrist_cam else None
         
-        # === Camera validation - FAIL FAST if camera data is missing/stale/black ===
-        def is_black_image(img: np.ndarray, threshold: float = 5.0) -> bool:
-            """Check if image is essentially black (mean pixel value < threshold)."""
+        # === Camera validation - FAIL FAST if camera data is missing/stale/black/green ===
+        def is_invalid_image(img: np.ndarray) -> bool:
             if img is None:
                 return True
-            return np.mean(img) < threshold
+            # Check black
+            if np.mean(img) < 5.0:
+                return True
+            # Check green (UVC error often returns solid green)
+            mean_r = np.mean(img[:, :, 0])
+            mean_g = np.mean(img[:, :, 1])
+            mean_b = np.mean(img[:, :, 2])
+            if mean_g > 100 and mean_r < 10 and mean_b < 10:
+                return True
+            return False
+
+        camera_error = False
+        error_msg = ""
         
-        # Check fixed camera (front camera) - check health first (frame freshness)
         if self._fixed_cam is not None:
             if not self._fixed_cam.is_healthy(max_age=1.0):
-                frame_age = self._fixed_cam.get_frame_age()
-                raise RuntimeError(
-                    "\n" + "=" * 60 + "\n"
-                    "❌ CAMERA ERROR: Front camera (fixed_cam) is UNHEALTHY!\n"
-                    f"   Frame age: {frame_age:.2f}s (max allowed: 1.0s)\n"
-                    "   Camera may be experiencing V4L2 timeout or disconnected.\n"
-                    "   Recording STOPPED to prevent invalid data.\n"
-                    "=" * 60
-                )
-            if fixed_img is None:
-                raise RuntimeError(
-                    "\n" + "=" * 60 + "\n"
-                    "❌ CAMERA ERROR: Front camera (fixed_cam) returned None!\n"
-                    "   Camera may be disconnected or experiencing timeout.\n"
-                    "   Recording STOPPED to prevent invalid data.\n"
-                    "=" * 60
-                )
-            if is_black_image(fixed_img):
-                raise RuntimeError(
-                    "\n" + "=" * 60 + "\n"
-                    "❌ CAMERA ERROR: Front camera (fixed_cam) returned BLACK image!\n"
-                    f"   Mean pixel value: {np.mean(fixed_img):.2f} (threshold: 5.0)\n"
-                    "   Camera may be blocked, disconnected, or malfunctioning.\n"
-                    "   Recording STOPPED to prevent invalid data.\n"
-                    "=" * 60
-                )
-        
-        # Check wrist camera - check health first (frame freshness)
-        if self._wrist_cam is not None:
+                camera_error = True
+                error_msg = "Front camera is UNHEALTHY (stale frames)"
+            elif is_invalid_image(fixed_img):
+                camera_error = True
+                error_msg = "Front camera returned invalid (black/green) image"
+                
+        if self._wrist_cam is not None and not camera_error:
             if not self._wrist_cam.is_healthy(max_age=1.0):
-                frame_age = self._wrist_cam.get_frame_age()
-                raise RuntimeError(
-                    "\n" + "=" * 60 + "\n"
-                    "❌ CAMERA ERROR: Wrist camera (wrist_cam) is UNHEALTHY!\n"
-                    f"   Frame age: {frame_age:.2f}s (max allowed: 1.0s)\n"
-                    "   Camera: Dabai DC1 (/dev/video10)\n"
-                    "   Camera is experiencing V4L2 timeout - not producing new frames.\n"
-                    "   Try: 1) Replug USB cable  2) Run with --wrist_cam -1 to disable\n"
-                    "   Recording STOPPED to prevent invalid/stale data.\n"
-                    "=" * 60
-                )
-            if wrist_img is None:
-                raise RuntimeError(
-                    "\n" + "=" * 60 + "\n"
-                    "❌ CAMERA ERROR: Wrist camera (wrist_cam) returned None!\n"
-                    "   Camera: Dabai DC1 (/dev/video10)\n"
-                    "   Camera may be disconnected or experiencing V4L2 timeout.\n"
-                    "   Try: 1) Replug USB cable  2) Run with --wrist_cam -1 to disable\n"
-                    "   Recording STOPPED to prevent invalid data.\n"
-                    "=" * 60
-                )
-            if is_black_image(wrist_img):
-                raise RuntimeError(
-                    "\n" + "=" * 60 + "\n"
-                    "❌ CAMERA ERROR: Wrist camera (wrist_cam) returned BLACK image!\n"
-                    f"   Mean pixel value: {np.mean(wrist_img):.2f} (threshold: 5.0)\n"
-                    "   Camera: Dabai DC1 (/dev/video10)\n"
-                    "   Camera may be blocked, disconnected, or malfunctioning.\n"
-                    "   Try: 1) Replug USB cable  2) Run with --wrist_cam -1 to disable\n"
-                    "   Recording STOPPED to prevent invalid data.\n"
-                    "=" * 60
-                )
+                camera_error = True
+                error_msg = "Wrist camera is UNHEALTHY (stale frames)"
+            elif is_invalid_image(wrist_img):
+                camera_error = True
+                error_msg = "Wrist camera returned invalid (black/green) image"
+        
+        if camera_error:
+            print(f"\n[Teleop] ❌ CAMERA ERROR: {error_msg}")
+            print("[Teleop] 🛑 Recording STOPPED to prevent invalid data.")
+            self._recording = False
+            self._current_episode = None
+            self._prev_pose = None
+            self._camera_error_state = True
+            # Vibrate continuously to alert user
+            self.ps5.rumble(low_frequency=1.0, high_frequency=0.0, duration_ms=500)
+            return
         
         # Fallback for disabled cameras (create placeholder only if camera not configured)
         if fixed_img is None:
@@ -1592,6 +1576,14 @@ class TeleoperationController:
             False if should quit, True otherwise.
         """
         self.ps5.update()
+        
+        # Handle camera error continuous vibration
+        if getattr(self, '_camera_error_state', False):
+            if not hasattr(self, '_last_error_rumble_time'):
+                self._last_error_rumble_time = 0
+            if time.time() - self._last_error_rumble_time > 0.5:
+                self.ps5.rumble(low_frequency=1.0, high_frequency=0.0, duration_ms=500)
+                self._last_error_rumble_time = time.time()
         
         # Check quit button (PS button)
         if self.ps5.get_button_pressed(PS5Buttons.PS):
@@ -1685,9 +1677,15 @@ class TeleoperationController:
         elif self._record_data and not self._recording:
             # Recording mode but not recording: short press starts recording
             if square_just_pressed:
-                self.start_recording()
-                # Vibrate once to indicate start
-                self.ps5.rumble_short(count=1, intensity=0.7, duration_ms=150)
+                if getattr(self, '_camera_error_state', False):
+                    # Clear error state and stop vibration
+                    self._camera_error_state = False
+                    self.ps5.stop_rumble()
+                    print("[Teleop] 🔄 Camera error state cleared. Press again to record.")
+                else:
+                    self.start_recording()
+                    # Vibrate once to indicate start
+                    self.ps5.rumble_short(count=1, intensity=0.7, duration_ms=150)
         
         elif not self._record_data and square_just_pressed:
             # No recording mode: print and record pose (original behavior)
@@ -1852,7 +1850,52 @@ class TeleoperationController:
             fixed_img = self._fixed_cam.get_frame_rgb() if self._fixed_cam else None
             wrist_img = self._wrist_cam.get_frame_rgb() if self._wrist_cam else None
             
-            # Handle missing camera data
+            # === Camera validation - FAIL FAST if camera data is missing/stale/black/green ===
+            def is_invalid_image(img: np.ndarray) -> bool:
+                if img is None:
+                    return True
+                # Check black
+                if np.mean(img) < 5.0:
+                    return True
+                # Check green (UVC error often returns solid green)
+                mean_r = np.mean(img[:, :, 0])
+                mean_g = np.mean(img[:, :, 1])
+                mean_b = np.mean(img[:, :, 2])
+                if mean_g > 100 and mean_r < 10 and mean_b < 10:
+                    return True
+                return False
+
+            camera_error = False
+            error_msg = ""
+            
+            if self._fixed_cam is not None:
+                if not self._fixed_cam.is_healthy(max_age=1.0):
+                    camera_error = True
+                    error_msg = "Front camera is UNHEALTHY (stale frames)"
+                elif is_invalid_image(fixed_img):
+                    camera_error = True
+                    error_msg = "Front camera returned invalid (black/green) image"
+                    
+            if self._wrist_cam is not None and not camera_error:
+                if not self._wrist_cam.is_healthy(max_age=1.0):
+                    camera_error = True
+                    error_msg = "Wrist camera is UNHEALTHY (stale frames)"
+                elif is_invalid_image(wrist_img):
+                    camera_error = True
+                    error_msg = "Wrist camera returned invalid (black/green) image"
+            
+            if camera_error:
+                print(f"\n[Teleop] ❌ CAMERA ERROR: {error_msg}")
+                print("[Teleop] 🛑 Recording STOPPED to prevent invalid data.")
+                self._recording = False
+                self._current_episode = None
+                self._prev_pose = None
+                self._camera_error_state = True
+                # Vibrate continuously to alert user
+                self.ps5.rumble(low_frequency=1.0, high_frequency=0.0, duration_ms=500)
+                return True
+            
+            # Handle missing camera data (only if camera not configured)
             if fixed_img is None:
                 fixed_img = np.zeros((480, 640, 3), dtype=np.uint8)
             if wrist_img is None:
@@ -1920,7 +1963,7 @@ Examples:
   python 2_teleop_ps5_controller.py --record --out_dir data/teleop_data
   
   # With specific cameras
-  python 2_teleop_ps5_controller.py --record --front_cam Orbbec_Gemini_335L --wrist_cam Dabai_DC1
+  python 2_teleop_ps5_controller.py --record --front_cam Orbbec_Gemini_335L --wrist_cam Orbbec_Gemini_336
 
 Data Recording Controls (when --record is enabled):
   - Square (short press): Start/Stop recording (1 vibrate = start, 2 vibrates = stop & save)
@@ -1948,16 +1991,16 @@ Data Recording Controls (when --record is enabled):
     # Data recording options
     parser.add_argument("--record", "-r", action="store_true", default=True,
                         help="Enable data recording mode (default: enabled)")
-    parser.add_argument("--out_dir", "-o", type=str, default="/media/qiyuan/SSDQQY/rev2fwd_data/pick_place_piper",
-                        help="Output directory for recorded data (default: /media/qiyuan/SSDQQY/rev2fwd_data/pick_place_piper)")
+    parser.add_argument("--out_dir", "-o", type=str, default="/media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B_test",
+                        help="Output directory for recorded data (default: /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B_test)")
     parser.add_argument("--front_cam", "-f", type=str, default=DEFAULT_FRONT_CAMERA,
                         help=f"Front camera ID/name (default: {DEFAULT_FRONT_CAMERA})")
     parser.add_argument("--wrist_cam", "-w", type=str, default=DEFAULT_WRIST_CAMERA,
                         help=f"Wrist camera ID/name, use -1 to disable (default: {DEFAULT_WRIST_CAMERA})")
-    parser.add_argument("--image_width", type=int, default=320,
-                        help="Camera image width (default: 320)")
-    parser.add_argument("--image_height", type=int, default=270,
-                        help="Camera image height (default: 270)")
+    parser.add_argument("--image_width", type=int, default=640,
+                        help="Camera image width (default: 640)")
+    parser.add_argument("--image_height", type=int, default=480,
+                        help="Camera image height (default: 480)")
     
     # Force estimation options
     parser.add_argument("--gripper_mass", type=float, default=GRIPPER_MASS,
@@ -2256,36 +2299,61 @@ def main():
                 teleop._current_episode = None
             
             # Show camera if available
-            if display_cam is not None and CV2_AVAILABLE:
-                frame = display_cam.get_frame()
-                if frame is not None:
+            if args.show_camera and CV2_AVAILABLE:
+                frames_to_show = []
+                if fixed_cam is not None:
+                    f_frame = fixed_cam.get_frame()
+                    if f_frame is not None:
+                        frames_to_show.append(f_frame)
+                if wrist_cam is not None:
+                    w_frame = wrist_cam.get_frame()
+                    if w_frame is not None:
+                        frames_to_show.append(w_frame)
+                
+                if not args.record and display_cam is not None and display_cam not in [fixed_cam, wrist_cam]:
+                    d_frame = display_cam.get_frame()
+                    if d_frame is not None:
+                        frames_to_show.append(d_frame)
+                
+                if frames_to_show:
+                    # Resize frames to be smaller
+                    scale = 0.3  # Make it even smaller to reduce impact
+                    resized_frames = []
+                    for f in frames_to_show:
+                        h, w = f.shape[:2]
+                        resized_frames.append(cv2.resize(f, (int(w * scale), int(h * scale))))
+                    
+                    # Concatenate horizontally
+                    display_frame = np.hstack(resized_frames) if len(resized_frames) > 1 else resized_frames[0]
+                    
                     # Add overlay text
                     pose = piper.get_ee_pose_meters()
                     if pose:
                         text = f"Pos: ({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})m"
-                        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                    0.7, (0, 255, 0), 2)
+                        cv2.putText(display_frame, text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.5, (0, 255, 0), 1)
                         text2 = f"Rot: ({pose['rx_deg']:.1f}, {pose['ry_deg']:.1f}, {pose['rz_deg']:.1f})deg"
-                        cv2.putText(frame, text2, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                                    0.7, (0, 255, 0), 2)
+                        cv2.putText(display_frame, text2, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.5, (0, 255, 0), 1)
                     
                     speed_text = f"Speed: {piper._speed_percent}%"
-                    cv2.putText(frame, speed_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 
-                                0.7, (255, 255, 0), 2)
+                    cv2.putText(display_frame, speed_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                                0.5, (255, 255, 0), 1)
                     
                     if piper._emergency_stop:
-                        cv2.putText(frame, "EMERGENCY STOP", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 
-                                    0.8, (0, 0, 255), 2)
+                        cv2.putText(display_frame, "EMERGENCY STOP", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.6, (0, 0, 255), 2)
                     
                     # Recording indicator
                     if args.record and teleop._recording:
-                        cv2.putText(frame, "REC", (frame.shape[1] - 70, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.8, (0, 0, 255), 2)
-                        cv2.circle(frame, (frame.shape[1] - 80, 25), 8, (0, 0, 255), -1)
+                        cv2.putText(display_frame, "REC", (display_frame.shape[1] - 50, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6, (0, 0, 255), 2)
+                        cv2.circle(display_frame, (display_frame.shape[1] - 60, 15), 6, (0, 0, 255), -1)
                     
-                    cv2.imshow("Piper Teleop", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+                    cv2.imshow("Piper Teleop", display_frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
             
             # Maintain control frequency
             elapsed = time.time() - loop_start

@@ -729,7 +729,7 @@ IDLE → GO_TO_HOME → HOVER_PLATE → LOWER_GRASP → CLOSE_GRIP → LIFT_OBJE
 python 6_collect_data_piper.py --num_episodes 50 --out_dir data/piper_pick_place
 
 # Specify cameras by device name
-python 6_collect_data_piper.py -f Orbbec_Gemini_335L -w Dabai_DC1
+python 6_collect_data_piper.py -f Orbbec_Gemini_335L -w Orbbec_Gemini_336
 
 # Custom workspace parameters
 python 6_collect_data_piper.py \
@@ -998,7 +998,7 @@ python 8_eval_ditflow_piper.py \
 | `--control_freq` | `20` | Control frequency in Hz |
 | `--speed` / `-s` | `20` | Motion speed percentage |
 | `--front_cam` / `-f` | `Orbbec_Gemini_335L` | Front camera ID or name |
-| `--wrist_cam` / `-w` | `Dabai_DC1` | Wrist camera ID or name (`-1` to disable) |
+| `--wrist_cam` / `-w` | `Orbbec_Gemini_336` | Wrist camera ID or name (`-1` to disable) |
 | `--image_width` | `320` | Camera capture width |
 | `--image_height` | `270` | Camera capture height |
 | `--show_camera` | off | Show live camera feed with overlay |

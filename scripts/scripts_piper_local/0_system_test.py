@@ -38,7 +38,7 @@ class TestConfig:
     
     # 相机设备 ID
     front_camera_id: Union[int, str] = "Orbbec_Gemini_335L"
-    wrist_camera_id: Union[int, str] = "Dabai_DC1"  # 如果没有腕部相机，设为 -1, if the writs camera is present, set to its ID(2).
+    wrist_camera_id: Union[int, str] = "Orbbec_Gemini_336"  # 如果没有腕部相机，设为 -1, if the writs camera is present, set to its ID(2).
     
     # 机械臂参数
     enable_timeout: float = 5.0
@@ -607,7 +607,7 @@ class CameraTest:
         支持:
         - 整数索引 (如 8)
         - /dev/videoX 路径
-        - /dev/v4l/by-id/ 下的设备名或其子串 (如 Orbbec_Gemini_335L, Dabai_DC1)
+        - /dev/v4l/by-id/ 下的设备名或其子串 (如 Orbbec_Gemini_335L, Orbbec_Gemini_336)
         """
         if isinstance(camera_id, int):
             return camera_id
@@ -664,7 +664,7 @@ class CameraTest:
         if cap.isOpened():
             return cap
 
-        # 尝试 Orbbec obsensor 后端（如 Dabai / Gemini）
+        # 尝试 Orbbec obsensor 后端（如 Gemini）
         obsensor_backend = getattr(cv2, "CAP_OBSENSOR", None)
         if obsensor_backend is not None:
             cap = cv2.VideoCapture(source, obsensor_backend)
@@ -1434,8 +1434,8 @@ def main():
     )
     parser.add_argument(
         '--wrist-cam', '-w',
-        default='Dabai_DC1',
-        help='腕部相机 ID/名称 (默认: Dabai_DC1; 使用 -1 表示无腕部相机)'
+        default='Orbbec_Gemini_336',
+        help='腕部相机 ID/名称 (默认: Orbbec_Gemini_336; 使用 -1 表示无腕部相机)'
     )
     parser.add_argument(
         '--speed', '-s',
