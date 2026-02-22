@@ -11,6 +11,10 @@ Usage:
     # Upload model (entire experiment folder, ignores lerobot_dataset)
     python scripts/hf_sync.py upload-model runs/ditflow_piper_0210_B
     python scripts/hf_sync.py upload-model runs/ditflow_piper_0210_A
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_A
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_B
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_A_0222
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_B_0222
 
     python scripts/hf_sync.py upload-model runs/diffusion_piper_teleop_B_0205
     python scripts/hf_sync.py upload-model runs/dp_pickplace_piper_0210_A
@@ -35,6 +39,7 @@ Usage:
     
     # Download dataset (auto-appends dataset name as subdirectory)
     python scripts/hf_sync.py download-dataset pick_place_piper_A --local_dir /media/qiyuan/SSDQQY/           # -> /media/qiyuan/SSDQQY/pick_place_piper_A
+    python scripts/hf_sync.py download-dataset pickplace_piper_0221_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
 
 
 

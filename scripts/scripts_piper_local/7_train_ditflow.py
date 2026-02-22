@@ -126,33 +126,71 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
     --out runs/ditflow_piper_teleop \
     --hidden_dim 256 --num_blocks 4 --num_heads 8 --dim_feedforward 2048 \
-    --batch_size 64 --steps 50000 --wandb
+    --batch_size 64 --steps 50000 --wandb --include_gripper
 
 # Use beta noise scheduling (from Pi0 paper)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
     --out runs/ditflow_piper_teleop \
     --training_noise_sampling beta \
-    --batch_size 64 --steps 50000 --wandb
+    --batch_size 64 --steps 50000 --wandb --include_gripper
 
 # Multi-GPU training
 CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 \
     scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pickplace_piper_0210_B \
     --out runs/ditflow_pickplace_piper_0210_B  \
-    --batch_size 128 --steps 50000 --wandb
+    --batch_size 128 --steps 50000 --wandb --include_gripper
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29501\
     scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pickplace_piper_0210_A \
     --out runs/ditflow_pickplace_piper_0210_A  \
-    --batch_size 128 --steps 50000 --wandb
+    --batch_size 128 --steps 50000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=5,6,7,8,9 torchrun --nproc_per_node=5 --master_port=29501\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_A \
+    --out runs/ditflow_pickplace_piper_0221_A  \
+    --batch_size 64 --steps 100000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --nproc_per_node=5\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_B \
+    --out runs/ditflow_pickplace_piper_0221_B  \
+    --batch_size 32 --steps 100000 --wandb --include_gripper
+
+    # A100 G1
+CUDA_VISIBLE_DEVICES=1 python\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_A \
+    --out runs/ditflow_pickplace_piper_0221_A  \
+    --batch_size 128 --steps 100000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=1 python\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_B \
+    --out runs/ditflow_pickplace_piper_0221_B_0222  \
+    --batch_size 128 --steps 10000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=7 python\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_A \
+    --out runs/ditflow_pickplace_piper_0221_A_0222  \
+    --batch_size 128 --steps 10000 --wandb --include_gripper
+
+    # 3090 G5
+CUDA_VISIBLE_DEVICES=1 python\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_B \
+    --out runs/ditflow_pickplace_piper_0221_B  \
+    --batch_size 16 --steps 20000 --wandb --include_gripper
     
 # Data conversion only (for debugging)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
     --out runs/ditflow_piper_teleop \
-    --convert_only
+    --convert_only --include_gripper
 
 # Overfit mode (1 episode, useful for debugging)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
@@ -164,12 +202,12 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper_A \
     --out runs/ditflow_piper_teleop \
-    --resume --steps 200000
+    --resume --steps 200000 --include_gripper
 
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pickplace_piper_0210_A \
     --out runs/ditflow_pickplace_piper_0210_A  \
-    --batch_size 128 --steps 50000 --wandb
+    --batch_size 128 --steps 50000 --wandb --include_gripper
 =============================================================================
 
 

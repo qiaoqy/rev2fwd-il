@@ -43,6 +43,10 @@ python scripts/scripts_piper_local/3_make_forward_data.py \
     --input data/pickplace_piper_0210_B \
     --output data/pickplace_piper_0210_A_01gripper_action
 
+python scripts/scripts_piper_local/3_make_forward_data.py \
+    --input data/pickplace_piper_0221_B \
+    --output data/pickplace_piper_0221_A
+
 # With verbose output
 python scripts/scripts_piper_local/3_make_forward_data.py \
     --input data/pick_place_piper \
