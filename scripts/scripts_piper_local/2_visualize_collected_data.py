@@ -41,6 +41,9 @@ python scripts/scripts_piper_local/2_visualize_collected_data.py \
 
 python scripts/scripts_piper_local/2_visualize_collected_data.py \
     --episode /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pickplace_piper_0210_B/episode_20260221_211946_247343.tar.gz
+
+python scripts/scripts_piper_local/2_visualize_collected_data.py \
+    --episode /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/pickplace_piper_0221_A/episode_20260221_213014_498253.tar.gz
 =============================================================================
 """
 

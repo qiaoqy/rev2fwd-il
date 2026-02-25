@@ -143,6 +143,43 @@ def compute_delta_quat(q_prev: np.ndarray, q_curr: np.ndarray) -> np.ndarray:
     return delta
 
 
+def compute_delta_quat_euler(q_prev: np.ndarray, q_curr: np.ndarray) -> np.ndarray:
+    """Compute delta quaternion using Euler-difference method.
+    
+    This matches how script 1 (teleop) computes action quaternion deltas:
+      1. Convert both quaternions to Euler XYZ (degrees)
+      2. Take the Euler angle difference
+      3. Wrap to [-180, 180] to handle angle discontinuities
+      4. Convert the difference back to a quaternion
+    
+    This is NOT the same as proper quaternion multiplication (q_prev^-1 * q_curr),
+    but it's consistent with how script 8 (eval) applies the delta:
+      delta_euler_deg = quat_to_euler(delta_quat)
+      target_euler_rad = current_euler_rad + deg2rad(delta_euler_deg)
+    
+    Using the proper quaternion method would produce deltas that, when decoded
+    back to Euler and added, give WRONG orientation targets.
+    
+    Args:
+        q_prev: Previous quaternion [w, x, y, z]
+        q_curr: Current quaternion [w, x, y, z]
+        
+    Returns:
+        Delta quaternion [w, x, y, z] encoding the Euler angle difference
+    """
+    euler_prev = np.array(quat_to_euler(q_prev[0], q_prev[1], q_prev[2], q_prev[3]))  # degrees
+    euler_curr = np.array(quat_to_euler(q_curr[0], q_curr[1], q_curr[2], q_curr[3]))  # degrees
+    
+    delta_euler_deg = euler_curr - euler_prev
+    
+    # Wrap to [-180, 180] to handle angle discontinuities
+    # e.g., going from 179° to -179° should be a delta of -2°, not +358°
+    delta_euler_deg = (delta_euler_deg + 180.0) % 360.0 - 180.0
+    
+    delta_quat = np.array(euler_to_quat(delta_euler_deg[0], delta_euler_deg[1], delta_euler_deg[2]))
+    return delta_quat
+
+
 # =============================================================================
 # Data Loading and Saving
 # =============================================================================
@@ -351,10 +388,14 @@ def reverse_episode(episode: dict, verbose: bool = False) -> dict:
         # Position delta: xyz[t+1] - xyz[t]
         delta_xyz = ee_pose_rev[t + 1, :3] - ee_pose_rev[t, :3]
         
-        # Quaternion delta: what rotation takes quat[t] to quat[t+1]?
+        # Quaternion delta using Euler-difference method (matches script 1 & 8 pipeline)
+        # IMPORTANT: Do NOT use compute_delta_quat() here (proper quaternion algebra),
+        # because the eval pipeline (script 8) decodes delta_quat back to Euler and
+        # adds to current Euler. This requires the delta to be an Euler-difference
+        # encoded as quaternion, not a proper quaternion rotation delta.
         quat_prev = ee_pose_rev[t, 3:7]
         quat_curr = ee_pose_rev[t + 1, 3:7]
-        delta_quat = compute_delta_quat(quat_prev, quat_curr)
+        delta_quat = compute_delta_quat_euler(quat_prev, quat_curr)
         
         action_rev[t, :3] = delta_xyz
         action_rev[t, 3:7] = delta_quat
@@ -450,7 +491,7 @@ def verify_reversal(original: dict, reversed_ep: dict) -> bool:
         print(f"    Original start: {orig_start}")
         print(f"    Reversed end: {rev_end}")
     
-    # Check action integration
+    # Check position action integration
     ee_pose_rev = reversed_ep['ee_pose']
     action_rev = reversed_ep['action']
     
@@ -463,9 +504,32 @@ def verify_reversal(original: dict, reversed_ep: dict) -> bool:
     integration_ok = integration_error < 1e-4
     
     if not integration_ok:
-        print(f"  WARNING: Integration error too high: {integration_error:.6f} m")
+        print(f"  WARNING: Position integration error too high: {integration_error:.6f} m")
     
-    return pos_check1 and pos_check2 and integration_ok
+    # Check rotation action integration (Euler-based, matching eval pipeline)
+    # This verifies that: euler_curr = euler_prev + quat_to_euler(delta_quat)
+    euler_error_max = 0.0
+    for t in range(T - 1):
+        quat_prev = ee_pose_rev[t, 3:7]
+        quat_curr = ee_pose_rev[t + 1, 3:7]
+        delta_quat = action_rev[t, 3:7]
+        
+        # Decode delta the same way eval (script 8) does
+        euler_prev = np.array(quat_to_euler(quat_prev[0], quat_prev[1], quat_prev[2], quat_prev[3]))
+        euler_curr = np.array(quat_to_euler(quat_curr[0], quat_curr[1], quat_curr[2], quat_curr[3]))
+        delta_euler = np.array(quat_to_euler(delta_quat[0], delta_quat[1], delta_quat[2], delta_quat[3]))
+        
+        reconstructed = euler_prev + delta_euler
+        error = np.abs(reconstructed - euler_curr)
+        # Handle angle wrapping: error near 360 means correct wrapping
+        error = np.minimum(error, 360.0 - error)
+        euler_error_max = max(euler_error_max, error.max())
+    
+    rotation_ok = euler_error_max < 1.0  # Less than 1 degree tolerance
+    if not rotation_ok:
+        print(f"  WARNING: Rotation integration error too high: {euler_error_max:.4f} deg")
+    
+    return pos_check1 and pos_check2 and integration_ok and rotation_ok
 
 
 # =============================================================================

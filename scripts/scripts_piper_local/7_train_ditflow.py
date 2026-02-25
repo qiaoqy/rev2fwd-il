@@ -154,6 +154,13 @@ CUDA_VISIBLE_DEVICES=5,6,7,8,9 torchrun --nproc_per_node=5 --master_port=29501\
     --out runs/ditflow_pickplace_piper_0221_A  \
     --batch_size 64 --steps 100000 --wandb --include_gripper
 
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 --master_port=29501\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0221_A \
+    --out runs/ditflow_pickplace_piper_0224_A  \
+    --save_freq 20000 --lr 5e-4\
+    --batch_size 64 --steps 500000 --wandb --include_gripper
+
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --nproc_per_node=5\
     scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pickplace_piper_0221_B \
@@ -208,6 +215,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pickplace_piper_0210_A \
     --out runs/ditflow_pickplace_piper_0210_A  \
     --batch_size 128 --steps 50000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=1 python \
+    scripts/scripts_piper_local/7_train_ditflow.py  \
+    --dataset data/pickplace_piper_0221_B_extended_0222   \
+    --out runs/ditflow_pickplace_piper_0222_B_extended_0222   \
+    --batch_size 128 --steps 11333 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=1 python \
+    scripts/scripts_piper_local/7_train_ditflow.py  \
+    --dataset data/pickplace_piper_0221_B_extended_0222   \
+    --out runs/ditflow_pickplace_piper_0222_B_extended_0222   \
+    --batch_size 128 --steps 11333 --wandb --include_gripper
 =============================================================================
 
 
@@ -215,7 +234,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
 TMUX BACKGROUND EXECUTION (Recommended for long training)
 =============================================================================
 # Create a new tmux session and run training in background
-tmux new -s ditflow_pickplace_piper_0210_A
+tmux new -s ditflow_pickplace_piper_0224_A
 tmux new -s ditflow_pickplace_piper_0210_B
 # Common tmux commands:
 #   tmux ls                  # List all sessions

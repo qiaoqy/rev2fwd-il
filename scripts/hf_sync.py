@@ -15,11 +15,14 @@ Usage:
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_B
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_A_0222
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0221_B_0222
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0222_B_extended_0222
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0222_B_extended_0223
 
     python scripts/hf_sync.py upload-model runs/diffusion_piper_teleop_B_0205
     python scripts/hf_sync.py upload-model runs/dp_pickplace_piper_0210_A
     python scripts/hf_sync.py upload-model runs/dp_pickplace_piper_0210_B
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0210_B
+    python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0224_A
     
     # Download model (auto-appends model name as subdirectory)
     python scripts/hf_sync.py download-model diffusion_piper_teleop_A --local_dir /media/qiyuan/SSDQQY/runs       # -> runs/diffusion_piper_teleop_A
@@ -40,6 +43,8 @@ Usage:
     # Download dataset (auto-appends dataset name as subdirectory)
     python scripts/hf_sync.py download-dataset pick_place_piper_A --local_dir /media/qiyuan/SSDQQY/           # -> /media/qiyuan/SSDQQY/pick_place_piper_A
     python scripts/hf_sync.py download-dataset pickplace_piper_0221_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
+    python scripts/hf_sync.py download-dataset B_rollout_data --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
+    python scripts/hf_sync.py download-dataset pullout_piper_0225_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
 
 
 
