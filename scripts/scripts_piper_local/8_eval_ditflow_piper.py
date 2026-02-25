@@ -85,6 +85,23 @@ python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
 python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
     --checkpoint /media/qiyuan/SSDQQY/runs/ditflow_pickplace_piper_0210_A/checkpoints/checkpoints/050000/pretrained_model \
     --n_action_steps 16 --num_inference_steps 100
+
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/14F7C6746159B99A/piper_file/runs/ditflow_pickplace_piper_0221_B_0222/checkpoints/checkpoints/010000/pretrained_model \
+    --max_steps 1000 \
+    --n_action_steps 16 \
+    --num_inference_steps 100
+
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/14F7C6746159B99A/piper_file/runs/ditflow_pickplace_piper_0222_B_extended_0222/checkpoints/checkpoints/011333/pretrained_model \
+    --max_steps 500 \
+    --n_action_steps 16 \
+    --num_inference_steps 100
+
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint /media/qiyuan/C46EDFA671E11AFD/piper_file/runs/ditflow_pickplace_piper_0221_A/checkpoints/checkpoints/100000/pretrained_model\
+    --max_steps 500 \
+    --n_action_steps 16 --num_inference_steps 100
 =============================================================================
 """
 
@@ -1365,7 +1382,16 @@ def run_episode(
     """Run a single evaluation episode.
 
     The episode runs until max_steps or until the user presses Square to stop.
-    Actions are RELATIVE deltas applied to the current pose.
+
+    Control strategy: INTEGRAL-BASED
+      - On the first frame, the arm's current pose is captured as the base.
+      - Each inference step, the action delta is accumulated (integrated) onto
+        the base pose.
+      - The integrated pose is sent to the arm as the control command.
+      - The real-time arm pose is only used for observations (policy inference),
+        NOT for control signal synthesis.
+      - Benefit: even if individual deltas are tiny, the cumulative integral
+        eventually moves the arm, eliminating drift-gap issues.
 
     PS5 controls during episode:
         Square:   Stop episode (finish normally)
@@ -1389,7 +1415,10 @@ def run_episode(
     # Trajectory tracking for comparison plot
     actual_positions = []
     integrated_positions = []
-    integrated_xyz = None
+
+    # Integral-based control: accumulate deltas on top of the first-frame pose
+    # instead of applying each delta to the (noisy) current pose.
+    integrated_pose = None  # Will be set from the first-frame arm pose
 
     # Data recording
     episode_data = None
@@ -1584,26 +1613,61 @@ def run_episode(
             episode_data.action.append(action.copy())
 
         if step % log_freq == 0:
-            print(f"  Step {step}: action={action[:3].round(4)}, "
-                  f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
+            if integrated_pose is not None:
+                print(f"  Step {step}: action={action[:3].round(4)}, "
+                      f"actual=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f}), "
+                      f"integ=({integrated_pose['x']:.3f}, {integrated_pose['y']:.3f}, {integrated_pose['z']:.3f})", flush=True)
+            else:
+                print(f"  Step {step}: action={action[:3].round(4)}, "
+                      f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})", flush=True)
 
         # =================================================================
-        # Track trajectory for comparison plot
+        # Integral-based control: accumulate deltas from initial pose
         # =================================================================
+        # On the first frame, snapshot the arm pose as the integration base
+        if integrated_pose is None:
+            integrated_pose = {
+                'x': pose['x'], 'y': pose['y'], 'z': pose['z'],
+                'rx': pose['rx'], 'ry': pose['ry'], 'rz': pose['rz'],
+            }
+            print(f"  [Integral] Initial pose captured: "
+                  f"pos=({pose['x']:.4f}, {pose['y']:.4f}, {pose['z']:.4f}) "
+                  f"rot=({np.rad2deg(pose['rx']):.1f}, {np.rad2deg(pose['ry']):.1f}, {np.rad2deg(pose['rz']):.1f})deg")
+
+        # Decompose action deltas
+        delta_x, delta_y, delta_z = action[0], action[1], action[2]
+        delta_qw, delta_qx, delta_qy, delta_qz = action[3], action[4], action[5], action[6]
+        gripper_target = action[7]
+
+        # Accumulate position deltas
+        integrated_pose['x'] += delta_x
+        integrated_pose['y'] += delta_y
+        integrated_pose['z'] += delta_z
+
+        # Accumulate rotation deltas (quaternion -> euler degrees -> radians)
+        delta_euler_deg = quat_to_euler(delta_qw, delta_qx, delta_qy, delta_qz)
+        integrated_pose['rx'] += np.deg2rad(delta_euler_deg[0])
+        integrated_pose['ry'] += np.deg2rad(delta_euler_deg[1])
+        integrated_pose['rz'] += np.deg2rad(delta_euler_deg[2])
+
+        # Gripper: normalized [0, 1] -> degrees [0, GRIPPER_OPEN_ANGLE]
+        gripper_deg = float(np.clip(gripper_target, 0.0, 1.0)) * GRIPPER_OPEN_ANGLE
+
+        # Track trajectory for comparison plot
         current_xyz = np.array([pose['x'], pose['y'], pose['z']])
         actual_positions.append(current_xyz.copy())
-
-        if integrated_xyz is None:
-            integrated_xyz = current_xyz.copy()
-
-        integrated_xyz = integrated_xyz + np.array([action[0], action[1], action[2]])
-        integrated_positions.append(integrated_xyz.copy())
+        integrated_xyz_snapshot = np.array([integrated_pose['x'], integrated_pose['y'], integrated_pose['z']])
+        integrated_positions.append(integrated_xyz_snapshot.copy())
 
         # =================================================================
-        # Apply action to robot
+        # Send integrated pose to robot (NOT current_pose + delta)
         # =================================================================
-        target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg = \
-            apply_delta_action(pose, action)
+        target_x = integrated_pose['x']
+        target_y = integrated_pose['y']
+        target_z = integrated_pose['z']
+        target_rx = integrated_pose['rx']
+        target_ry = integrated_pose['ry']
+        target_rz = integrated_pose['rz']
 
         piper.move_to_pose(target_x, target_y, target_z, target_rx, target_ry, target_rz)
 

@@ -95,6 +95,11 @@ python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
     --out_dir /media/qiyuan/14F7C6746159B99A/piper_file/rev2fwd_data/pullout_piper_0221_B \
     --show_camera
 
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record \
+    --out_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pullout_piper_0225_B \
+    --show_camera 
+
 """
 
 from __future__ import annotations
@@ -946,6 +951,7 @@ class PS5Controller:
         self.joystick: Optional[pygame.joystick.JoystickType] = None
         self.connected = False
         self.deadzone = 0.1
+        self.trigger_deadzone = 0.2  # Higher deadzone for L2/R2 triggers to filter drift
         self._haptic = None
         self._haptic_ready = False
         
@@ -1044,10 +1050,30 @@ class PS5Controller:
         return current and not prev
     
     def get_trigger(self, trigger: int) -> float:
-        """Get trigger value normalized to [0, 1]."""
-        # Triggers are typically -1 to 1, convert to 0 to 1
-        value = self.get_axis(trigger)
-        return (value + 1.0) / 2.0
+        """Get trigger value normalized to [0, 1].
+        
+        PS5 L2/R2 triggers report raw axis values from -1.0 (released) to +1.0 (fully pressed).
+        However, SDL2 may report 0.0 for triggers that haven't been physically touched yet,
+        and physical triggers often have slight analog drift. We use a dedicated trigger
+        deadzone (higher than stick deadzone) to filter out these phantom inputs.
+        """
+        if not self.connected or self.joystick is None:
+            return 0.0
+        
+        try:
+            raw = self.joystick.get_axis(trigger)
+        except Exception:
+            return 0.0
+        
+        # Convert from [-1, 1] to [0, 1]
+        normalized = (raw + 1.0) / 2.0
+        
+        # Apply trigger-specific deadzone to filter drift and initialization noise
+        if normalized < self.trigger_deadzone:
+            return 0.0
+        
+        # Remap from [trigger_deadzone, 1.0] to [0.0, 1.0] for smooth control
+        return (normalized - self.trigger_deadzone) / (1.0 - self.trigger_deadzone)
     
     def get_hat(self, hat: int = 0) -> Tuple[int, int]:
         """Get D-pad (hat) state."""
@@ -1610,11 +1636,19 @@ class TeleoperationController:
         # Options button - go to start position
         if self.ps5.get_button_pressed(PS5Buttons.OPTIONS):
             self.piper.go_to_start()
+            # Reset gripper to open state when going to start
+            self.piper.open_gripper()
+            self._gripper_open = True
+            self._gripper_target_angle = GRIPPER_OPEN_ANGLE
             return True
         
         # Cross button - go home
         if self.ps5.get_button_pressed(PS5Buttons.CROSS):
             self.piper.go_to_home()
+            # Reset gripper to open state when going home
+            self.piper.open_gripper()
+            self._gripper_open = True
+            self._gripper_target_angle = GRIPPER_OPEN_ANGLE
             return True
         
         # Triangle button - toggle gripper (was Circle)
@@ -1797,7 +1831,7 @@ class TeleoperationController:
         l2 = self.ps5.get_trigger(PS5Axes.L2)  # Close
         r2 = self.ps5.get_trigger(PS5Axes.R2)  # Open
         
-        if l2 > 0.1 or r2 > 0.1:
+        if l2 > 0.15 or r2 > 0.15:
             # Incremental control: adjust target angle based on trigger pressure
             delta = (r2 - l2) * self._gripper_speed
             self._gripper_target_angle += delta
