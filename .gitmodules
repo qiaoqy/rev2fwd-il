@@ -3,4 +3,4 @@
 	url = git@github.com:agilexrobotics/piper_sdk.git
 [submodule "lerobot_policy_ditflow"]
 	path = lerobot_policy_ditflow
-	url = https://github.com/danielsanjosepro/lerobot_policy_ditflow.git
+	url = git@github.com:qiaoqy/lerobot_policy_ditflow.git
