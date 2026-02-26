@@ -96,6 +96,42 @@ DiT Flow uses:
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29501\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0226_A_ps5collected \
+    --out runs/pickplace_piper_0226_A_ps5collected  \
+    --save_freq 10000 --lr 5e-4\
+    --batch_size 128 --steps 40000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29502\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0226_B_reversed \
+    --out runs/pickplace_piper_0226_B_reversed  \
+    --save_freq 10000 --lr 5e-4\
+    --batch_size 128 --steps 40000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=2 --master_port=29503\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0226_B \
+    --out runs/pickplace_piper_0226_B  \
+    --save_freq 10000 --lr 5e-4\
+    --batch_size 128 --steps 40000 --wandb --include_gripper
+
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 --master_port=29504\
+    scripts/scripts_piper_local/7_train_ditflow.py \
+    --dataset data/pickplace_piper_0226_A \
+    --out runs/pickplace_piper_0226_A  \
+    --save_freq 10000 --lr 5e-4\
+    --batch_size 128 --steps 40000 --wandb --include_gripper
+
+
+
+
+
+
+
+
+
 # Basic training
 CUDA_VISIBLE_DEVICES=2 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pickplace_piper_0210_B \
@@ -537,6 +573,80 @@ def _parse_args() -> argparse.Namespace:
         "--overfit",
         action="store_true",
         help="Enable overfit mode: use only 1 episode. Automatically sets num_episodes=1.",
+    )
+
+    # =========================================================================
+    # Data Augmentation (training-time only)
+    # =========================================================================
+    parser.add_argument(
+        "--color_jitter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable ColorJitter augmentation during training. Default: True. "
+             "Use --no-color_jitter to disable.",
+    )
+    parser.add_argument(
+        "--color_jitter_brightness",
+        type=float,
+        default=0.05,
+        help="ColorJitter brightness range. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--color_jitter_contrast",
+        type=float,
+        default=0.05,
+        help="ColorJitter contrast range. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--color_jitter_saturation",
+        type=float,
+        default=0.05,
+        help="ColorJitter saturation range. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--color_jitter_hue",
+        type=float,
+        default=0.05,
+        help="ColorJitter hue range. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--gaussian_blur",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable GaussianBlur augmentation during training. Default: True. "
+             "Use --no-gaussian_blur to disable.",
+    )
+    parser.add_argument(
+        "--gaussian_blur_kernel_size",
+        type=int,
+        default=3,
+        help="GaussianBlur kernel size (must be odd). Default: 3.",
+    )
+    parser.add_argument(
+        "--gaussian_blur_sigma",
+        type=float,
+        nargs=2,
+        default=[0.1, 0.5],
+        help="GaussianBlur sigma range (low, high). Default: 0.1 0.5.",
+    )
+    parser.add_argument(
+        "--random_sharpness",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable RandomAdjustSharpness augmentation during training. Default: True. "
+             "Use --no-random_sharpness to disable.",
+    )
+    parser.add_argument(
+        "--random_sharpness_factor",
+        type=float,
+        default=1.2,
+        help="RandomAdjustSharpness sharpness factor. Default: 1.2.",
+    )
+    parser.add_argument(
+        "--random_sharpness_p",
+        type=float,
+        default=0.3,
+        help="Probability of applying RandomAdjustSharpness. Default: 0.3.",
     )
 
     # =========================================================================
@@ -1343,6 +1453,18 @@ def train_with_lerobot_api(
         drop_n_last_frames=drop_n_last_frames,
         # Optimizer settings
         optimizer_lr=args.lr,
+        # Data augmentation
+        color_jitter_enabled=args.color_jitter,
+        color_jitter_brightness=args.color_jitter_brightness,
+        color_jitter_contrast=args.color_jitter_contrast,
+        color_jitter_saturation=args.color_jitter_saturation,
+        color_jitter_hue=args.color_jitter_hue,
+        gaussian_blur_enabled=args.gaussian_blur,
+        gaussian_blur_kernel_size=args.gaussian_blur_kernel_size,
+        gaussian_blur_sigma=tuple(args.gaussian_blur_sigma),
+        random_sharpness_enabled=args.random_sharpness,
+        random_sharpness_factor=args.random_sharpness_factor,
+        random_sharpness_p=args.random_sharpness_p,
     )
     
     # Print normalization settings
@@ -1477,6 +1599,19 @@ def train_with_lerobot_api(
     print(f"    Noise sampling: {args.training_noise_sampling}")
     print(f"    Clip sample: {args.clip_sample} (range: {args.clip_sample_range})")
     print(f"    Drop N last frames: {drop_n_last_frames}")
+    print("")
+    print("  Data augmentation (training-time only):")
+    print(f"    ColorJitter: {args.color_jitter}"
+          + (f" (b={args.color_jitter_brightness}, c={args.color_jitter_contrast}, "
+             f"s={args.color_jitter_saturation}, h={args.color_jitter_hue})"
+             if args.color_jitter else ""))
+    print(f"    GaussianBlur: {args.gaussian_blur}"
+          + (f" (kernel={args.gaussian_blur_kernel_size}, "
+             f"sigma={args.gaussian_blur_sigma})"
+             if args.gaussian_blur else ""))
+    print(f"    RandomSharpness: {args.random_sharpness}"
+          + (f" (factor={args.random_sharpness_factor}, p={args.random_sharpness_p})"
+             if args.random_sharpness else ""))
     if train_episodes is not None:
         print(f"  Train episodes: {len(train_episodes)}")
     if val_episodes is not None:

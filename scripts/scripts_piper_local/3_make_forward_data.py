@@ -44,6 +44,14 @@ python scripts/scripts_piper_local/3_make_forward_data.py \
     --output data/pickplace_piper_0210_A_01gripper_action
 
 python scripts/scripts_piper_local/3_make_forward_data.py \
+    --input data/pickplace_piper_0226_A_ps5collected \
+    --output data/pickplace_piper_0226_B_reversed
+
+python scripts/scripts_piper_local/3_make_forward_data.py \
+    --input data/pickplace_piper_0226_B \
+    --output data/pickplace_piper_0226_A
+
+python scripts/scripts_piper_local/3_make_forward_data.py \
     --input data/pickplace_piper_0221_B \
     --output data/pickplace_piper_0221_A
 
