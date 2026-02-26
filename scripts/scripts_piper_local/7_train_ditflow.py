@@ -550,6 +550,42 @@ def _parse_args() -> argparse.Namespace:
     )
 
     # =========================================================================
+    # Normalization Stats Clamping
+    # =========================================================================
+    parser.add_argument(
+        "--norm_clamp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable stats clamping to prevent normalization collapse for near-constant "
+             "dimensions. Applied to both action and observation.state. "
+             "Default: True. Use --no-norm_clamp to disable.",
+    )
+    parser.add_argument(
+        "--translation_std_threshold",
+        type=float,
+        default=1e-3,
+        help="Per-axis std threshold for translation (xyz). If std < this, "
+             "the dimension is considered static and its min/max range is clamped. "
+             "Default: 1e-3.",
+    )
+    parser.add_argument(
+        "--rotation_std_threshold",
+        type=float,
+        default=0.01,
+        help="Std threshold for rotation (quaternion). If max(std(qx), std(qy), std(qz)) "
+             "< this, ALL 4 quaternion dims are clamped together. "
+             "Default: 0.01.",
+    )
+    parser.add_argument(
+        "--clamp_range",
+        type=float,
+        default=2.0,
+        help="Target min/max range when clamping. The range is expanded symmetrically "
+             "around the midpoint. A range of 2.0 means near-constant data maps to "
+             "~0 in [-1,1] normalized space. Default: 2.0.",
+    )
+
+    # =========================================================================
     # DiT Flow Sampling
     # =========================================================================
     parser.add_argument(
@@ -691,6 +727,131 @@ def _parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def clamp_dataset_stats(
+    dataset_dir: Path,
+    translation_std_threshold: float = 1e-3,
+    rotation_std_threshold: float = 0.01,
+    clamp_range: float = 2.0,
+) -> None:
+    """Clamp min/max stats to prevent normalization collapse for near-constant dims.
+
+    Applies to both 'action' and 'observation.state'. Assumes the dimension layout:
+        [x, y, z, qw, qx, qy, qz, (gripper)]   (7D or 8D)
+
+    Detection logic:
+      - Translation (dims 0,1,2): Each dim is checked independently.
+        If std[i] < translation_std_threshold → clamp that dim.
+      - Rotation (dims 3,4,5,6 = qw,qx,qy,qz): Checked as a group.
+        If max(std[qx], std[qy], std[qz]) < rotation_std_threshold
+        → clamp ALL 4 quaternion dims together.
+        Rationale: qw is always near 1 for small delta rotations, so its std
+        is not discriminative. qx,qy,qz encode sin(θ/2)*axis, directly measuring
+        rotation. And quaternion components are coupled, so clamp all or none.
+      - Gripper (dim 7 if present): Never clamped (always has range 0-1).
+
+    Clamping expands min/max symmetrically around the midpoint to `clamp_range`,
+    so near-constant data maps to ≈ 0 in [-1, 1] normalized space.
+
+    Example:
+        action delta_qw: min=0.99995, max=1.0, std=1.96e-7
+        rotation check: max(std(qx,qy,qz)) = 0.00116 < 0.01 → negligible
+        → All 4 quat dims clamped to range 2.0
+        → delta_qw midpoint=0.99997, new min=-0.00003, new max=1.99997
+        → In normalized space: actual data ≈ 0  (network learns "no rotation")
+
+    Args:
+        dataset_dir: Path to the LeRobot dataset directory.
+        translation_std_threshold: Std threshold for per-axis translation clamping.
+        rotation_std_threshold: Std threshold for grouped quaternion clamping.
+            Compared against max(std(qx), std(qy), std(qz)).
+        clamp_range: Target range when clamping (expanded symmetrically around midpoint).
+    """
+    stats_path = dataset_dir / "meta" / "stats.json"
+    if not stats_path.exists():
+        print(f"[stats clamp] stats.json not found at {stats_path}, skipping")
+        return
+
+    with open(stats_path, "r") as f:
+        stats = json.load(f)
+
+    modified = False
+    half_range = clamp_range / 2.0
+
+    def _expand_dim(key: str, i: int, reason: str) -> bool:
+        """Expand min/max for stats[key] at dimension i. Returns True if modified."""
+        min_vals = stats[key]["min"]
+        max_vals = stats[key]["max"]
+        old_min, old_max = min_vals[i], max_vals[i]
+        current_range = old_max - old_min
+        if current_range >= clamp_range:
+            return False
+        midpoint = (old_min + old_max) / 2.0
+        min_vals[i] = midpoint - half_range
+        max_vals[i] = midpoint + half_range
+        print(
+            f"  [stats clamp] {key}[{i}]: {reason}  "
+            f"range {current_range:.2e} → {clamp_range}  "
+            f"[{old_min:.6g}, {old_max:.6g}] → [{min_vals[i]:.6g}, {max_vals[i]:.6g}]"
+        )
+        return True
+
+    for key in ["action", "observation.state"]:
+        if key not in stats:
+            continue
+        std_vals = stats[key].get("std", None)
+        min_vals = stats[key]["min"]
+        n_dims = len(min_vals)
+        if std_vals is None or len(std_vals) < 7:
+            print(f"  [stats clamp] {key}: insufficient stats (dims={n_dims}), skipping")
+            continue
+
+        print(f"\n  --- {key} ({n_dims}D) ---")
+        print(f"  std: {[f'{s:.2e}' for s in std_vals]}")
+
+        # --- Translation: dims 0, 1, 2 (x, y, z) ---
+        for i in range(3):
+            if std_vals[i] < translation_std_threshold:
+                if _expand_dim(key, i, f"translation std={std_vals[i]:.2e} < {translation_std_threshold}"):
+                    modified = True
+            else:
+                print(f"  [stats clamp] {key}[{i}]: translation std={std_vals[i]:.2e} OK")
+
+        # --- Rotation: dims 3, 4, 5, 6 (qw, qx, qy, qz) ---
+        # Check qx(4), qy(5), qz(6) std — these directly encode rotation magnitude.
+        # qw(3) is always ~1 for small rotations, so not used for detection.
+        qxyz_stds = [std_vals[4], std_vals[5], std_vals[6]]
+        max_qxyz_std = max(qxyz_stds)
+        rotation_negligible = max_qxyz_std < rotation_std_threshold
+        print(
+            f"  [stats clamp] {key} rotation: "
+            f"max(std(qx,qy,qz)) = {max_qxyz_std:.2e}  "
+            f"{'< ' if rotation_negligible else '>= '}{rotation_std_threshold}  "
+            f"→ {'CLAMP all 4 quat dims' if rotation_negligible else 'OK (has rotation)'}"
+        )
+        if rotation_negligible:
+            for i in range(3, 7):  # qw, qx, qy, qz
+                if _expand_dim(key, i, "rotation negligible"):
+                    modified = True
+
+        # --- Gripper: dim 7 (if present) — never clamped ---
+        if n_dims > 7:
+            print(f"  [stats clamp] {key}[7]: gripper (skipped, range="
+                  f"{stats[key]['max'][7] - stats[key]['min'][7]:.2e})")
+
+    if modified:
+        # Backup original stats (only once)
+        backup_path = stats_path.with_suffix(".json.bak")
+        if not backup_path.exists():
+            shutil.copy2(stats_path, backup_path)
+            print(f"\n  [stats clamp] Original stats backed up to {backup_path}")
+
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=4)
+        print(f"  [stats clamp] Updated stats saved to {stats_path}")
+    else:
+        print("\n  [stats clamp] All dimensions have sufficient range, no changes needed.")
 
 
 def load_episode_from_archive(archive_path: Path) -> dict:
@@ -1773,6 +1934,22 @@ def main() -> None:
                 f"Run without --skip_convert first."
             )
     
+    # Apply stats clamping to prevent normalization collapse for near-constant dimensions
+    if is_main_process and args.norm_clamp:
+        print(f"\n{'='*60}")
+        print("Stats Clamping (normalization collapse prevention)")
+        print(f"{'='*60}")
+        print(f"  translation_std_threshold: {args.translation_std_threshold}")
+        print(f"  rotation_std_threshold:    {args.rotation_std_threshold}")
+        print(f"  clamp_range:               {args.clamp_range}")
+        clamp_dataset_stats(
+            dataset_dir=lerobot_dataset_dir,
+            translation_std_threshold=args.translation_std_threshold,
+            rotation_std_threshold=args.rotation_std_threshold,
+            clamp_range=args.clamp_range,
+        )
+        print(f"{'='*60}\n")
+
     if args.convert_only:
         if is_main_process:
             print("Data conversion complete. Exiting (--convert_only flag).")
