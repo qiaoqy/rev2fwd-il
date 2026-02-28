@@ -23,6 +23,13 @@ Usage:
     python scripts/hf_sync.py upload-model runs/dp_pickplace_piper_0210_B
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0210_B
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0224_A
+
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_A_ps5collected
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_B_reversed
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_B
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_A
+
+
     
     # Download model (auto-appends model name as subdirectory)
     python scripts/hf_sync.py download-model diffusion_piper_teleop_A --local_dir /media/qiyuan/SSDQQY/runs       # -> runs/diffusion_piper_teleop_A
@@ -32,7 +39,6 @@ Usage:
     python scripts/hf_sync.py download-model dp_pickplace_piper_0210_A --local_dir /media/qiyuan/SSDQQY/runs
     python scripts/hf_sync.py download-model ditflow_pickplace_piper_0210_A --local_dir /media/qiyuan/SSDQQY/runs
 
-
     python scripts/hf_sync.py download-model ditflow_pickplace_piper_0221_A_0222 --local_dir /media/qiyuan/14F7C6746159B99A/piper_file/runs
     python scripts/hf_sync.py download-model ditflow_pickplace_piper_0221_B_0222 --local_dir /media/qiyuan/14F7C6746159B99A/piper_file/runs
     python scripts/hf_sync.py download-model ditflow_pickplace_piper_0221_A --local_dir /media/qiyuan/14F7C6746159B99A/piper_file/runs
@@ -41,6 +47,16 @@ Usage:
         --local_dir /media/qiyuan/14F7C6746159B99A/piper_file/runs
     python scripts/hf_sync.py download-model ditflow_pickplace_piper_0221_A \
         --local_dir /media/qiyuan/C46EDFA671E11AFD/piper_file/runs
+
+    python scripts/hf_sync.py download-model pickplace_piper_0226_A_ps5collected \
+        --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs    
+    python scripts/hf_sync.py download-model pickplace_piper_0226_B_reversed \
+        --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs 
+    python scripts/hf_sync.py download-model pickplace_piper_0226_B \
+        --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs
+    python scripts/hf_sync.py download-model pickplace_piper_0226_A \
+        --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs
+
 
 
 
@@ -52,6 +68,7 @@ Usage:
     python scripts/hf_sync.py upload-dataset /media/qiyuan/14F7C6746159B99A/piper_file/runs/ditflow_pickplace_piper_0221_B_0222/B_rollout_data_2
     python scripts/hf_sync.py upload-dataset /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pullout_piper_0225_B
     
+
     # Download dataset (auto-appends dataset name as subdirectory)
     python scripts/hf_sync.py download-dataset pick_place_piper_A --local_dir /media/qiyuan/SSDQQY/           # -> /media/qiyuan/SSDQQY/pick_place_piper_A
     python scripts/hf_sync.py download-dataset pickplace_piper_0221_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
