@@ -30,7 +30,8 @@ EULER ANGLE CONVENTION
 - Quaternion convention: [qw, qx, qy, qz] (scalar-first, matching script 1)
 
 For action deltas, we recompute them from the converted ee_pose trajectory
-to ensure consistency, rather than naively converting quaternion deltas.
+(same approach as script 3: action[t] = ee_pose[t+1] - ee_pose[t]), ensuring
+the actions are always consistent with the Euler ee_pose observations.
 
 =============================================================================
 USAGE EXAMPLES
@@ -190,22 +191,25 @@ def convert_episode(episode_data: dict, verbose: bool = False) -> Tuple[dict, st
         print(f"      xyz range: [{xyz.min(axis=0)} , {xyz.max(axis=0)}]")
         print(f"      euler range (rad): [{euler.min(axis=0)} , {euler.max(axis=0)}]")
 
-    # 2. Recompute action deltas from converted ee_pose
-    #    Rather than converting quaternion deltas directly (which can be ambiguous),
-    #    we recompute deltas from the ee_pose trajectory for consistency.
+    # 2. Recompute action deltas from converted ee_pose trajectory
+    #    Same approach as script 3 (3_make_forward_data.py):
+    #        action[t] = ee_pose[t+1] - ee_pose[t]  (forward difference)
+    #        action[T-1] = 0  (last frame: no movement)
+    #    This ensures action deltas are always consistent with ee_pose,
+    #    regardless of how the original quaternion deltas were computed.
     gripper_targets = action[:, 7]  # (T,) - gripper target is last column in quat format
     action_euler = np.zeros((T, 7), dtype=np.float32)
 
     for t in range(T - 1):
-        # Position delta
+        # Position delta: xyz[t+1] - xyz[t]
         action_euler[t, :3] = ee_pose_euler[t + 1, :3] - ee_pose_euler[t, :3]
-        # Orientation delta (with angle wrapping)
+        # Rotation delta: Euler angle subtraction with wrapping
         action_euler[t, 3:6] = wrap_angle(ee_pose_euler[t + 1, 3:6] - ee_pose_euler[t, 3:6])
         # Gripper target
         action_euler[t, 6] = gripper_targets[t]
 
     # Last timestep: zero position/rotation delta, keep gripper
-    action_euler[-1, 6] = gripper_targets[-1]
+    action_euler[T - 1, 6] = gripper_targets[T - 1]
 
     if verbose:
         pos_deltas = action_euler[:, :3]
