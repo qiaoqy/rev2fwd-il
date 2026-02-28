@@ -100,6 +100,16 @@ python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
     --out_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pullout_piper_0225_B \
     --show_camera 
 
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record \
+    --out_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pickplace_piper_0226_B \
+    --show_camera
+
+python scripts/scripts_piper_local/1_teleop_ps5_controller.py \
+    --record \
+    --out_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pickplace_piper_0226_A_ps5collected \
+    --show_camera
+
 """
 
 from __future__ import annotations
