@@ -16,11 +16,21 @@ After EVERY task execution (regardless of success or failure), the script:
   4. Continues with the next task
 
 Specifically:
-  After Task A (success or fail) → prepare for Task B:
+  After Task A success:
+    - Run 100 transition frames with Policy A (gripper open, not recorded)
     - env.reset() (arm home)
     - Teleport object to goal position (Task B picks from goal)
 
-  After Task B (success or fail) → prepare for Task A:
+  After Task A failure:
+    - env.reset() (arm home)
+    - Teleport object to goal position (Task B picks from goal)
+
+  After Task B success:
+    - Run 100 transition frames with Policy B (gripper open, not recorded)
+    - env.reset() (arm home)
+    - Teleport object to random table position (Task A picks from table)
+
+  After Task B failure:
     - env.reset() (arm home)
     - Teleport object to random table position (Task A picks from table)
 
@@ -319,12 +329,25 @@ def main() -> None:
 
             if success_A:
                 print(f"  ✓ Task A SUCCESS")
+                # Run 100 transition frames with policy A (not recording data)
+                new_place_xy = tester._sample_new_place_target()
+                tester._update_place_marker(new_place_xy)
+                tester._run_transition(
+                    n_frames=100,
+                    policy=tester.policy_A, preprocessor=tester.preprocessor_A,
+                    postprocessor=tester.postprocessor_A,
+                    n_action_steps=tester.n_action_steps_A,
+                    include_obj_pose=tester.include_obj_pose_A,
+                    include_gripper=tester.include_gripper_A,
+                    has_wrist=tester.has_wrist_A,
+                    task_name="Task A (transition)",
+                )
             else:
                 print(f"  ✗ Task A FAILED")
+                new_place_xy = tester._sample_new_place_target()
+                tester._update_place_marker(new_place_xy)
 
-            # Always reset arm and prepare for Task B
-            new_place_xy = tester._sample_new_place_target()
-            tester._update_place_marker(new_place_xy)
+            # Always hard-reset arm and prepare for Task B
             _hard_reset_for_task_B()
 
             # ---- Task B ----
@@ -337,10 +360,21 @@ def main() -> None:
 
             if success_B:
                 print(f"  ✓ Task B SUCCESS")
+                # Run 100 transition frames with policy B (not recording data)
+                tester._run_transition(
+                    n_frames=100,
+                    policy=tester.policy_B, preprocessor=tester.preprocessor_B,
+                    postprocessor=tester.postprocessor_B,
+                    n_action_steps=tester.n_action_steps_B,
+                    include_obj_pose=tester.include_obj_pose_B,
+                    include_gripper=tester.include_gripper_B,
+                    has_wrist=tester.has_wrist_B,
+                    task_name="Task B (transition)",
+                )
             else:
                 print(f"  ✗ Task B FAILED")
 
-            # Always reset arm and prepare for next Task A
+            # Always hard-reset arm and prepare for next Task A
             _hard_reset_for_task_A()
 
             # per-cycle summary

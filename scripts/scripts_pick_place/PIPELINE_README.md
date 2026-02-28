@@ -168,7 +168,59 @@ The baseline experiment aims to demonstrate:
 
 ---
 
-## 5. Quick Start
+## 5. Success Rate Pipeline
+
+The **success rate pipeline** (`run_success_rate_pipeline.sh`) provides a more
+intuitive evaluation metric: **task success rate over iterations**.
+
+### Workflow
+
+```
+For each iteration (1..10):
+  ┌──────────────────────────────────────────────────────────────┐
+  │  1. Evaluate: Run 50 A-B cycles with arm reset between tasks │
+  │     - After EVERY task (success or fail):                     │
+  │       env.reset() → teleport object → settle                  │
+  │     - Record per-task success/failure                         │
+  │  2. Train A: Finetune with successful rollout data            │
+  │  3. Train B: Finetune with successful rollout data            │
+  └──────────────────────────────────────────────────────────────┘
+  Plot success rate curves (A & B) over iterations
+```
+
+### Inter-Task Reset
+
+Every task execution ends with a **full environment reset** regardless of
+success or failure, ensuring reproducible starting conditions:
+
+| After | Next Task | Reset Action |
+|-------|-----------|-------------|
+| Task A (success or fail) | Task B | `env.reset()` + teleport object to **goal** position |
+| Task B (success or fail) | Task A | `env.reset()` + teleport object to **random table** position |
+
+### Usage
+
+```bash
+# Edit configuration in the script header, then run:
+bash scripts/scripts_pick_place/run_success_rate_pipeline.sh
+
+# Plot results from a record file:
+python scripts/scripts_pick_place/plot_success_rate.py \
+    --record data/success_rate_record.json
+```
+
+### Output
+
+| File | Description |
+|------|-------------|
+| `data/success_rate_record.json` | Per-iteration success rates & metrics |
+| `data/success_rate_curve.png` | Success rate curve plot |
+| `data/sr_eval_A_iterN.npz` | Task A successful rollout data (per iter) |
+| `data/sr_eval_B_iterN.npz` | Task B successful rollout data (per iter) |
+
+---
+
+## 6. Quick Start
 
 ```bash
 # Activate environment
@@ -180,8 +232,14 @@ bash scripts/scripts_pick_place/run_iterative_training.sh
 # Run baseline experiment (without data aggregation)
 bash scripts/scripts_pick_place/run_iterative_training_baseline.sh
 
+# Run success rate pipeline (evaluate → train loop with success rate tracking)
+bash scripts/scripts_pick_place/run_success_rate_pipeline.sh
+
 # Analyze and compare results
 python scripts/scripts_pick_place/8_analyze_rollout_record.py
+
+# Plot success rate curves
+python scripts/scripts_pick_place/plot_success_rate.py --record data/success_rate_record.json
 ```
 
 ---
