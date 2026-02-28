@@ -10,17 +10,16 @@ standard Diffusion Policy trained by script 4.
 KEY DESIGN PRINCIPLES
 =============================================================================
 1. Actions are RELATIVE deltas (not absolute poses)
-   - Policy outputs: [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy,
-     delta_qz, gripper_target]
+   - Policy outputs: [delta_x, delta_y, delta_z, delta_rx, delta_ry,
+     delta_rz, gripper_target]
    - Delta position: added to current position in meters
-   - Delta quaternion: converted to euler degrees, then to radians, added to
-     current euler radians
+   - Delta rotation: Euler angle deltas in radians, added to current Euler angles
    - Gripper target: [0, 1] mapped to [0, GRIPPER_OPEN_ANGLE] degrees
 
 2. Observation format matches training (script 7):
    - observation.image: (3, H, W) from front camera (Orbbec_Gemini_335L)
    - observation.wrist_image: (3, H, W) from wrist camera (Orbbec_Gemini_336)
-   - observation.state: [x, y, z, qw, qx, qy, qz] (7D) or + gripper (8D)
+   - observation.state: [x, y, z, rx, ry, rz] (6D) or + gripper (7D)
    - Image size read from model config, NOT hardcoded
 
 3. Hardware interface matches teleop (script 1):
@@ -818,9 +817,9 @@ class EpisodeData:
     episode_id: str  # Timestamp-based ID (YYYYMMDD_HHMMSS_ffffff)
     fixed_images: list  # List of (H, W, 3) uint8 arrays
     wrist_images: list  # List of (H, W, 3) uint8 arrays
-    ee_pose: list       # List of (7,) arrays [x, y, z, qw, qx, qy, qz]
+    ee_pose: list       # List of (6,) arrays [x, y, z, rx, ry, rz] in meters/radians
     gripper_state: list # List of floats (0=closed, 1=open, normalized)
-    action: list        # List of (8,) arrays [delta_x, ..., delta_qz, gripper_target]
+    action: list        # List of (7,) arrays [delta_x, ..., delta_rz, gripper_target] in meters/radians
     timestamp: list     # List of Unix timestamps
     # Force/torque data (empty for eval, kept for format compatibility)
     joint_angles: list = field(default_factory=list)
@@ -1247,14 +1246,13 @@ def build_observation(
         wrist_tensor = torch.from_numpy(wrist_resized).permute(2, 0, 1).float() / 255.0
         obs["observation.wrist_image"] = wrist_tensor.unsqueeze(0)
 
-    # State vector
-    current_quat = np.array(euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg']))
+    # State vector (Euler angles in radians)
     ee_pose = np.array([pose['x'], pose['y'], pose['z'],
-                        current_quat[0], current_quat[1], current_quat[2], current_quat[3]],
+                        pose['rx'], pose['ry'], pose['rz']],
                        dtype=np.float32)
 
-    state_dim = policy_config.get("state_dim", 8)
-    if state_dim == 8:
+    state_dim = policy_config.get("state_dim", 7)
+    if state_dim == 7:
         gripper_angle = pose.get('gripper_angle', GRIPPER_OPEN_ANGLE)
         gripper_normalized = gripper_angle / GRIPPER_OPEN_ANGLE
         state = np.concatenate([ee_pose, [gripper_normalized]]).astype(np.float32)
@@ -1278,31 +1276,27 @@ def apply_delta_action(
 
     Args:
         pose: Current EE pose dict from PiperController.get_ee_pose_meters()
-        action: 8D action array [delta_x, delta_y, delta_z,
-                delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
+        action: 7D action array [delta_x, delta_y, delta_z,
+                delta_rx, delta_ry, delta_rz, gripper_target]
+                where delta_rpy are in radians.
 
     Returns:
         (target_x, target_y, target_z, target_rx, target_ry, target_rz, gripper_deg)
         where position is in meters, rotation in radians, gripper in degrees [0, 70]
     """
     delta_x, delta_y, delta_z = action[0], action[1], action[2]
-    delta_qw, delta_qx, delta_qy, delta_qz = action[3], action[4], action[5], action[6]
-    gripper_target = action[7]
+    delta_rx, delta_ry, delta_rz = action[3], action[4], action[5]
+    gripper_target = action[6]
 
     # Apply position delta (meters)
     target_x = pose['x'] + delta_x
     target_y = pose['y'] + delta_y
     target_z = pose['z'] + delta_z
 
-    # Apply rotation delta
-    delta_euler_deg = quat_to_euler(delta_qw, delta_qx, delta_qy, delta_qz)
-    delta_rx_rad = np.deg2rad(delta_euler_deg[0])
-    delta_ry_rad = np.deg2rad(delta_euler_deg[1])
-    delta_rz_rad = np.deg2rad(delta_euler_deg[2])
-
-    target_rx = pose['rx'] + delta_rx_rad
-    target_ry = pose['ry'] + delta_ry_rad
-    target_rz = pose['rz'] + delta_rz_rad
+    # Apply rotation delta (radians)
+    target_rx = pose['rx'] + delta_rx
+    target_ry = pose['ry'] + delta_ry
+    target_rz = pose['rz'] + delta_rz
 
     # Gripper: normalized [0, 1] -> degrees [0, GRIPPER_OPEN_ANGLE]
     gripper_deg = float(np.clip(gripper_target, 0.0, 1.0)) * GRIPPER_OPEN_ANGLE
@@ -1568,10 +1562,9 @@ def run_episode(
         # Record observation data
         # =================================================================
         if episode_data is not None:
-            current_quat = euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg'])
             episode_data.ee_pose.append(
                 np.array([pose['x'], pose['y'], pose['z'],
-                          current_quat[0], current_quat[1], current_quat[2], current_quat[3]],
+                          pose['rx'], pose['ry'], pose['rz']],
                          dtype=np.float32)
             )
             episode_data.gripper_state.append(float(gripper_angle) / GRIPPER_OPEN_ANGLE)
@@ -1606,17 +1599,17 @@ def run_episode(
         if action.ndim == 2:
             action = action[0]
 
-        gripper_val = float(action[7]) if len(action) > 7 else 1.0
+        gripper_val = float(action[6]) if len(action) > 6 else 1.0
 
         # Force gripper OPEN for the last 50 steps before max_steps
         remaining_steps = max_steps - step
         if remaining_steps <= 50:
-            action[7] = 1.0
+            action[6] = 1.0
             if remaining_steps == 50:
                 print(f"\033[1;33m  🖐 Step {step}: FORCE GRIPPER OPEN for last 50 steps (remaining={remaining_steps})\033[0m", flush=True)
         # Every-frame gripper close detection: force to 0.3 to ensure tight closure
         elif gripper_val < 0.9:
-            action[7] = 0.3
+            action[6] = 0.3
             print(f"\033[1;31m  ✊ Step {step}: GRIPPER CLOSE  gripper={gripper_val:.3f} (forced to 0.3)\033[0m", flush=True)
 
         # Record action into episode data (after gripper forcing)
@@ -1645,21 +1638,20 @@ def run_episode(
                   f"pos=({pose['x']:.4f}, {pose['y']:.4f}, {pose['z']:.4f}) "
                   f"rot=({np.rad2deg(pose['rx']):.1f}, {np.rad2deg(pose['ry']):.1f}, {np.rad2deg(pose['rz']):.1f})deg")
 
-        # Decompose action deltas
+        # Decompose action deltas (Euler angle format)
         delta_x, delta_y, delta_z = action[0], action[1], action[2]
-        delta_qw, delta_qx, delta_qy, delta_qz = action[3], action[4], action[5], action[6]
-        gripper_target = action[7]
+        delta_rx, delta_ry, delta_rz = action[3], action[4], action[5]
+        gripper_target = action[6]
 
         # Accumulate position deltas
         integrated_pose['x'] += delta_x
         integrated_pose['y'] += delta_y
         integrated_pose['z'] += delta_z
 
-        # Accumulate rotation deltas (quaternion -> euler degrees -> radians)
-        delta_euler_deg = quat_to_euler(delta_qw, delta_qx, delta_qy, delta_qz)
-        integrated_pose['rx'] += np.deg2rad(delta_euler_deg[0])
-        integrated_pose['ry'] += np.deg2rad(delta_euler_deg[1])
-        integrated_pose['rz'] += np.deg2rad(delta_euler_deg[2])
+        # Accumulate rotation deltas (already in radians)
+        integrated_pose['rx'] += delta_rx
+        integrated_pose['ry'] += delta_ry
+        integrated_pose['rz'] += delta_rz
 
         # Gripper: normalized [0, 1] -> degrees [0, GRIPPER_OPEN_ANGLE]
         gripper_deg = float(np.clip(gripper_target, 0.0, 1.0)) * GRIPPER_OPEN_ANGLE
@@ -1705,7 +1697,7 @@ def run_episode(
 
             delta_pos = np.linalg.norm(action[:3])
             cv2.putText(display_frame,
-                        f"Delta: pos={delta_pos:.4f}m  grip={action[7]:.2f}",
+                        f"Delta: pos={delta_pos:.4f}m  grip={action[6]:.2f}",
                         (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
             grip_text = f"Gripper: {gripper_angle:.0f}deg"

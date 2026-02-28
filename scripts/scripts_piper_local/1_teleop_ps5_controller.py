@@ -385,9 +385,9 @@ class EpisodeData:
     episode_id: str  # Timestamp-based ID (YYYYMMDD_HHMMSS_ffffff)
     fixed_images: list  # List of (H, W, 3) uint8 arrays
     wrist_images: list  # List of (H, W, 3) uint8 arrays
-    ee_pose: list       # List of (7,) arrays [x, y, z, qw, qx, qy, qz]
+    ee_pose: list       # List of (6,) arrays [x, y, z, rx, ry, rz] in meters/radians
     gripper_state: list # List of floats (0=closed, 1=open, normalized)
-    action: list        # List of (8,) arrays [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
+    action: list        # List of (7,) arrays [delta_x, delta_y, delta_z, delta_rx, delta_ry, delta_rz, gripper_target] in meters/radians
     timestamp: list     # List of Unix timestamps
     # Force/torque data
     joint_angles: list = field(default_factory=list)   # List of (6,) arrays in radians
@@ -1445,16 +1445,17 @@ class TeleoperationController:
         if target_rz is None:
             target_rz = pose['rz']
         
-        # Get current pose as observation
-        current_pos = np.array([pose['x'], pose['y'], pose['z']])
-        current_quat = np.array(euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg']))
-        ee_pose = np.concatenate([current_pos, current_quat])  # [x, y, z, qw, qx, qy, qz]
+        # Get current pose as observation (Euler angles in radians)
+        ee_pose = np.array([pose['x'], pose['y'], pose['z'],
+                            pose['rx'], pose['ry'], pose['rz']],
+                           dtype=np.float32)  # [x, y, z, rx, ry, rz]
         
         # Get gripper state (normalized 0-1)
         gripper_angle = self.piper.get_gripper_angle() or self._gripper_target_angle
         gripper_state = gripper_angle / GRIPPER_OPEN_ANGLE  # Normalize to [0, 1]
         
-        # Compute action as RELATIVE pose change (delta)
+        # Compute action as RELATIVE pose change (delta) in radians
+        # Action format: [delta_x, delta_y, delta_z, delta_rx, delta_ry, delta_rz, gripper_target]
         if self._prev_pose is not None:
             delta_x = target_x - self._prev_pose['x']
             delta_y = target_y - self._prev_pose['y']
@@ -1463,19 +1464,16 @@ class TeleoperationController:
             delta_rx = target_rx - self._prev_pose['rx']
             delta_ry = target_ry - self._prev_pose['ry']
             delta_rz = target_rz - self._prev_pose['rz']
-            delta_quat = np.array(euler_to_quat(
-                np.rad2deg(delta_rx), np.rad2deg(delta_ry), np.rad2deg(delta_rz)
-            ))
         else:
             # First frame: no delta, set to zero
             delta_x, delta_y, delta_z = 0.0, 0.0, 0.0
-            delta_quat = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+            delta_rx, delta_ry, delta_rz = 0.0, 0.0, 0.0
         
         # Gripper target (normalized)
         gripper_target = self._gripper_target_angle / GRIPPER_OPEN_ANGLE
         
         action = np.array([delta_x, delta_y, delta_z,
-                           delta_quat[0], delta_quat[1], delta_quat[2], delta_quat[3],
+                           delta_rx, delta_ry, delta_rz,
                            gripper_target], dtype=np.float32)
         
         # Get camera frames
@@ -1859,40 +1857,35 @@ class TeleoperationController:
         should_record = (self._step_counter % self._record_interval == 0)
         
         if self._recording and self._current_episode is not None and should_record:
-            # Get current pose as observation
-            current_pos = np.array([pose['x'], pose['y'], pose['z']])
-            current_quat = np.array(euler_to_quat(pose['rx_deg'], pose['ry_deg'], pose['rz_deg']))
-            ee_pose = np.concatenate([current_pos, current_quat])  # [x, y, z, qw, qx, qy, qz]
+            # Get current pose as observation (Euler angles in radians)
+            ee_pose = np.array([pose['x'], pose['y'], pose['z'],
+                                pose['rx'], pose['ry'], pose['rz']],
+                               dtype=np.float32)  # [x, y, z, rx, ry, rz]
             
             # Get gripper state (normalized 0-1)
             gripper_angle = self.piper.get_gripper_angle() or self._gripper_target_angle
             gripper_state = gripper_angle / GRIPPER_OPEN_ANGLE  # Normalize to [0, 1]
             
-            # Compute action as RELATIVE pose change (delta)
-            # Action format: [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
+            # Compute action as RELATIVE pose change (delta) in radians
+            # Action format: [delta_x, delta_y, delta_z, delta_rx, delta_ry, delta_rz, gripper_target]
             if self._prev_pose is not None:
                 delta_x = target_x - self._prev_pose['x']
                 delta_y = target_y - self._prev_pose['y']
                 delta_z = target_z - self._prev_pose['z']
                 
-                # Compute delta rotation as quaternion difference
-                # q_delta = q_target * q_prev^-1  (simplified: just store delta euler converted to quat)
                 delta_rx = target_rx - self._prev_pose['rx']
                 delta_ry = target_ry - self._prev_pose['ry']
                 delta_rz = target_rz - self._prev_pose['rz']
-                delta_quat = np.array(euler_to_quat(
-                    np.rad2deg(delta_rx), np.rad2deg(delta_ry), np.rad2deg(delta_rz)
-                ))
             else:
                 # First frame: no delta, set to zero
                 delta_x, delta_y, delta_z = 0.0, 0.0, 0.0
-                delta_quat = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+                delta_rx, delta_ry, delta_rz = 0.0, 0.0, 0.0
             
             # Gripper target (normalized)
             gripper_target = self._gripper_target_angle / GRIPPER_OPEN_ANGLE
             
             action = np.array([delta_x, delta_y, delta_z,
-                               delta_quat[0], delta_quat[1], delta_quat[2], delta_quat[3],
+                               delta_rx, delta_ry, delta_rz,
                                gripper_target], dtype=np.float32)
             
             # Get camera frames

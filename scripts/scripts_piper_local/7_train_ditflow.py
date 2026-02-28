@@ -45,9 +45,9 @@ Each episode tar.gz contains:
         wrist_cam/          # Wrist camera images (000000.png, ...)
 
 episode_data.npz structure:
-    - ee_pose:       (T, 7)   EE poses [x, y, z, qw, qx, qy, qz] in meters/radians
+    - ee_pose:       (T, 6)   EE poses [x, y, z, rx, ry, rz] in meters/radians
     - gripper_state: (T,)     Gripper state [0-1] (0=closed, 1=open)
-    - action:        (T, 8)   RELATIVE actions [delta_xyz, delta_quat, gripper_target]
+    - action:        (T, 7)   RELATIVE actions [delta_xyz, delta_rpy, gripper_target] in meters/radians
     - timestamp:     (T,)     Timestamps
     - joint_angles:  (T, 6)   Joint angles in radians
     - joint_torques: (T, 6)   Joint torques in N·m
@@ -62,20 +62,20 @@ The observation.state can include different combinations of features:
 
   Flags                      | state_dim | Components
   ---------------------------|-----------|---------------------------
-  (none)                     |     7     | ee_pose(7)
-  --include_gripper          |     8     | ee_pose(7) + gripper(1)
+  (none)                     |     6     | ee_pose(6)
+  --include_gripper          |     7     | ee_pose(6) + gripper(1)
 
-Default: state_dim=7 (ee_pose only)
+Default: state_dim=6 (ee_pose only)
 
 =============================================================================
 ACTION FORMAT (Relative Delta)
 =============================================================================
-The action output is 8D relative delta:
-    [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper_target]
+The action output is 7D relative delta:
+    [delta_x, delta_y, delta_z, delta_rx, delta_ry, delta_rz, gripper_target]
 
 Where:
     - delta_xyz: Position change in meters
-    - delta_quat: Quaternion change (w, x, y, z)
+    - delta_rpy: Euler angle change (rx, ry, rz) in radians
     - gripper_target: Target gripper state [0-1]
 
 =============================================================================
@@ -701,8 +701,8 @@ def load_episode_from_archive(archive_path: Path) -> dict:
         
     Returns:
         Dictionary containing episode data with:
-        - ee_pose: (T, 7) array [x, y, z, qw, qx, qy, qz]
-        - action: (T, 8) array [delta_xyz, delta_quat, gripper]
+        - ee_pose: (T, 6) array [x, y, z, rx, ry, rz] in meters/radians
+        - action: (T, 7) array [delta_xyz, delta_rpy, gripper] in meters/radians
         - gripper_state: (T,) array
         - images: list of (H, W, 3) arrays (fixed camera)
         - wrist_images: list of (H, W, 3) arrays or None
@@ -1116,14 +1116,14 @@ def convert_episodes_to_lerobot_format(
             print(f"        All images will be resized to ({image_height}, {image_width})")
     
     # State dimension
-    state_dim = 7  # ee_pose (7)
-    state_names = ["ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz"]
+    state_dim = 6  # ee_pose (6): [x, y, z, rx, ry, rz]
+    state_names = ["ee_x", "ee_y", "ee_z", "ee_rx", "ee_ry", "ee_rz"]
     if include_gripper:
         state_dim += 1
         state_names.append("gripper")
     
-    # Action dimension: 8 for relative delta
-    action_dim = 8
+    # Action dimension: 7 for relative delta
+    action_dim = 7
     
     # Remove existing dataset if force conversion
     if output_dir.exists() and force:
@@ -1163,7 +1163,7 @@ def convert_episodes_to_lerobot_format(
             "dtype": "float32",
             "shape": (action_dim,),
             "names": ["delta_x", "delta_y", "delta_z", 
-                      "delta_qw", "delta_qx", "delta_qy", "delta_qz", 
+                      "delta_rx", "delta_ry", "delta_rz", 
                       "gripper"],
         },
     }
@@ -1210,8 +1210,8 @@ def convert_episodes_to_lerobot_format(
         
         # Extract data
         images = ep['images']  # list of (H, W, 3) uint8
-        ee_pose = ep['ee_pose']  # (T, 7)
-        actions = ep['action']  # (T, 8) - RELATIVE delta actions
+        ee_pose = ep['ee_pose']  # (T, 6)
+        actions = ep['action']  # (T, 7) - RELATIVE delta actions
         gripper_states = ep['gripper_state']  # (T,)
         wrist_images = ep.get('wrist_images', None)
         
@@ -1229,7 +1229,7 @@ def convert_episodes_to_lerobot_format(
                 state = ee_pose[t]
             
             # Action: use relative delta directly from the dataset
-            action = actions[t]  # (8,) [delta_xyz, delta_quat, gripper]
+            action = actions[t]  # (7,) [delta_xyz, delta_rpy, gripper]
             
             frame = {
                 "observation.image": img,
@@ -1380,7 +1380,7 @@ def train_with_lerobot_api(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Determine state dimension
-    state_dim = 7  # base: ee_pose (7)
+    state_dim = 6  # base: ee_pose (6)
     if include_gripper:
         state_dim += 1
     
@@ -1406,7 +1406,7 @@ def train_with_lerobot_api(
     output_features = {
         "action": PolicyFeature(
             type=FeatureType.ACTION,
-            shape=(8,),  # Relative delta action
+            shape=(7,),  # Relative delta action
         ),
     }
     
@@ -1579,7 +1579,7 @@ def train_with_lerobot_api(
     print(f"  Has wrist camera: {has_wrist}")
     print(f"  Include gripper: {include_gripper}")
     print(f"  State dim: {state_dim}")
-    print(f"  Action dim: 8 (relative delta)")
+    print(f"  Action dim: 7 (relative delta)")
     print(f"  Crop ratio: {tuple(args.crop_ratio)} -> crop shape: {crop_shape}")
     print(f"  Horizon: {args.horizon}")
     print(f"  N obs steps: {args.n_obs_steps}")

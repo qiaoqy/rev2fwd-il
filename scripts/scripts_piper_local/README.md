@@ -126,24 +126,25 @@ place_z = table_height  # Same as plate center z
 
 | SDK Format | Policy Format |
 |------------|---------------|
-| Euler XYZ (RX, RY, RZ) in 0.001° units | Quaternion (qw, qx, qy, qz) |
+| Euler XYZ (RX, RY, RZ) in 0.001° units | Euler XYZ (rx, ry, rz) in radians |
 
-**Conversion**: Use `scipy.spatial.transform.Rotation` to convert between formats.
+**Conversion**: The Piper SDK reports orientation as Euler angles in 0.001° units. The policy stores and operates on Euler angles in **radians**.
 
 ```python
-from scipy.spatial.transform import Rotation as R
+import numpy as np
 
-def euler_to_quat(rx_deg, ry_deg, rz_deg):
-    """Convert Euler XYZ (degrees) to quaternion (w, x, y, z)."""
-    rot = R.from_euler('xyz', [rx_deg, ry_deg, rz_deg], degrees=True)
-    q_xyzw = rot.as_quat()  # [x, y, z, w]
-    return (q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2])  # (w, x, y, z)
+# SDK → Policy: convert 0.001° to radians
+rx_rad = pose.RX_axis / 1000.0 * np.pi / 180.0
+ry_rad = pose.RY_axis / 1000.0 * np.pi / 180.0
+rz_rad = pose.RZ_axis / 1000.0 * np.pi / 180.0
 
-def quat_to_euler(qw, qx, qy, qz):
-    """Convert quaternion (w, x, y, z) to Euler XYZ (degrees)."""
-    rot = R.from_quat([qx, qy, qz, qw])  # scipy uses [x, y, z, w]
-    return rot.as_euler('xyz', degrees=True)  # [rx, ry, rz]
+# Policy → SDK: convert radians to 0.001° (integer)
+rx_sdk = int(rx_rad * 180.0 / np.pi * 1000)
+ry_sdk = int(ry_rad * 180.0 / np.pi * 1000)
+rz_sdk = int(rz_rad * 180.0 / np.pi * 1000)
 ```
+
+> **Note**: No quaternion conversion is needed. The pipeline uses Euler angles end-to-end, which avoids the overhead of quaternion ↔ Euler roundtrips and saves 1 dimension in state/action representation.
 
 ---
 
@@ -155,14 +156,14 @@ def quat_to_euler(qw, qx, qy, qz):
 |-------|-------|------|-------------|
 | `fixed_camera_rgb` | (H, W, 3) | uint8 | RGB image from fixed Orbbec camera |
 | `wrist_camera_rgb` | (H, W, 3) | uint8 | RGB image from wrist camera |
-| `ee_pose` | (7,) | float32 | End-effector pose [x, y, z, qw, qx, qy, qz] |
+| `ee_pose` | (6,) | float32 | End-effector pose [x, y, z, rx, ry, rz] (meters + radians) |
 | `gripper_state` | (1,) | float32 | Gripper position (0=closed, 1=open) |
 
 ### 4.2 Action Space
 
 | Field | Shape | Type | Description |
 |-------|-------|------|-------------|
-| `target_ee_pose` | (7,) | float32 | Target end-effector pose [x, y, z, qw, qx, qy, qz] |
+| `delta_ee_pose` | (6,) | float32 | Delta end-effector pose [Δx, Δy, Δz, Δrx, Δry, Δrz] (meters + radians) |
 | `gripper_action` | (1,) | float32 | Gripper command (0=close, 1=open) |
 
 ### 4.3 Episode Data Structure (NPZ Format)
@@ -172,9 +173,9 @@ def quat_to_euler(qw, qx, qy, qz):
     # Per-timestep data (T = episode length)
     "fixed_images": (T, 480, 640, 3),   # Fixed camera RGB (uint8)
     "wrist_images": (T, 480, 640, 3),   # Wrist camera RGB (uint8)
-    "ee_pose": (T, 7),                   # EE pose [x, y, z, qw, qx, qy, qz]
+    "ee_pose": (T, 6),                   # EE pose [x, y, z, rx, ry, rz] (meters + radians)
     "gripper_state": (T,),               # Gripper position
-    "action": (T, 8),                    # Target [ee_pose(7), gripper(1)]
+    "action": (T, 7),                    # Delta [Δx, Δy, Δz, Δrx, Δry, Δrz, gripper]
     "fsm_state": (T,),                   # FSM state index (int)
     "timestamp": (T,),                   # Unix timestamp (float)
     
@@ -382,11 +383,11 @@ For **relative delta actions**, the reversal process:
    # Position delta
    action_rev[t][:3] = ee_pose_rev[t+1][:3] - ee_pose_rev[t][:3]
    
-   # Quaternion delta: rotation from quat[t] to quat[t+1]
-   action_rev[t][3:7] = quat_inverse(quat[t]) * quat[t+1]
+   # Euler angle delta (with angle wrapping to [-π, π])
+   action_rev[t][3:6] = wrap_angle(ee_pose_rev[t+1][3:6] - ee_pose_rev[t][3:6])
    
    # Gripper target: the gripper state we're moving TO
-   action_rev[t][7] = gripper_state_rev[t+1]
+   action_rev[t][6] = gripper_state_rev[t+1]
    ```
 3. **Verify** that integrating actions recovers the trajectory (error should be ~0)
 
@@ -456,7 +457,7 @@ Expected integration error: **< 1e-6 meters** (numerical precision)
 `4_train_diffusion.py` trains a vision-based **Diffusion Policy** using LeRobot on the teleoperation data collected by Script 1 (or time-reversed data from Script 3).
 
 **Key Features**:
-- Uses **relative delta actions** (position + quaternion + gripper)
+- Uses **relative delta actions** (position + Euler angles + gripper)
 - Supports dual cameras (fixed + wrist) with automatic resolution alignment
 - LeRobot v3.0 dataset format with video encoding
 - Multi-GPU training support via `torchrun`
@@ -484,13 +485,13 @@ episode_XXXX/
 
 ### 9.3 Action Format
 
-The script uses **8D relative delta actions**:
+The script uses **7D relative delta actions**:
 
 | Index | Field | Description |
 |-------|-------|-------------|
 | 0-2 | `delta_xyz` | Position change in meters |
-| 3-6 | `delta_quat` | Quaternion change (qw, qx, qy, qz) |
-| 7 | `gripper` | Target gripper state [0-1] |
+| 3-5 | `delta_rpy` | Euler angle change (Δrx, Δry, Δrz) in radians |
+| 6 | `gripper` | Target gripper state [0-1] |
 
 ### 9.4 Observation Format
 
@@ -498,7 +499,7 @@ The script uses **8D relative delta actions**:
 |---------|-------|-------------|
 | `observation.image` | (3, H, W) | Fixed camera RGB |
 | `observation.wrist_image` | (3, H, W) | Wrist camera RGB (optional) |
-| `observation.state` | (7,) or (8,) | EE pose (+ gripper if `--include_gripper`) |
+| `observation.state` | (6,) or (7,) | EE pose [x,y,z,rx,ry,rz] (+ gripper if `--include_gripper`) |
 
 **Note**: If cameras have different resolutions, all images are resized to a common size (default: 240×320) during conversion.
 
@@ -511,7 +512,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
     --out runs/diffusion_piper_teleop \
     --batch_size 64 --steps 50000 --wandb
 
-# With gripper state in observation (state_dim=8)
+# With gripper state in observation (state_dim=7)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/4_train_diffusion.py \
     --dataset data/pick_place_piper \
     --out runs/diffusion_piper_teleop \
@@ -645,7 +646,7 @@ The diffusion policy predicts **8-step action chunks**. Execution strategy:
 ```python
 # Inference every N steps (default N=8)
 if step % n_action_steps == 0:
-    action_chunk = policy.predict(observation)  # Shape: (8, 8)
+    action_chunk = policy.predict(observation)  # Shape: (8, 7)
 
 # Execute current action from chunk
 current_action = action_chunk[step % n_action_steps]
@@ -770,7 +771,7 @@ This script provides the **same functionality as Script 4** (Diffusion Policy) b
 | Config class | `DiffusionConfig` | `DiTFlowConfig` |
 
 **Key Features** (same as Script 4):
-- Uses **relative delta actions** (position + quaternion + gripper)
+- Uses **relative delta actions** (position + Euler angles + gripper)
 - Supports dual cameras (fixed + wrist) with automatic resolution alignment
 - LeRobot v3.0 dataset format with video encoding
 - Multi-GPU training via `torchrun`
@@ -803,7 +804,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --out runs/ditflow_piper_teleop \
     --batch_size 64 --steps 50000 --wandb
 
-# With gripper state in observation (state_dim=8)
+# With gripper state in observation (state_dim=7)
 CUDA_VISIBLE_DEVICES=0 python scripts/scripts_piper_local/7_train_ditflow.py \
     --dataset data/pick_place_piper \
     --out runs/ditflow_piper_teleop \
@@ -1025,7 +1026,7 @@ python 8_eval_ditflow_piper.py \
 │  Fixed Camera    │───▶│  build_          │───▶│  DiT Flow       │
 │  Wrist Camera    │    │  observation()   │    │  Policy         │
 │  Robot State     │    │  normalize +     │    │  (Flow Matching │
-│  (7D EE pose)    │    │  preprocess      │    │   Euler ODE)    │
+│  (6D EE pose)    │    │  preprocess      │    │   Euler ODE)    │
 └─────────────────┘    └──────────────────┘    └────────┬────────┘
                                                         │
                                                         ▼
@@ -1200,7 +1201,7 @@ p.GripperCtrl(0, 1000, 0x01, 0)  # Close
 
 3. **Verify coordinate convention**
    - Piper SDK uses **0.001mm** for position, **0.001°** for angles
-   - Policy uses **meters** and **quaternion (w,x,y,z)**
+   - Policy uses **meters** and **Euler angles (rx,ry,rz) in radians**
 
 ---
 

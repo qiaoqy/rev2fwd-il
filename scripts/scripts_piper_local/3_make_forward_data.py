@@ -27,8 +27,8 @@ INPUT/OUTPUT DATA FORMATS
 =============================================================================
 INPUT (from script 1_teleop_ps5_controller.py):
     Directory with tar.gz archives containing teleop trajectories
-    - ee_pose: (T, 7) [x, y, z, qw, qx, qy, qz]
-    - action: (T, 8) [delta_x, delta_y, delta_z, delta_qw, delta_qx, delta_qy, delta_qz, gripper]
+    - ee_pose: (T, 6) [x, y, z, rx, ry, rz] in meters/radians
+    - action: (T, 7) [delta_x, delta_y, delta_z, delta_rx, delta_ry, delta_rz, gripper] in meters/radians
     - images: fixed_cam/*.png, wrist_cam/*.png
 
 OUTPUT:
@@ -77,115 +77,19 @@ import tarfile
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
 
 # =============================================================================
-# Quaternion Utilities
+# Angle Wrapping Utility
 # =============================================================================
 
-def euler_to_quat(rx_deg: float, ry_deg: float, rz_deg: float) -> Tuple[float, float, float, float]:
-    """Convert Euler XYZ (degrees) to quaternion (w, x, y, z)."""
-    rot = R.from_euler('xyz', [rx_deg, ry_deg, rz_deg], degrees=True)
-    q_xyzw = rot.as_quat()  # [x, y, z, w]
-    return (q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2])  # (w, x, y, z)
-
-
-def quat_to_euler(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, float, float]:
-    """Convert quaternion (w, x, y, z) to Euler XYZ (degrees)."""
-    rot = R.from_quat([qx, qy, qz, qw])  # scipy uses [x, y, z, w]
-    return tuple(rot.as_euler('xyz', degrees=True))  # [rx, ry, rz]
-
-
-def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Multiply two quaternions (w, x, y, z format).
-    
-    Args:
-        q1: First quaternion [w, x, y, z]
-        q2: Second quaternion [w, x, y, z]
-        
-    Returns:
-        Product quaternion [w, x, y, z]
-    """
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2
-    ])
-
-
-def quat_inverse(q: np.ndarray) -> np.ndarray:
-    """Compute inverse of a quaternion (w, x, y, z format).
-    
-    For unit quaternions, inverse is just conjugate.
-    """
-    return np.array([q[0], -q[1], -q[2], -q[3]])
-
-
-def compute_delta_quat(q_prev: np.ndarray, q_curr: np.ndarray) -> np.ndarray:
-    """Compute the delta quaternion such that q_curr = q_prev * delta.
-    
-    Args:
-        q_prev: Previous quaternion [w, x, y, z]
-        q_curr: Current quaternion [w, x, y, z]
-        
-    Returns:
-        Delta quaternion [w, x, y, z]
-    """
-    # delta = q_prev^(-1) * q_curr
-    q_prev_inv = quat_inverse(q_prev)
-    delta = quat_multiply(q_prev_inv, q_curr)
-    
-    # Normalize to ensure unit quaternion
-    norm = np.linalg.norm(delta)
-    if norm > 1e-8:
-        delta = delta / norm
-    
-    return delta
-
-
-def compute_delta_quat_euler(q_prev: np.ndarray, q_curr: np.ndarray) -> np.ndarray:
-    """Compute delta quaternion using Euler-difference method.
-    
-    This matches how script 1 (teleop) computes action quaternion deltas:
-      1. Convert both quaternions to Euler XYZ (degrees)
-      2. Take the Euler angle difference
-      3. Wrap to [-180, 180] to handle angle discontinuities
-      4. Convert the difference back to a quaternion
-    
-    This is NOT the same as proper quaternion multiplication (q_prev^-1 * q_curr),
-    but it's consistent with how script 8 (eval) applies the delta:
-      delta_euler_deg = quat_to_euler(delta_quat)
-      target_euler_rad = current_euler_rad + deg2rad(delta_euler_deg)
-    
-    Using the proper quaternion method would produce deltas that, when decoded
-    back to Euler and added, give WRONG orientation targets.
-    
-    Args:
-        q_prev: Previous quaternion [w, x, y, z]
-        q_curr: Current quaternion [w, x, y, z]
-        
-    Returns:
-        Delta quaternion [w, x, y, z] encoding the Euler angle difference
-    """
-    euler_prev = np.array(quat_to_euler(q_prev[0], q_prev[1], q_prev[2], q_prev[3]))  # degrees
-    euler_curr = np.array(quat_to_euler(q_curr[0], q_curr[1], q_curr[2], q_curr[3]))  # degrees
-    
-    delta_euler_deg = euler_curr - euler_prev
-    
-    # Wrap to [-180, 180] to handle angle discontinuities
-    # e.g., going from 179° to -179° should be a delta of -2°, not +358°
-    delta_euler_deg = (delta_euler_deg + 180.0) % 360.0 - 180.0
-    
-    delta_quat = np.array(euler_to_quat(delta_euler_deg[0], delta_euler_deg[1], delta_euler_deg[2]))
-    return delta_quat
+def wrap_angle(angle_rad: np.ndarray) -> np.ndarray:
+    """Wrap angle to [-pi, pi]."""
+    return (angle_rad + np.pi) % (2 * np.pi) - np.pi
 
 
 # =============================================================================
@@ -374,45 +278,41 @@ def reverse_episode(episode: dict, verbose: bool = False) -> dict:
         print(f"  Original episode length: {T}")
     
     # Get original data
-    ee_pose_orig = episode['ee_pose']  # (T, 7): [x, y, z, qw, qx, qy, qz]
+    ee_pose_orig = episode['ee_pose']  # (T, 6): [x, y, z, rx, ry, rz] in meters/radians
     gripper_state_orig = episode['gripper_state']  # (T,)
-    action_orig = episode['action']  # (T, 8): [dx, dy, dz, dqw, dqx, dqy, dqz, gripper]
+    action_orig = episode['action']  # (T, 7): [dx, dy, dz, drx, dry, drz, gripper]
     timestamp_orig = episode['timestamp']  # (T,)
     
     # Reverse all sequences in time
-    ee_pose_rev = ee_pose_orig[::-1].copy()  # (T, 7)
+    ee_pose_rev = ee_pose_orig[::-1].copy()  # (T, 6)
     gripper_state_rev = gripper_state_orig[::-1].copy()  # (T,)
     
     # Reverse the original action's gripper targets (user commands: 0 or 1)
     # IMPORTANT: Do NOT use gripper_state (measured position) because it can be
     # e.g. 0.6 when gripping an object even though the command was 0 (close).
-    gripper_targets_rev = action_orig[::-1, 7].copy()  # (T,)
+    gripper_targets_rev = action_orig[::-1, 6].copy()  # (T,) - gripper is at index 6 now
     
     # Compute new relative actions from reversed ee_pose
     # action_rev[t] should transform ee_pose_rev[t] to ee_pose_rev[t+1]
-    action_rev = np.zeros((T, 8), dtype=np.float32)
+    action_rev = np.zeros((T, 7), dtype=np.float32)
     
     for t in range(T - 1):
         # Position delta: xyz[t+1] - xyz[t]
         delta_xyz = ee_pose_rev[t + 1, :3] - ee_pose_rev[t, :3]
         
-        # Quaternion delta using Euler-difference method (matches script 1 & 8 pipeline)
-        # IMPORTANT: Do NOT use compute_delta_quat() here (proper quaternion algebra),
-        # because the eval pipeline (script 8) decodes delta_quat back to Euler and
-        # adds to current Euler. This requires the delta to be an Euler-difference
-        # encoded as quaternion, not a proper quaternion rotation delta.
-        quat_prev = ee_pose_rev[t, 3:7]
-        quat_curr = ee_pose_rev[t + 1, 3:7]
-        delta_quat = compute_delta_quat_euler(quat_prev, quat_curr)
+        # Rotation delta: simple Euler angle subtraction with wrapping
+        delta_euler = ee_pose_rev[t + 1, 3:6] - ee_pose_rev[t, 3:6]
+        # Wrap to [-pi, pi] to handle angle discontinuities
+        delta_euler = wrap_angle(delta_euler)
         
         action_rev[t, :3] = delta_xyz
-        action_rev[t, 3:7] = delta_quat
-        action_rev[t, 7] = gripper_targets_rev[t]
+        action_rev[t, 3:6] = delta_euler
+        action_rev[t, 6] = gripper_targets_rev[t]
     
-    # Last action: no movement (or could repeat second-to-last)
+    # Last action: no movement
     action_rev[T - 1, :3] = 0.0
-    action_rev[T - 1, 3:7] = [1.0, 0.0, 0.0, 0.0]  # Identity quaternion
-    action_rev[T - 1, 7] = gripper_targets_rev[T - 1]
+    action_rev[T - 1, 3:6] = 0.0  # Zero rotation delta
+    action_rev[T - 1, 6] = gripper_targets_rev[T - 1]
     
     # Create relative timestamps (reset to start from 0)
     dt = np.mean(np.diff(timestamp_orig)) if T > 1 else 0.05
@@ -458,7 +358,16 @@ def reverse_episode(episode: dict, verbose: bool = False) -> dict:
             integrated[t + 1] = integrated[t] + action_rev[t, :3]
         
         error = np.abs(integrated - ee_pose_rev[:, :3]).max()
-        print(f"  Max integration error: {error:.6f} m")
+        print(f"  Max position integration error: {error:.6f} m")
+        
+        # Verify rotation integration
+        integrated_rot = np.zeros((T, 3), dtype=np.float32)
+        integrated_rot[0] = ee_pose_rev[0, 3:6]
+        for t in range(T - 1):
+            integrated_rot[t + 1] = integrated_rot[t] + action_rev[t, 3:6]
+        
+        rot_error = np.abs(integrated_rot - ee_pose_rev[:, 3:6]).max()
+        print(f"  Max rotation integration error: {np.rad2deg(rot_error):.4f} deg")
     
     return result
 
@@ -514,28 +423,19 @@ def verify_reversal(original: dict, reversed_ep: dict) -> bool:
     if not integration_ok:
         print(f"  WARNING: Position integration error too high: {integration_error:.6f} m")
     
-    # Check rotation action integration (Euler-based, matching eval pipeline)
-    # This verifies that: euler_curr = euler_prev + quat_to_euler(delta_quat)
+    # Check rotation action integration (Euler angle addition)
     euler_error_max = 0.0
+    integrated_rot = np.zeros(3, dtype=np.float64)
+    integrated_rot[:] = ee_pose_rev[0, 3:6]
     for t in range(T - 1):
-        quat_prev = ee_pose_rev[t, 3:7]
-        quat_curr = ee_pose_rev[t + 1, 3:7]
-        delta_quat = action_rev[t, 3:7]
-        
-        # Decode delta the same way eval (script 8) does
-        euler_prev = np.array(quat_to_euler(quat_prev[0], quat_prev[1], quat_prev[2], quat_prev[3]))
-        euler_curr = np.array(quat_to_euler(quat_curr[0], quat_curr[1], quat_curr[2], quat_curr[3]))
-        delta_euler = np.array(quat_to_euler(delta_quat[0], delta_quat[1], delta_quat[2], delta_quat[3]))
-        
-        reconstructed = euler_prev + delta_euler
-        error = np.abs(reconstructed - euler_curr)
-        # Handle angle wrapping: error near 360 means correct wrapping
-        error = np.minimum(error, 360.0 - error)
+        integrated_rot += action_rev[t, 3:6]
+        actual_rot = ee_pose_rev[t + 1, 3:6]
+        error = np.abs(wrap_angle(integrated_rot - actual_rot))
         euler_error_max = max(euler_error_max, error.max())
     
-    rotation_ok = euler_error_max < 1.0  # Less than 1 degree tolerance
+    rotation_ok = euler_error_max < np.deg2rad(1.0)  # Less than 1 degree tolerance
     if not rotation_ok:
-        print(f"  WARNING: Rotation integration error too high: {euler_error_max:.4f} deg")
+        print(f"  WARNING: Rotation integration error too high: {np.rad2deg(euler_error_max):.4f} deg")
     
     return pos_check1 and pos_check2 and integration_ok and rotation_ok
 
