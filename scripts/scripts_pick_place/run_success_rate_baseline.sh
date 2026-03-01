@@ -1,22 +1,21 @@
 #!/bin/bash
 # =============================================================================
-# Success Rate Pipeline: Iterative Evaluate → Train → Evaluate → ...
+# Success Rate BASELINE Pipeline: Train with SAME data (no new rollout data)
 # =============================================================================
 #
-# This script orchestrates a loop of:
-#   1. Evaluate: Run 50 A-B cycles with failure recovery, record success rates
-#   2. Train: Finetune Policy A & B using only the SUCCESSFUL rollout data
-#   3. Repeat for 10 iterations
-#   4. Plot success rate curves
+# This is a control/ablation experiment for run_success_rate_pipeline.sh.
+# It follows the same evaluate → train → evaluate loop, BUT:
+#   - After evaluation, does NOT add successful rollout data to training set
+#   - Continues training with the ORIGINAL dataset only
+#   - This isolates the effect of additional training steps from new data
 #
-# Key difference from run_iterative_training.sh:
-#   - Uses 9_eval_with_recovery.py which does NOT break on failure
-#   - Tracks success rate (%) instead of consecutive successes / task cost
-#   - Always runs the full num_cycles regardless of failures
-#   - Generates a success rate curve plot at the end
+# By comparing this baseline's success rate curve with the main pipeline,
+# we can determine whether improvements come from:
+#   (a) new rollout data augmentation, or
+#   (b) simply training for more steps
 #
 # Usage:
-#   bash scripts/scripts_pick_place/run_success_rate_pipeline.sh
+#   CUDA_VISIBLE_DEVICES=5,6 bash scripts/scripts_pick_place/run_success_rate_baseline.sh
 #
 # Configuration:
 #   Edit the variables in the "Configuration" section below.
@@ -47,11 +46,11 @@ N_ACTION_STEPS=16           # Action steps per inference
 POLICY_A_DIR="runs/PP_A_circle"
 POLICY_B_DIR="runs/PP_B_circle"
 
-# Working directories (created/managed by this script)
-POLICY_A_DIR_TEMP="runs/PP_A_success_rate_temp"
-POLICY_B_DIR_TEMP="runs/PP_B_success_rate_temp"
-POLICY_A_DIR_LAST="runs/PP_A_success_rate_last"
-POLICY_B_DIR_LAST="runs/PP_B_success_rate_last"
+# Working directories — use _baseline suffix to avoid collision with main pipeline
+POLICY_A_DIR_TEMP="runs/PP_A_baseline_temp"
+POLICY_B_DIR_TEMP="runs/PP_B_baseline_temp"
+POLICY_A_DIR_LAST="runs/PP_A_baseline_last"
+POLICY_B_DIR_LAST="runs/PP_B_baseline_last"
 
 # Original LeRobot datasets
 LEROBOT_A="${POLICY_A_DIR}/lerobot_dataset"
@@ -61,20 +60,25 @@ LEROBOT_B="${POLICY_B_DIR}/lerobot_dataset"
 GOAL_X=0.5
 GOAL_Y=0.0
 
-# GPU configuration
-DATA_COLLECTION_GPU=0                                      # Single GPU for eval rollout
-TRAINING_GPUS="${CUDA_VISIBLE_DEVICES:-0,4,5,6}"           # Multi-GPU for training
+# GPU configuration — prefer idle GPUs 5 and 6
+DATA_COLLECTION_GPU=5                                      # Single GPU for eval rollout
+TRAINING_GPUS="${CUDA_VISIBLE_DEVICES:-5,6}"               # Multi-GPU for training
 NUM_TRAINING_GPUS=$(echo "$TRAINING_GPUS" | tr ',' '\n' | wc -l)
 
 echo "Data collection GPU: $DATA_COLLECTION_GPU"
 echo "Training GPUs: $TRAINING_GPUS (total: $NUM_TRAINING_GPUS)"
 
+# NCCL robustness settings
+export NCCL_P2P_DISABLE=1
+export NCCL_TIMEOUT=1800
+export TORCH_NCCL_BLOCKING_WAIT=1
+
 # Flags
 HEADLESS="--headless"
 SAVE_VIDEO=""  # Set to "--save_video" to save videos of each eval
 
-# Output record
-RECORD_FILE="data/success_rate_record.json"
+# Output record — separate from main pipeline
+RECORD_FILE="data/success_rate_baseline_record.json"
 
 # =============================================================================
 # Helper Functions
@@ -121,7 +125,7 @@ init_record() {
     python3 -c "
 import json
 data = {
-    'description': 'Success rate tracking for iterative evaluate-train pipeline',
+    'description': 'BASELINE: Success rate tracking with NO new rollout data (training steps only ablation)',
     'created_at': '$timestamp',
     'config': {
         'max_iterations': $MAX_ITERATIONS,
@@ -134,6 +138,8 @@ data = {
         'policy_A_source': '$POLICY_A_DIR',
         'policy_B_source': '$POLICY_B_DIR',
         'goal_xy': [$GOAL_X, $GOAL_Y],
+        'baseline': True,
+        'note': 'No new rollout data added. Training continues on original dataset only.',
     },
     'iterations': []
 }
@@ -220,7 +226,7 @@ PYEOF
 # =============================================================================
 # Pre-flight Checks
 # =============================================================================
-print_header "Pre-flight Checks"
+print_header "Pre-flight Checks (BASELINE)"
 
 for dir in "$LEROBOT_A" "$LEROBOT_B"; do
     if [ ! -d "$dir" ]; then
@@ -244,7 +250,7 @@ echo "✓ Datasets and checkpoints found"
 # =============================================================================
 # Configuration Summary
 # =============================================================================
-print_header "Configuration Summary"
+print_header "Configuration Summary (BASELINE — no new data)"
 echo "  MAX_ITERATIONS:     $MAX_ITERATIONS"
 echo "  NUM_CYCLES:         $NUM_CYCLES (per evaluation)"
 echo "  STEPS_PER_ITER:     $STEPS_PER_ITER"
@@ -256,11 +262,13 @@ echo ""
 echo "  POLICY_A_DIR:       $POLICY_A_DIR"
 echo "  POLICY_B_DIR:       $POLICY_B_DIR"
 echo "  GOAL:               ($GOAL_X, $GOAL_Y)"
+echo ""
+echo "  ** BASELINE MODE: Training uses ORIGINAL data only (no rollout augmentation) **"
 
 # =============================================================================
 # Initialize Record
 # =============================================================================
-print_header "Initializing Record"
+print_header "Initializing Record (BASELINE)"
 init_record
 
 # =============================================================================
@@ -298,11 +306,11 @@ echo "✓ Initialized"
 # Main Loop
 # =============================================================================
 for iter in $(seq 1 $MAX_ITERATIONS); do
-    print_header "========== Iteration $iter / $MAX_ITERATIONS =========="
+    print_header "========== BASELINE Iteration $iter / $MAX_ITERATIONS =========="
 
-    # Output paths for this iteration
-    ROLLOUT_A="data/sr_eval_A_iter${iter}.npz"
-    ROLLOUT_B="data/sr_eval_B_iter${iter}.npz"
+    # Output paths for this iteration (separate from main pipeline)
+    ROLLOUT_A="data/sr_baseline_eval_A_iter${iter}.npz"
+    ROLLOUT_B="data/sr_baseline_eval_B_iter${iter}.npz"
     STATS_FILE="${ROLLOUT_A%.npz}.stats.json"
 
     # Current checkpoints (from temp = previous iteration's output)
@@ -348,35 +356,22 @@ print(f\"  Task B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s
     fi
 
     # =====================================================================
-    # Step 2: TRAIN Policy A (finetune with successful rollout data)
+    # Step 2: TRAIN Policy A (NO new data — original dataset only)
     # =====================================================================
-    print_section "[Step 2] Finetuning Policy A ($STEPS_PER_ITER steps)"
+    print_section "[Step 2] Finetuning Policy A ($STEPS_PER_ITER steps, ORIGINAL data only)"
 
     rm -rf "$POLICY_A_DIR_LAST"
     mkdir -p "$POLICY_A_DIR_LAST"
 
-    # ---- 2a: Prepare dataset (merge rollout data if available) and copy checkpoint ----
-    if [ -f "$ROLLOUT_A" ]; then
-        echo "  [2a] Merging rollout data into dataset + copying checkpoint..."
-        python scripts/scripts_pick_place/7_finetune_with_rollout.py \
-            --original_lerobot "$POLICY_A_DIR_TEMP/lerobot_dataset" \
-            --rollout_data "$ROLLOUT_A" \
-            --checkpoint "$CHECKPOINT_A" \
-            --out "$POLICY_A_DIR_LAST" \
-            --prepare_only \
-            --include_obj_pose \
-            --include_gripper
-        echo "  ✓ Rollout data merged and checkpoint copied for Policy A"
-    else
-        echo "  [2a] No Task A rollout data — copying original dataset and checkpoint"
-        python scripts/scripts_pick_place/7_finetune_with_rollout.py \
-            --original_lerobot "$POLICY_A_DIR_TEMP/lerobot_dataset" \
-            --checkpoint "$CHECKPOINT_A" \
-            --out "$POLICY_A_DIR_LAST" \
-            --prepare_only \
-            --include_obj_pose \
-            --include_gripper
-    fi
+    # ---- 2a: Copy ORIGINAL dataset and checkpoint (NO rollout_data!) ----
+    echo "  [2a] Copying original dataset and checkpoint (NO new rollout data)"
+    python scripts/scripts_pick_place/7_finetune_with_rollout.py \
+        --original_lerobot "$POLICY_A_DIR_TEMP/lerobot_dataset" \
+        --checkpoint "$CHECKPOINT_A" \
+        --out "$POLICY_A_DIR_LAST" \
+        --prepare_only \
+        --include_obj_pose \
+        --include_gripper
 
     # ---- 2b: Copy wandb directory for resumed logging ----
     if [ -d "$POLICY_A_DIR_TEMP/checkpoints/wandb" ]; then
@@ -420,7 +415,7 @@ print(f\"  Task B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s
         --include_gripper \
         --wandb
 
-    echo "  ✓ Policy A finetuned"
+    echo "  ✓ Policy A finetuned (original data only)"
 
     # ---- 2d: Rotate directories ----
     rm -rf "$POLICY_A_DIR_TEMP"
@@ -428,37 +423,24 @@ print(f\"  Task B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s
     echo "  ✓ last → temp"
 
     # =====================================================================
-    # Step 3: TRAIN Policy B (finetune with successful rollout data)
+    # Step 3: TRAIN Policy B (NO new data — original dataset only)
     # =====================================================================
-    print_section "[Step 3] Finetuning Policy B ($STEPS_PER_ITER steps)"
+    print_section "[Step 3] Finetuning Policy B ($STEPS_PER_ITER steps, ORIGINAL data only)"
 
     CHECKPOINT_B=$(get_checkpoint_path "$POLICY_B_DIR_TEMP")
 
     rm -rf "$POLICY_B_DIR_LAST"
     mkdir -p "$POLICY_B_DIR_LAST"
 
-    # ---- 3a: Prepare dataset (merge rollout data if available) and copy checkpoint ----
-    if [ -f "$ROLLOUT_B" ]; then
-        echo "  [3a] Merging rollout data into dataset + copying checkpoint..."
-        python scripts/scripts_pick_place/7_finetune_with_rollout.py \
-            --original_lerobot "$POLICY_B_DIR_TEMP/lerobot_dataset" \
-            --rollout_data "$ROLLOUT_B" \
-            --checkpoint "$CHECKPOINT_B" \
-            --out "$POLICY_B_DIR_LAST" \
-            --prepare_only \
-            --include_obj_pose \
-            --include_gripper
-        echo "  ✓ Rollout data merged and checkpoint copied for Policy B"
-    else
-        echo "  [3a] No Task B rollout data — copying original dataset and checkpoint"
-        python scripts/scripts_pick_place/7_finetune_with_rollout.py \
-            --original_lerobot "$POLICY_B_DIR_TEMP/lerobot_dataset" \
-            --checkpoint "$CHECKPOINT_B" \
-            --out "$POLICY_B_DIR_LAST" \
-            --prepare_only \
-            --include_obj_pose \
-            --include_gripper
-    fi
+    # ---- 3a: Copy ORIGINAL dataset and checkpoint (NO rollout_data!) ----
+    echo "  [3a] Copying original dataset and checkpoint (NO new rollout data)"
+    python scripts/scripts_pick_place/7_finetune_with_rollout.py \
+        --original_lerobot "$POLICY_B_DIR_TEMP/lerobot_dataset" \
+        --checkpoint "$CHECKPOINT_B" \
+        --out "$POLICY_B_DIR_LAST" \
+        --prepare_only \
+        --include_obj_pose \
+        --include_gripper
 
     # ---- 3b: Copy wandb directory for resumed logging ----
     if [ -d "$POLICY_B_DIR_TEMP/checkpoints/wandb" ]; then
@@ -502,45 +484,49 @@ print(f\"  Task B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s
         --include_gripper \
         --wandb
 
-    echo "  ✓ Policy B finetuned"
+    echo "  ✓ Policy B finetuned (original data only)"
 
     # ---- 3d: Rotate directories ----
     rm -rf "$POLICY_B_DIR_TEMP"
     mv "$POLICY_B_DIR_LAST" "$POLICY_B_DIR_TEMP"
     echo "  ✓ last → temp"
 
-    print_section "Iteration $iter complete!"
+    print_section "BASELINE Iteration $iter complete!"
 done
 
 # =============================================================================
-# Generate Success Rate Plot
+# Generate Success Rate Plot (baseline)
 # =============================================================================
-print_header "Generating Success Rate Plot"
+print_header "Generating Baseline Success Rate Plot"
 
 python scripts/scripts_pick_place/plot_success_rate.py \
     --record "$RECORD_FILE" \
-    --out "data/success_rate_curve.png"
+    --out "data/success_rate_baseline_curve.png"
 
 # =============================================================================
 # Summary
 # =============================================================================
-print_header "Pipeline Complete!"
+print_header "BASELINE Pipeline Complete!"
 echo ""
 echo "  Record file:  $RECORD_FILE"
-echo "  Plot:         data/success_rate_curve.png"
+echo "  Plot:         data/success_rate_baseline_curve.png"
 echo ""
 echo "  Final checkpoints (in temp dirs):"
 echo "    Policy A: $(get_checkpoint_path "$POLICY_A_DIR_TEMP")"
 echo "    Policy B: $(get_checkpoint_path "$POLICY_B_DIR_TEMP")"
 echo ""
+echo "  NOTE: This baseline used ORIGINAL data only (no rollout augmentation)."
+echo "  Compare with data/success_rate_record.json for the main pipeline results."
+echo ""
 
 # Print final summary from record
 python3 << 'PYSUMMARY'
 import json
-with open("data/success_rate_record.json", 'r') as f:
+with open("data/success_rate_baseline_record.json", 'r') as f:
     record = json.load(f)
 iters = record.get("iterations", [])
 if iters:
+    print("  BASELINE Results (no new data):")
     print("  Iter  |  Task A  |  Task B")
     print("  ------|----------|--------")
     for it in iters:

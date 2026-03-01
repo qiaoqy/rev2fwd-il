@@ -1749,15 +1749,10 @@ def main() -> None:
             # Read state dimension from dataset - this is critical!
             if "observation.state" in features:
                 actual_state_dim = features["observation.state"]["shape"][0]
-                # Override include_gripper based on actual data
-                if actual_state_dim == 7:
-                    args.include_gripper = False
-                    print(f"  State dim: {actual_state_dim} (ee_pose only - overriding --include_gripper)")
-                elif actual_state_dim == 8:
-                    args.include_gripper = True
-                    print(f"  State dim: {actual_state_dim} (ee_pose + gripper)")
-                else:
-                    print(f"  State dim: {actual_state_dim} (unexpected dimension)")
+                state_names = features["observation.state"].get("names", [])
+                has_gripper_in_data = "gripper" in state_names
+                args.include_gripper = has_gripper_in_data
+                print(f"  State dim: {actual_state_dim} (gripper={'yes' if has_gripper_in_data else 'no'}, names={state_names})")
             else:
                 raise ValueError("observation.state not found in dataset features")
             
@@ -1778,9 +1773,10 @@ def main() -> None:
             print("Data conversion complete. Exiting (--convert_only flag).")
         return
     
-    # Auto-detect include_gripper from actual dataset metadata
-    # This prevents model/data dimension mismatch when reusing a dataset
-    # that was converted with a different --include_gripper setting.
+    # Auto-detect include_gripper from actual dataset metadata.
+    # Check whether "gripper" is in the feature names rather than relying on
+    # hardcoded dimension thresholds, because the base ee_pose dimension varies
+    # between quaternion (7-dim) and Euler (6-dim) representations.
     ds_meta_path = lerobot_dataset_dir / "meta" / "info.json"
     if ds_meta_path.exists():
         with open(ds_meta_path, "r") as f:
@@ -1788,13 +1784,14 @@ def main() -> None:
         ds_features = ds_info.get("features", {})
         if "observation.state" in ds_features:
             actual_state_dim = ds_features["observation.state"]["shape"][0]
-            expected_state_dim = 8 if args.include_gripper else 7
-            if actual_state_dim != expected_state_dim:
+            state_names = ds_features["observation.state"].get("names", [])
+            has_gripper_in_data = "gripper" in state_names
+            if has_gripper_in_data != args.include_gripper:
                 old_flag = args.include_gripper
-                args.include_gripper = (actual_state_dim == 8)
-                print(f"\n[AUTO-DETECT] Dataset state_dim={actual_state_dim} "
-                      f"(expected {expected_state_dim} from --include_gripper={old_flag}). "
-                      f"Overriding --include_gripper to {args.include_gripper}.")
+                args.include_gripper = has_gripper_in_data
+                print(f"\n[AUTO-DETECT] Dataset state has gripper={has_gripper_in_data} "
+                      f"(state_dim={actual_state_dim}, names={state_names}). "
+                      f"Overriding --include_gripper from {old_flag} to {args.include_gripper}.")
     
     # Initialize distributed process group AFTER data conversion is complete
     # This avoids NCCL timeout issues during long-running conversions
