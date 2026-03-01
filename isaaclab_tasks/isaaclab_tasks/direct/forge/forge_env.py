@@ -218,10 +218,15 @@ class ForgeEnv(FactoryEnv):
             roll=desired_xyz[:, 0], pitch=desired_xyz[:, 1], yaw=desired_xyz[:, 2]
         )
 
+        # Step (3): Gripper control from action[:, 6].
+        # action[:, 6] ∈ [-1, 1] → gripper DOF pos ∈ [0.0, 0.04] (closed → open).
+        # Franka finger joints range: 0.0 (fully closed) to 0.04 (fully open).
+        gripper_action = (self.actions[:, 6] + 1.0) / 2.0 * 0.04  # [-1,1] → [0, 0.04]
+
         self.generate_ctrl_signals(
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
             ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
-            ctrl_target_gripper_dof_pos=0.0,
+            ctrl_target_gripper_dof_pos=gripper_action,
         )
 
     def _get_rewards(self):

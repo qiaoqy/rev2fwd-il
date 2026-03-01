@@ -18,7 +18,7 @@ For each episode, the following arrays are saved:
     - ee_pose:          (T, 7)   End-effector pose [x, y, z, qw, qx, qy, qz]
     - nut_pose:         (T, 7)   Nut (held asset) pose
     - bolt_pose:        (T, 7)   Bolt (fixed asset) pose
-    - action:           (T, 7)   Action [pos(3), rot(3), success_pred]
+    - action:           (T, 7)   Action [pos(3), rot(3), gripper]
     - ft_force:         (T, 3)   Force/torque sensor readings (force xyz)
     - ft_force_raw:     (T, 6)   Raw force/torque readings (force + torque)
     - joint_pos:        (T, 7)   Robot joint positions
@@ -646,7 +646,7 @@ class NutThreadingExpert:
         The FORGE action space is 7D:
         - pos (3): Position target relative to bolt frame
         - rot (3): Rotation target (roll, pitch, yaw) 
-        - success_pred (1): Success prediction output
+        - gripper (1): Gripper control [-1=closed, +1=open]
         
         Force feedback logic:
         - APPROACH: Move down until force > contact_threshold
@@ -952,7 +952,7 @@ class NutThreadingExpert:
             action[release_mask, 2] = 0.5    # Move UP
             action[release_mask, 3:5] = 0.0  # No roll/pitch change
             action[release_mask, 5] = self.cumulative_yaw_target[release_mask]  # Keep yaw
-            action[release_mask, 6] = -1.0   # OPEN GRIPPER (release nut)
+            action[release_mask, 6] = 1.0    # OPEN GRIPPER (release nut)
             
             # After some steps, transition to REPOSITION
             lifted_enough = release_mask & (self.phase_step_count > self.release_timeout)
@@ -967,7 +967,7 @@ class NutThreadingExpert:
             action[reposition_mask, 0:2] = 0.0  # Stay centered XY
             action[reposition_mask, 2] = 0.3    # Stay lifted
             action[reposition_mask, 3:5] = 0.0  # No roll/pitch change
-            action[reposition_mask, 6] = -1.0   # Keep gripper OPEN
+            action[reposition_mask, 6] = 1.0    # Keep gripper OPEN
             
             # Decrement yaw target back towards -0.8 (leave some margin from -1.0)
             # Use larger steps for faster repositioning
@@ -1009,8 +1009,8 @@ class NutThreadingExpert:
             )
             action[regrasp_mask, 6] = torch.where(
                 is_descending[regrasp_mask],
-                torch.full((regrasp_mask.sum(),), -1.0, device=self.device),  # Open during descend
-                torch.full((regrasp_mask.sum(),), 1.0, device=self.device)    # Close to grasp
+                torch.full((regrasp_mask.sum(),), 1.0, device=self.device),   # Open during descend
+                torch.full((regrasp_mask.sum(),), -1.0, device=self.device)   # Close to grasp
             )
             
             # Transition back to THREAD after completing regrasp
@@ -1043,13 +1043,11 @@ class NutThreadingExpert:
                                                  self.phase_entry_step)
         
         # =====================================================================
-        # Success prediction
+        # Gripper control: default CLOSED for phases 0-4
+        # Phases 5-7 (RELEASE, REPOSITION, REGRASP) already set action[:, 6]
         # =====================================================================
-        # Estimate based on phase and progress
-        is_threading = (self.phase >= 3).float()
-        progress_normalized = (self.z_progress / 0.015).clamp(0, 1)
-        success_estimate = 0.3 * is_threading + 0.7 * progress_normalized
-        action[:, 6] = success_estimate * 2.0 - 1.0  # Scale to [-1, 1]
+        default_gripper_mask = phase_snapshot <= 4
+        action[default_gripper_mask, 6] = -1.0  # Gripper closed (grasp nut)
         
         return action
     
