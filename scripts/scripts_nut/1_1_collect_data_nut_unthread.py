@@ -257,12 +257,17 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     """Dynamically add camera sensors to the FORGE environment configuration."""
     import isaaclab.sim as sim_utils
     from isaaclab.sensors import CameraCfg
+    from isaaclab.sensors.camera import TiledCameraCfg
     
+    # NOTE: Using TiledCameraCfg instead of CameraCfg.
+    # TiledCamera reads from the Hydra render pipeline and works WITH fabric enabled.
+    # Regular Camera sensor requires disable_fabric=1, but that breaks
+    # SimulationContext.forward() -> articulation link meshes never sync to renderer.
     camera_eye = (0.7, 0.4, 0.5)
     camera_lookat = (0.6, 0.0, 0.0)
     camera_quat = compute_camera_quat_from_lookat(camera_eye, camera_lookat)
     
-    env_cfg.scene.table_cam = CameraCfg(
+    env_cfg.scene.table_cam = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
         update_period=0.0,
         height=image_height,

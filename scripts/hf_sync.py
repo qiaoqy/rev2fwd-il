@@ -24,10 +24,10 @@ Usage:
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0210_B
     python scripts/hf_sync.py upload-model runs/ditflow_pickplace_piper_0224_A
 
-    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_A_ps5collected
-    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_B_reversed
-    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_B
-    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_A
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_A_ps5collected_euler
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_B_reversed_euler
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_B_euler
+    python scripts/hf_sync.py upload-model runs/pickplace_piper_0226_A_euler
 
 
     

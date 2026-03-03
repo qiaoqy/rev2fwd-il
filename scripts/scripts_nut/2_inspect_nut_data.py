@@ -574,7 +574,16 @@ def main() -> None:
     
     images = episode_data["images"]
     num_frames = len(images)
-    H, W = images.shape[1], images.shape[2]
+    
+    # Check if images are valid (not empty)
+    has_images = images.ndim >= 3 and images.shape[1] > 0 and images.shape[2] > 0
+    
+    if has_images:
+        H, W = images.shape[1], images.shape[2]
+    else:
+        H, W = 0, 0
+        print("WARNING: Images are empty (likely collected with Fabric backend). "
+              "Skipping image/video outputs. Use --disable_fabric 1 during collection to get images.")
     
     # Check for wrist cameras - support both old format (wrist_images) and new format (wrist_<cam_name>)
     wrist_images_dict = {}
@@ -586,19 +595,22 @@ def main() -> None:
             key = f"wrist_{cam_name}"
             if key in episode_data:
                 wrist_img = episode_data[key]
-                if not np.all(wrist_img == 0):
+                if wrist_img.ndim >= 3 and wrist_img.shape[1] > 0 and not np.all(wrist_img == 0):
                     wrist_images_dict[cam_name] = wrist_img
     else:
         # Fall back to old single wrist_images format
         wrist_images = episode_data.get("wrist_images", None)
-        if wrist_images is not None and not np.all(wrist_images == 0):
+        if wrist_images is not None and wrist_images.ndim >= 3 and wrist_images.shape[1] > 0 and not np.all(wrist_images == 0):
             wrist_images_dict["wrist_cam"] = wrist_images
     
     has_wrist = len(wrist_images_dict) > 0
     
     print(f"Episode {args.episode}:")
     print(f"  - Number of frames: {num_frames}")
-    print(f"  - Table camera image size: {W}x{H}")
+    if has_images:
+        print(f"  - Table camera image size: {W}x{H}")
+    else:
+        print(f"  - Table camera: NO IMAGES (empty)")
     if has_wrist:
         print(f"  - Wrist cameras available: {list(wrist_images_dict.keys())}")
         for cam_name, wrist_img in wrist_images_dict.items():
@@ -606,35 +618,38 @@ def main() -> None:
     else:
         print(f"  - Wrist camera: not available / all zeros")
     
-    # Save single frame as PNG for table camera
     frame_idx = min(args.frame, num_frames - 1)
-    png_path = output_dir / f"frame_{frame_idx}_table.png"
-    save_frame_as_png(images, frame_idx, png_path)
     
-    # Save single frame for each wrist camera
-    if has_wrist:
-        for cam_name, wrist_images in wrist_images_dict.items():
-            wrist_png_path = output_dir / f"frame_{frame_idx}_{cam_name}.png"
-            save_frame_as_png(wrist_images, frame_idx, wrist_png_path)
+    if has_images:
+        # Save single frame as PNG for table camera
+        png_path = output_dir / f"frame_{frame_idx}_table.png"
+        save_frame_as_png(images, frame_idx, png_path)
+        
+        # Save single frame for each wrist camera
+        if has_wrist:
+            for cam_name, wrist_images in wrist_images_dict.items():
+                wrist_png_path = output_dir / f"frame_{frame_idx}_{cam_name}.png"
+                save_frame_as_png(wrist_images, frame_idx, wrist_png_path)
     
     # Save frame data as JSON
     json_path = output_dir / f"frame_{frame_idx}_data.json"
     save_frame_data_as_json(episode_data, frame_idx, json_path)
     
-    # Create basic episode video with all cameras
-    video_path = output_dir / f"episode_{args.episode}_video.mp4"
-    create_episode_video(images, video_path, args.fps, 
-                        wrist_images_dict=wrist_images_dict if has_wrist else None)
-    
-    # Also create individual videos for each wrist camera for easier comparison
-    if has_wrist:
-        for cam_name, wrist_images in wrist_images_dict.items():
-            wrist_video_path = output_dir / f"episode_{args.episode}_{cam_name}.mp4"
-            create_episode_video(wrist_images, wrist_video_path, args.fps)
-    
-    # Create video with force overlay
-    overlay_video_path = output_dir / f"episode_{args.episode}_with_force.mp4"
-    create_video_with_overlay(episode_data, overlay_video_path, args.fps)
+    if has_images:
+        # Create basic episode video with all cameras
+        video_path = output_dir / f"episode_{args.episode}_video.mp4"
+        create_episode_video(images, video_path, args.fps, 
+                            wrist_images_dict=wrist_images_dict if has_wrist else None)
+        
+        # Also create individual videos for each wrist camera for easier comparison
+        if has_wrist:
+            for cam_name, wrist_images in wrist_images_dict.items():
+                wrist_video_path = output_dir / f"episode_{args.episode}_{cam_name}.mp4"
+                create_episode_video(wrist_images, wrist_video_path, args.fps)
+        
+        # Create video with force overlay
+        overlay_video_path = output_dir / f"episode_{args.episode}_with_force.mp4"
+        create_video_with_overlay(episode_data, overlay_video_path, args.fps)
     
     # Create force plot if enabled
     if args.enable_force_plot:

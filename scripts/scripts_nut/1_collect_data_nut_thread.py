@@ -233,6 +233,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     """
     import isaaclab.sim as sim_utils
     from isaaclab.sensors import CameraCfg
+    from isaaclab.sensors.camera import TiledCameraCfg
     
     # =========================================================================
     # Table Camera - Third-person fixed view for nut threading task
@@ -240,12 +241,18 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # FORGE/Factory workspace is centered at (0, 0, 0), robot base is there
     # Use similar camera position as pick_place task but adjusted for FORGE workspace
     # Place camera further back to capture full workspace including table
+    #
+    # NOTE: Using TiledCameraCfg instead of CameraCfg.
+    # TiledCamera reads from the Hydra render pipeline and works WITH fabric enabled.
+    # Regular Camera sensor requires disable_fabric=1, but that breaks
+    # SimulationContext.forward() -> articulation link meshes never sync to renderer,
+    # resulting in stale/frozen camera images.
     camera_eye = (0.7, 0.2, 0.2)      # Camera position: further back, right side, higher up
     camera_lookat = (0.6, 0.0, 0.1)   # Look at: workspace center
     
     camera_quat = compute_camera_quat_from_lookat(camera_eye, camera_lookat)
     
-    env_cfg.scene.table_cam = CameraCfg(
+    env_cfg.scene.table_cam = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
         update_period=0.0,  # Update every physics step
         height=image_height,

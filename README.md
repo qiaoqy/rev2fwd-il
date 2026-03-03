@@ -206,7 +206,51 @@ Same format, but trajectory direction is reversed (from random table position to
 
 ---
 
-## 5. Archived Scripts
+## 5. Nut Threading Task (FORGE Environment)
+
+### Camera Rendering Fix (2026-03-03)
+
+在 Isaac Lab 2.3.0 中使用 FORGE 环境 + `Camera` sensor 采集图像时，发现**相机画面完全不会随机械臂运动更新**。经过深入排查，发现了以下问题：
+
+**根因**：Isaac Lab 的 `Camera` sensor 要求 `--disable_fabric 1`，但关闭 Fabric 后，`SimulationContext.forward()` 方法会完全跳过 `update_articulations_kinematic()` 调用（因为 `_fabric_iface is None`），导致 PhysX 中的关节体 mesh 永远不会同步到 USD 渲染器。相机拍到的始终是初始帧。
+
+**修复方案**（两处改动）：
+
+1. **Patch Isaac Lab 源码**（安全兜底）：修改 `simulation_context.py` 的 `forward()` 方法，使 `update_articulations_kinematic()` 不再依赖 `_fabric_iface` 是否存在，始终执行同步。
+   - 文件位置：`$CONDA_PREFIX/lib/python3.11/site-packages/isaaclab/source/isaaclab/isaaclab/sim/simulation_context.py`
+   - 备份：`simulation_context.py.bak`
+
+2. **数据采集脚本切换为 `TiledCameraCfg`**（主要修复）：`TiledCamera` 通过 Hydra 渲染管线读取图像，可在 Fabric 开启时正常工作。`forward()` 此时会正确执行 `update_articulations_kinematic()` + `_update_fabric()`，确保 PhysX→Fabric→Hydra 全链路同步。
+   - 修改文件：`scripts/scripts_nut/1_collect_data_nut_thread.py`、`scripts/scripts_nut/1_1_collect_data_nut_unthread.py`
+   - `CameraCfg` → `TiledCameraCfg`
+   - 采集时**不再需要** `--disable_fabric 1`
+
+**验证**：通过连通分量分析（connected component analysis）证实，机械臂从 home 位置到 arm_up 位置（末端执行器移动 40+ cm），相机画面中最大连通变化区域为 461 像素的连贯形状，而随机噪声基线仅 3 像素。
+
+### 采集 Nut Threading 数据
+
+```bash
+# 基本用法（不需要 --disable_fabric）
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_nut/1_collect_data_nut_thread.py \
+    --headless --num_episodes 100 --out data/nut_thread.npz
+
+# 自定义图像尺寸
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_nut/1_collect_data_nut_thread.py \
+    --headless --num_episodes 100 \
+    --image_width 128 --image_height 128 --out data/nut_thread_128.npz
+```
+
+### 可视化 Nut Threading 数据
+
+```bash
+python scripts/scripts_nut/2_inspect_nut_data.py \
+    --dataset data/nut_thread.npz \
+    --episode 0 --enable_force_plot --enable_trajectory_plot
+```
+
+---
+
+## 6. Archived Scripts
 
 Legacy scripts have been moved to `scripts_archive/`, including:
 - MLP BC training/evaluation

@@ -237,3 +237,38 @@ Franka 夹爪 DOF 范围: `[0.0, 0.04]` 米 (0 = 全闭, 0.04 = 全开)。
 > **注意**: 此修改会影响 `_get_rewards()` 中的 success prediction reward 计算
 > （原来读取 `action[:, 6]` 作为 success prediction）。若仅用于数据采集则无影响；
 > 若需要 RL 训练，需同步修改 reward 函数。
+
+### 关于相机渲染的修复（libGLU）
+
+Isaac Sim 的 RTX 渲染管线依赖 `libGLU.so.1`。如果 conda 环境中缺少该库，
+所有 RTX shader 将加载失败（日志中会出现 29 条 "Cannot load shader" 错误），
+导致相机传感器返回空图像 `(T, 0)` 而非正常的 `(T, H, W, 3)`。
+
+**诊断方法**：查看相机数据 shape 是否为 `(num_envs, 0)` 而非 `(num_envs, H, W, 3)`。
+
+**修复方法**：
+
+```bash
+# 方法 1：从 conda 包缓存复制
+cp /path/to/conda/pkgs/libglu-*/lib/libGLU.so* $CONDA_PREFIX/lib/
+
+# 方法 2：conda 安装
+conda install -c conda-forge libglu
+
+# 验证
+ls $CONDA_PREFIX/lib/libGLU.so.1
+```
+
+> **注意**: 此问题同时影响 FORGE 环境（DirectRLEnv）和 pick-place 环境（ManagerBasedRLEnv），
+> 是系统级的渲染管线问题，与具体任务无关。
+
+### 关于 disable_fabric 参数
+
+使用相机传感器采集图像时，需要禁用 Fabric 后端以保证 USD stage 同步：
+
+```bash
+python scripts/scripts_nut/1_collect_data_nut_thread.py --headless --disable_fabric 1 ...
+```
+
+如果不加 `--disable_fabric 1`，相机可能仍然工作，但在某些配置下可能导致
+场景数据不同步。建议图像采集时始终加此参数。
