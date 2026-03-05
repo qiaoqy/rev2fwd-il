@@ -318,15 +318,32 @@ def create_video_with_overlay(
     
     # Get phase data if available
     phase_data = episode_data.get("phase", None)
-    phase_names = episode_data.get("phase_names", ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE"])
+    phase_names = episode_data.get("phase_names", 
+                                    ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE",
+                                     "RELEASE", "REPOSITION", "REGRASP"])
     
-    # Phase colors for background shading
+    # Phase colors for background shading (all 8 phases)
     phase_colors = {
         0: '#FFE4E1',  # APPROACH - light pink/red
         1: '#E6E6FA',  # SEARCH - light lavender
         2: '#FFFACD',  # ENGAGE - light yellow
         3: '#98FB98',  # THREAD - light green
         4: '#D3D3D3',  # DONE - light gray
+        5: '#FFD700',  # RELEASE - gold
+        6: '#87CEEB',  # REPOSITION - sky blue
+        7: '#DDA0DD',  # REGRASP - plum
+    }
+    
+    # Phase text colors (darker versions for readability)
+    phase_text_colors = {
+        0: '#8B0000',  # APPROACH - dark red
+        1: '#4B0082',  # SEARCH - indigo
+        2: '#8B8000',  # ENGAGE - dark yellow
+        3: '#006400',  # THREAD - dark green
+        4: '#404040',  # DONE - dark gray
+        5: '#B8860B',  # RELEASE - dark goldenrod
+        6: '#00688B',  # REPOSITION - dark sky blue
+        7: '#8B008B',  # REGRASP - dark plum
     }
     
     # Extract torque from raw data
@@ -339,6 +356,9 @@ def create_video_with_overlay(
         print(f"  Phase data NOT available (will not show phase)")
     
     frames_with_overlay = []
+    
+    # Get action data for yaw/gripper annotation
+    action_data = episode_data.get("action", None)
     
     for t in range(T):
         # Create figure with image and data (3 subplots: image, force, torque)
@@ -358,18 +378,25 @@ def create_video_with_overlay(
         if phase_data is not None:
             # Add phase label on image with colored background
             phase_color = phase_colors.get(current_phase, '#FFFFFF')
-            ax_img.text(0.5, 0.95, f'Phase: {current_phase_name}',
-                       transform=ax_img.transAxes, fontsize=14, fontweight='bold',
+            text_color = phase_text_colors.get(current_phase, '#000000')
+            ax_img.text(0.5, 0.95, f'{current_phase_name}',
+                       transform=ax_img.transAxes, fontsize=16, fontweight='bold',
+                       color=text_color,
                        horizontalalignment='center', verticalalignment='top',
                        bbox=dict(boxstyle='round,pad=0.3', facecolor=phase_color, 
                                 edgecolor='black', alpha=0.9))
         ax_img.set_title(f'Frame {t}/{T}', fontsize=12)
         ax_img.axis('off')
         
-        # Add EE position text below image
+        # Add EE position and action info below image
         ee_pos = ee_pose[t, :3]
-        ax_img.text(0.5, 0.02, f'EE: ({ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f})',
-                   transform=ax_img.transAxes, fontsize=9, horizontalalignment='center',
+        info_lines = [f'EE: ({ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f})']
+        if action_data is not None:
+            act = action_data[t]
+            info_lines.append(f'Yaw={act[5]:.2f}  Grip={act[6]:.1f}  Z={act[2]:.2f}')
+        ax_img.text(0.5, 0.02, '\n'.join(info_lines),
+                   transform=ax_img.transAxes, fontsize=8, horizontalalignment='center',
+                   verticalalignment='bottom', family='monospace',
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         # Helper function to add phase background shading
@@ -441,7 +468,14 @@ def create_video_with_overlay(
         
         # Add phase legend at the top if phase data available
         if phase_data is not None:
-            legend_text = ' | '.join([f'{name}' for name in phase_names])
+            # Show only phases that actually appear in the data
+            unique_phases = sorted(set(int(p) for p in phase_data))
+            legend_parts = []
+            for p in unique_phases:
+                if p < len(phase_names):
+                    color = phase_colors.get(p, '#FFFFFF')
+                    legend_parts.append(f'{phase_names[p]}')
+            legend_text = ' | '.join(legend_parts)
             fig.text(0.72, 0.98, f'Phases: {legend_text}', fontsize=8,
                     horizontalalignment='center', verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))

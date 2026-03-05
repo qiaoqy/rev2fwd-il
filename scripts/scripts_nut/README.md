@@ -1,124 +1,124 @@
 # Nut Threading Data Collection (FORGE Environment)
 
-本目录包含基于 Isaac Lab FORGE 环境的螺母拧紧（nut threading）任务数据收集脚本。
+This directory contains data collection scripts for the nut threading task based on the Isaac Lab FORGE environment.
 
-## 目录结构
+## Directory Structure
 
-| 脚本 | 说明 |
-|------|------|
-| `1_collect_data_nut_thread.py` | **正向**数据收集：从螺母悬空状态开始，执行拧紧动作 |
-| `1_1_collect_data_nut_unthread.py` | **逆向**数据收集（rev2fwd-il）：从拧紧状态开始，执行松螺母动作 |
-| `2_inspect_nut_data.py` | 数据可视化：提取帧、生成视频、力传感器曲线、3D 轨迹 |
+| Script | Description |
+|--------|-------------|
+| `1_collect_data_nut_thread.py` | **Forward** data collection: starts with nut suspended, executes threading |
+| `1_1_collect_data_nut_unthread.py` | **Reverse** data collection (rev2fwd-il): starts from threaded state, unthreads |
+| `2_inspect_nut_data.py` | Data visualization: frame extraction, video generation, force curves, 3D trajectories |
 
 ---
 
-## 环境概述
+## Environment Overview
 
 ### FORGE Nut Threading Task
 
 - **Task ID**: `Isaac-Forge-NutThread-Direct-v0`
-- **机器人**: Franka Panda (7-DOF 机械臂 + 2-DOF 平行夹爪)
-- **任务**: 将螺母拧到螺栓上
-- **控制频率**: 15 Hz (120 Hz 仿真 / 8 decimation)
-- **力传感器**: 6-DOF F/T 传感器 (force_sensor link)，EMA 平滑 (α=0.25)
+- **Robot**: Franka Panda (7-DOF arm + 2-DOF parallel gripper)
+- **Task**: Thread a nut onto a bolt
+- **Control frequency**: 15 Hz (120 Hz sim / 8 decimation)
+- **Force sensor**: 6-DOF F/T sensor (force_sensor link), EMA smoothed (α=0.25)
 
 ### Action Space (7D)
 
-| 维度 | 含义 | 范围 | 说明 |
-|------|------|------|------|
-| `action[0:3]` | 位置目标 (xyz) | [-1, 1] | 相对于螺栓顶部的位置偏移，乘以 `pos_action_bounds` |
-| `action[3:5]` | Roll/Pitch | [-1, 1] | **被强制归零**，即只允许 yaw 旋转 |
-| `action[5]` | Yaw 旋转目标 | [-1, 1] | 映射到 [-180°, +90°] 的绝对 yaw 角度 |
-| `action[6]` | 夹爪控制 | [-1, 1] | **-1 = 全闭合 (0.0m)，+1 = 全张开 (0.04m)** |
+| Dim | Meaning | Range | Notes |
+|-----|---------|-------|-------|
+| `action[0:3]` | Position target (xyz) | [-1, 1] | Offset relative to bolt top, scaled by `pos_action_bounds` |
+| `action[3:5]` | Roll/Pitch | [-1, 1] | **Forced to zero** — only yaw rotation allowed |
+| `action[5]` | Yaw rotation target | [-1, 1] | Maps to [-180°, +90°] absolute yaw angle |
+| `action[6]` | Gripper control | [-1, 1] | **-1 = fully closed (0.0m), +1 = fully open (0.04m)** |
 
-> **重要变更**: `action[6]` 原本是 success prediction 信号（用于 RL 训练），我们已修改
-> `forge_env.py` 将其改为夹爪控制。修改位置：
-> `isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py` 的 `_apply_action()` 方法。
+> **Important change**: `action[6]` was originally a success prediction signal (for RL training).
+> We modified `forge_env.py` to use it as gripper control instead.
+> Modified file: `isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py`, method `_apply_action()`.
 
 ### Observation Space
 
-| 观测项 | 维度 | 说明 |
-|--------|------|------|
-| `fingertip_pos_rel_fixed` | 3 | 指尖相对螺栓的位置 |
-| `fingertip_quat` | 4 | 指尖四元数 |
-| `ee_linvel` | 3 | 末端执行器线速度 |
-| `ee_angvel` | 3 | 末端执行器角速度 |
-| `ft_force` | 3 | 力传感器读数 (Fx, Fy, Fz) |
-| `force_threshold` | 1 | 接触力惩罚阈值 |
+| Observation | Dim | Description |
+|-------------|-----|-------------|
+| `fingertip_pos_rel_fixed` | 3 | Fingertip position relative to bolt |
+| `fingertip_quat` | 4 | Fingertip quaternion |
+| `ee_linvel` | 3 | End-effector linear velocity |
+| `ee_angvel` | 3 | End-effector angular velocity |
+| `ft_force` | 3 | Force sensor readings (Fx, Fy, Fz) |
+| `force_threshold` | 1 | Contact force penalty threshold |
 
 ---
 
-## 1. 正向数据收集
+## 1. Forward Data Collection
 
-### 脚本: `1_collect_data_nut_thread.py`
+### Script: `1_collect_data_nut_thread.py`
 
-从螺母悬空状态开始，使用力反馈状态机控制策略执行拧紧。
+Starts from the nut-in-air state and executes threading using a force-feedback state machine expert policy.
 
-#### 基本用法
+#### Basic Usage
 
 ```bash
-# 单环境收集 100 个 episode（headless 模式）
+# Collect 100 episodes in a single environment (headless mode)
 CUDA_VISIBLE_DEVICES=2 python scripts/scripts_nut/1_collect_data_nut_thread.py \
     --headless --num_episodes 100 \
     --out data/nut_thread.npz
 
-# 指定图像尺寸
+# Specify image resolution
 CUDA_VISIBLE_DEVICES=2 python scripts/scripts_nut/1_collect_data_nut_thread.py \
     --headless --num_episodes 100 \
     --image_width 128 --image_height 128 \
     --out data/nut_thread_128.npz
 ```
 
-#### 参数说明
+#### Arguments
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--task` | `Isaac-Forge-NutThread-Direct-v0` | Isaac Lab 任务 ID |
-| `--num_envs` | `1` | 并行环境数量（图像采集建议 1） |
-| `--num_episodes` | `100` | 收集 episode 数量 |
-| `--horizon` | `600` | 每个 episode 最大步数 |
-| `--image_width` | `128` | 图像宽度 |
-| `--image_height` | `128` | 图像高度 |
-| `--rotation_speed` | `0.5` | 拧紧角速度 (rad/s) |
-| `--downward_force` | `5.0` | 拧紧时目标下压力 (N) |
-| `--seed` | `0` | 随机种子 |
-| `--out` | `data/nut_thread.npz` | 输出 NPZ 文件路径 |
-| `--disable_fabric` | `0` | 是否禁用 Fabric 后端 (PhysX GPU) |
-| `--headless` | - | 无头模式运行（Isaac Lab 参数） |
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--task` | `Isaac-Forge-NutThread-Direct-v0` | Isaac Lab task ID |
+| `--num_envs` | `1` | Number of parallel environments (use 1 for image collection) |
+| `--num_episodes` | `100` | Number of episodes to collect |
+| `--horizon` | `600` | Maximum steps per episode |
+| `--image_width` | `128` | Image width |
+| `--image_height` | `128` | Image height |
+| `--rotation_speed` | `0.5` | Threading angular velocity (rad/s) |
+| `--downward_force` | `5.0` | Target downward force during threading (N) |
+| `--seed` | `0` | Random seed |
+| `--out` | `data/nut_thread.npz` | Output NPZ file path |
+| `--disable_fabric` | `0` | Whether to disable Fabric backend (PhysX GPU) |
+| `--headless` | - | Run in headless mode (Isaac Lab argument) |
 
-#### 专家策略状态机
+#### Expert Policy State Machine
 
-数据采集使用 `NutThreadingExpert` 力反馈状态机，包含以下阶段：
+Data collection uses the `NutThreadingExpert` force-feedback state machine with the following phases:
 
 ```
 APPROACH → SEARCH → ENGAGE → THREAD → DONE
                                 ↓
-                      (需要多圈时触发)
+                      (triggered for multi-turn)
                     RELEASE → REPOSITION → REGRASP → THREAD
 ```
 
-| 阶段 | ID | 说明 | 夹爪 |
-|------|----|------|------|
-| **APPROACH** | 0 | 向下移动直到检测到接触力 | 闭合 |
-| **SEARCH** | 1 | 螺旋搜索找到螺纹对齐点 | 闭合 |
-| **ENGAGE** | 2 | 反转-正转旋转 + 下压，捕捉螺纹 | 闭合 |
-| **THREAD** | 3 | 持续旋转 + 自适应下压力 | 闭合 |
-| **DONE** | 4 | 完成（扭矩过大或超时） | 闭合 |
-| **RELEASE** | 5 | 抬起 + 张开夹爪释放螺母 | **张开** |
-| **REPOSITION** | 6 | 保持抬起，yaw 旋转回初始位置 | **张开** |
-| **REGRASP** | 7 | 下降 + 重新抓取螺母 | 先张开后闭合 |
+| Phase | ID | Description | Gripper |
+|-------|----|-------------|---------|
+| **APPROACH** | 0 | Move down until contact force detected | Closed |
+| **SEARCH** | 1 | Spiral search to find thread alignment | Closed |
+| **ENGAGE** | 2 | Reverse-forward rotation + downward pressure to catch threads | Closed |
+| **THREAD** | 3 | Continuous rotation + adaptive downward force | Closed |
+| **DONE** | 4 | Completed (torque too high or timeout) | Closed |
+| **RELEASE** | 5 | Lift up + open gripper to release nut | **Open** |
+| **REPOSITION** | 6 | Stay lifted, rotate yaw back to initial position | **Open** |
+| **REGRASP** | 7 | Lower + re-grasp nut | Open then Close |
 
-> **多圈拧紧**: FORGE 的 yaw 范围只有 [-180°, +90°] = 270°，不到一整圈。
-> 当 yaw 接近上限（0.9）时，自动触发 RELEASE→REPOSITION→REGRASP 循环，
-> 最多支持 15 次重抓（约 15 × 270° = 4050° ≈ 11 圈）。
+> **Multi-turn threading**: FORGE's yaw range is only [-180°, +90°] = 270°, less than one full turn.
+> When yaw approaches the upper limit (0.9), RELEASE→REPOSITION→REGRASP is triggered automatically.
+> Supports up to 15 re-grasps (~15 × 270° = 4050° ≈ 11 turns).
 
 ---
 
-## 2. 逆向数据收集（rev2fwd-il）
+## 2. Reverse Data Collection (rev2fwd-il)
 
-### 脚本: `1_1_collect_data_nut_unthread.py`
+### Script: `1_1_collect_data_nut_unthread.py`
 
-从螺母已拧紧的状态开始，执行松螺母（逆时针旋转 + 上提）。收集到的轨迹可以通过时间反转得到正向拧紧数据。
+Starts from the nut-already-threaded state and unthreads (counterclockwise rotation + lift). Collected trajectories can be time-reversed to get forward threading demonstrations.
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python scripts/scripts_nut/1_1_collect_data_nut_unthread.py \
@@ -126,65 +126,65 @@ CUDA_VISIBLE_DEVICES=2 python scripts/scripts_nut/1_1_collect_data_nut_unthread.
     --out data/B_nut_unthread.npz
 ```
 
-**rev2fwd-il 思路**:
-1. 初始化为螺母已拧紧在螺栓上（目标状态）
-2. 执行简单的"松螺母"策略（逆时针旋转 + 上提）
-3. 对采集的轨迹做时间反转，得到正向拧紧 demonstration
+**rev2fwd-il approach**:
+1. Initialize with nut already threaded onto bolt (goal state)
+2. Execute simple "unthread" policy (counterclockwise rotation + lift)
+3. Time-reverse collected trajectories to get forward threading demonstrations
 
-优势：松螺母更简单（重力辅助保持接触），且初始状态可以直接设置。
+Advantage: Unthreading is simpler (gravity assists contact) and the initial goal state can be set directly.
 
 ---
 
-## 3. 数据检查与可视化
+## 3. Data Inspection & Visualization
 
-### 脚本: `2_inspect_nut_data.py`
+### Script: `2_inspect_nut_data.py`
 
 ```bash
-# 基本检查（打印统计信息 + 生成帧图片 + 视频）
+# Basic inspection (print stats + generate frame images + video)
 python scripts/scripts_nut/2_inspect_nut_data.py --dataset data/nut_thread.npz
 
-# 指定 episode，生成力传感器曲线和 3D 轨迹
+# Specify episode, generate force curves and 3D trajectory
 python scripts/scripts_nut/2_inspect_nut_data.py --dataset data/nut_thread.npz \
     --episode 5 --enable_force_plot --enable_trajectory_plot
 ```
 
-输出目录: `data/inspect_<dataset_name>_<timestamp>/`
+Output directory: `data/inspect_<dataset_name>_<timestamp>/`
 
-生成内容：
-- `frame_N_table.png` — 桌面相机单帧图片
-- `frame_N_wrist_cam.png` — 腕部相机单帧图片
-- `frame_N_data.json` — 帧元数据 (ee_pose, action, force 等)
-- `episode_X_video.mp4` — 多相机拼接视频
-- `episode_X_with_force.mp4` — 带力/扭矩曲线 overlay 的视频
-- `episode_X_force_plot.png` — 力传感器时序曲线（需 `--enable_force_plot`）
-- `episode_X_trajectory.png` — 3D 轨迹图（需 `--enable_trajectory_plot`）
+Generated files:
+- `frame_N_table.png` — Table camera single frame
+- `frame_N_wrist_cam.png` — Wrist camera single frame
+- `frame_N_data.json` — Frame metadata (ee_pose, action, force, etc.)
+- `episode_X_video.mp4` — Multi-camera side-by-side video
+- `episode_X_with_force.mp4` — Video with force/torque curve overlay
+- `episode_X_force_plot.png` — Force sensor time-series plot (requires `--enable_force_plot`)
+- `episode_X_trajectory.png` — 3D trajectory plot (requires `--enable_trajectory_plot`)
 
 ---
 
-## 输出数据格式
+## Output Data Format
 
-所有脚本输出 NPZ 文件，内含 `episodes` 数组（list of dict）。每个 episode dict 包含：
+All scripts output NPZ files containing an `episodes` array (list of dicts). Each episode dict contains:
 
-| 字段 | Shape | Dtype | 说明 |
-|------|-------|-------|------|
-| `obs` | (T, obs_dim) | float32 | 策略观测 |
-| `state` | (T, state_dim) | float32 | 完整状态观测（privileged） |
-| `images` | (T, H, W, 3) | uint8 | 桌面相机 RGB |
-| `wrist_wrist_cam` | (T, H, W, 3) | uint8 | 腕部相机 RGB |
-| `ee_pose` | (T, 7) | float32 | 末端位姿 [x, y, z, qw, qx, qy, qz] |
-| `nut_pose` | (T, 7) | float32 | 螺母位姿 |
-| `bolt_pose` | (T, 7) | float32 | 螺栓位姿 |
-| `action` | (T, 7) | float32 | 动作 [pos(3), rot(3), gripper(1)] |
-| `ft_force` | (T, 3) | float32 | 力传感器 (Fx, Fy, Fz) |
-| `ft_force_raw` | (T, 6) | float32 | 原始力/扭矩 (Fx, Fy, Fz, Tx, Ty, Tz) |
-| `joint_pos` | (T, 7) | float32 | 机器人关节位置 |
-| `phase` | (T,) | int32 | 状态机阶段 ID |
-| `episode_length` | scalar | int | Episode 总步数 |
-| `success` | scalar | bool | 是否成功 |
-| `success_threshold` | scalar | float | 成功判定阈值 |
-| `wrist_cam_names` | list | str | 腕部相机名称列表 |
+| Field | Shape | Dtype | Description |
+|-------|-------|-------|-------------|
+| `obs` | (T, obs_dim) | float32 | Policy observation |
+| `state` | (T, state_dim) | float32 | Full state observation (privileged) |
+| `images` | (T, H, W, 3) | uint8 | Table camera RGB |
+| `wrist_wrist_cam` | (T, H, W, 3) | uint8 | Wrist camera RGB |
+| `ee_pose` | (T, 7) | float32 | End-effector pose [x, y, z, qw, qx, qy, qz] |
+| `nut_pose` | (T, 7) | float32 | Nut pose |
+| `bolt_pose` | (T, 7) | float32 | Bolt pose |
+| `action` | (T, 7) | float32 | Action [pos(3), rot(3), gripper(1)] |
+| `ft_force` | (T, 3) | float32 | Force sensor (Fx, Fy, Fz) |
+| `ft_force_raw` | (T, 6) | float32 | Raw force/torque (Fx, Fy, Fz, Tx, Ty, Tz) |
+| `joint_pos` | (T, 7) | float32 | Robot joint positions |
+| `phase` | (T,) | int32 | State machine phase ID |
+| `episode_length` | scalar | int | Episode total steps |
+| `success` | scalar | bool | Whether episode succeeded |
+| `success_threshold` | scalar | float | Success threshold value |
+| `wrist_cam_names` | list | str | Names of wrist cameras |
 
-### 读取示例
+### Reading Example
 
 ```python
 import numpy as np
@@ -203,72 +203,374 @@ print(f"Gripper action range: [{ep['action'][:, 6].min():.1f}, {ep['action'][:, 
 
 ---
 
-## FORGE 环境相关文件
+## FORGE Environment Files
 
-FORGE 环境代码位于 `isaaclab_tasks/isaaclab_tasks/direct/forge/`：
+FORGE environment code is located at `isaaclab_tasks/isaaclab_tasks/direct/forge/`:
 
-| 文件 | 说明 |
-|------|------|
-| `forge_env.py` | 主环境类（继承自 FactoryEnv），action 处理、力传感、奖励 |
-| `forge_env_cfg.py` | 环境配置（action bounds、控制器增益、观测噪声等） |
-| `forge_tasks_cfg.py` | 任务配置（NutThread、PegInsert、GearMesh） |
-| `forge_utils.py` | 工具函数（力/扭矩坐标变换等） |
-| `forge_events.py` | 域随机化事件（dead zone 等） |
+| File | Description |
+|------|-------------|
+| `forge_env.py` | Main environment class (extends FactoryEnv), action processing, force sensing, rewards |
+| `forge_env_cfg.py` | Environment config (action bounds, controller gains, observation noise, etc.) |
+| `forge_tasks_cfg.py` | Task config (NutThread, PegInsert, GearMesh) |
+| `forge_utils.py` | Utility functions (force/torque frame transforms, etc.) |
+| `forge_events.py` | Domain randomization events (dead zone, etc.) |
 
-### 关于夹爪控制的修改
+---
 
-原始 FORGE 环境**硬编码夹爪始终闭合** (`ctrl_target_gripper_dof_pos=0.0`)，
-因为 RL 训练中螺母拧紧任务不需要松手。
+## Required Patches (Reproduction Guide)
 
-我们在 `forge_env.py` 的 `_apply_action()` 中做了修改，让 `action[:, 6]` 控制夹爪：
+This project requires **two patches** to Isaac Lab's source code. Both modify files inside the installed
+`site-packages` directory because Isaac Sim's runtime extension loader reads from there rather than from
+workspace editable installs. **These patches must be re-applied after every reinstallation of Isaac Lab.**
 
+### Patch 1: Gripper Control in `forge_env.py`
+
+**File**: `isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py` (workspace copy is the source of truth)
+
+**Problem**: The original FORGE environment has **two issues** preventing gripper open/close:
+
+1. **Hardcoded closed gripper**: `_apply_action()` calls `generate_ctrl_signals(ctrl_target_gripper_dof_pos=0.0)`,
+   locking the gripper closed. `action[:, 6]` was used as a success prediction signal, not gripper control.
+
+2. **EMA smoothing makes gripper sluggish**: The parent `FactoryEnv._pre_physics_step()` applies EMA smoothing
+   to **all** action dimensions:
+   ```python
+   # factory_env.py _pre_physics_step()
+   self.actions = ema_factor * action + (1 - ema_factor) * self.actions
+   ```
+   With `ema_factor ∈ [0.025, 0.1]`, a -1→+1 gripper open command takes 30+ steps to converge,
+   making the gripper appear stuck.
+
+**Fix** — three modifications in `forge_env.py`:
+
+**Change 1** — Override `_pre_physics_step()` to capture raw gripper action before EMA:
 ```python
-# forge_env.py _apply_action() 末尾
-gripper_action = (self.actions[:, 6] + 1.0) / 2.0 * 0.04  # [-1,1] → [0, 0.04]
+def _pre_physics_step(self, action):
+    """Override to capture raw gripper action before EMA smoothing."""
+    self._raw_gripper_action = action[:, 6].clone()
+    super()._pre_physics_step(action)  # parent EMA still applies to arm joints
+```
+
+**Change 2** — In `_apply_action()`, use the raw (non-EMA) gripper command:
+```python
+# End of _apply_action() — bypass EMA, use raw value directly
+if hasattr(self, '_raw_gripper_action'):
+    gripper_action = (self._raw_gripper_action + 1.0) / 2.0 * 0.04  # [-1,1] → [0, 0.04]m
+else:
+    gripper_action = (self.actions[:, 6] + 1.0) / 2.0 * 0.04  # fallback
+
 self.generate_ctrl_signals(
     ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
     ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
-    ctrl_target_gripper_dof_pos=gripper_action,  # 替代原来的 0.0
+    ctrl_target_gripper_dof_pos=gripper_action,  # replaces the original 0.0
 )
 ```
 
-Franka 夹爪 DOF 范围: `[0.0, 0.04]` 米 (0 = 全闭, 0.04 = 全开)。
+**Change 3** — In `_reset_idx()`, initialize `_raw_gripper_action` to -1.0 (closed):
+```python
+if not hasattr(self, '_raw_gripper_action'):
+    self._raw_gripper_action = torch.full((self.num_envs,), -1.0, device=self.device)
+else:
+    self._raw_gripper_action[:] = -1.0
+```
 
-> **注意**: 此修改会影响 `_get_rewards()` 中的 success prediction reward 计算
-> （原来读取 `action[:, 6]` 作为 success prediction）。若仅用于数据采集则无影响；
-> 若需要 RL 训练，需同步修改 reward 函数。
+Franka gripper DOF range: `[0.0, 0.04]` meters (0 = fully closed, 0.04 = fully open).
 
-### 关于相机渲染的修复（libGLU）
+> **Note**: This modification affects `_get_rewards()` which originally reads `action[:, 6]` as a success
+> prediction. For data collection only this is harmless; for RL training, the reward function must be
+> updated accordingly.
 
-Isaac Sim 的 RTX 渲染管线依赖 `libGLU.so.1`。如果 conda 环境中缺少该库，
-所有 RTX shader 将加载失败（日志中会出现 29 条 "Cannot load shader" 错误），
-导致相机传感器返回空图像 `(T, 0)` 而非正常的 `(T, H, W, 3)`。
-
-**诊断方法**：查看相机数据 shape 是否为 `(num_envs, 0)` 而非 `(num_envs, H, W, 3)`。
-
-**修复方法**：
+**Deployment** — Isaac Sim loads `isaaclab_tasks` from site-packages at runtime, **not** from the
+workspace editable install. After editing the workspace copy, sync it to site-packages:
 
 ```bash
-# 方法 1：从 conda 包缓存复制
+# 1. Find the site-packages path
+SITE_PKG=$(python -c "import isaaclab_tasks; import os; print(os.path.dirname(isaaclab_tasks.__file__))")
+
+# 2. Copy the modified file
+cp isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py "$SITE_PKG/direct/forge/forge_env.py"
+
+# 3. Clear .pyc cache
+find "$SITE_PKG/direct/forge/" -name "*.pyc" -delete
+find "$SITE_PKG/direct/forge/__pycache__" -type f -delete 2>/dev/null
+```
+
+**Verification**: Add this to your collection script to confirm the correct file is loaded at runtime:
+```python
+import inspect
+print(inspect.getfile(type(env.unwrapped)))  # should point to site-packages
+```
+
+---
+
+### Patch 2: Camera Rendering Fix in `simulation_context.py`
+
+**File**: `<site-packages>/isaaclab/source/isaaclab/isaaclab/sim/simulation_context.py`
+
+This patch is applied **directly to the Isaac Lab library**. The workspace does not contain a copy of this file.
+
+#### Problem A: Empty Camera Images — Missing `libGLU`
+
+Isaac Sim's RTX rendering pipeline requires `libGLU.so.1`. If missing from the conda environment,
+all RTX shaders fail to load (log shows 29 "Cannot load shader" errors), causing camera sensors to
+return empty images with shape `(T, 0)` instead of `(T, H, W, 3)`.
+
+**Diagnosis**: Check if camera data shape is `(num_envs, 0)` instead of `(num_envs, H, W, 3)`.
+
+**Fix**:
+```bash
+# Option 1: Copy from conda package cache
 cp /path/to/conda/pkgs/libglu-*/lib/libGLU.so* $CONDA_PREFIX/lib/
 
-# 方法 2：conda 安装
+# Option 2: conda install
 conda install -c conda-forge libglu
 
-# 验证
+# Verify
 ls $CONDA_PREFIX/lib/libGLU.so.1
 ```
 
-> **注意**: 此问题同时影响 FORGE 环境（DirectRLEnv）和 pick-place 环境（ManagerBasedRLEnv），
-> 是系统级的渲染管线问题，与具体任务无关。
+> **Note**: This issue affects all environments (DirectRLEnv and ManagerBasedRLEnv alike) —
+> it is a system-level rendering pipeline problem, not task-specific.
 
-### 关于 disable_fabric 参数
+#### Problem B: Camera Images Exist but Don't Update — PhysX Fabric Sync Missing
 
-使用相机传感器采集图像时，需要禁用 Fabric 后端以保证 USD stage 同步：
+**Symptom**: Camera image shape is correct `(T, 128, 128, 3)`, but all frames show the same static scene.
+Frame-to-frame mean pixel difference < 1.0 (only render noise), even though the end-effector moves 5+ cm.
+
+**Root cause**: When `--disable_fabric 1` is used (required for camera sensors), Isaac Lab's
+`SimulationContext.forward()` method is responsible for syncing PhysX simulation data to the renderer
+before each `_app.update()`. The **original** `forward()` looks like:
+
+```python
+# ORIGINAL (broken with disable_fabric=1)
+def forward(self) -> None:
+    if self._fabric_iface is not None:           # <-- gates EVERYTHING on fabric
+        if self.physics_sim_view is not None and self.is_playing():
+            self.physics_sim_view.update_articulations_kinematic()
+        self._update_fabric(0.0, 0.0)
+```
+
+When fabric is disabled, `self._fabric_iface = None`, so **nothing** executes — no articulation kinematic
+update and no data sync to the Hydra renderer. The rendered scene stays frozen at its initial state.
+
+Isaac Lab overrides `render()` and does **not** call `super().render()`. The base class
+(`isaacsim.core.api.SimulationContext.render()`) contains fallback logic that lazily loads
+`physx_fabric_interface` and calls `force_update()` even when fabric is "disabled" — this is the
+mechanism that syncs PhysX data to the renderer. Isaac Lab's override skips this entirely.
+
+**Fix**: Replace the `forward()` method with a patched version that:
+1. Always calls `update_articulations_kinematic()` (regardless of fabric state)
+2. Falls back to raw `physx_fabric_interface.force_update()` when Isaac Lab's fabric interface is disabled
+
+#### How to Apply Patch 2
+
+**Step 1**: Locate the file:
+```bash
+SIMCTX=$(python -c "
+import isaaclab.sim.simulation_context as m
+import os
+print(os.path.abspath(m.__file__))
+")
+echo "File to patch: $SIMCTX"
+```
+
+This is typically at:
+```
+<conda_env>/lib/python3.11/site-packages/isaaclab/source/isaaclab/isaaclab/sim/simulation_context.py
+```
+
+**Step 2**: Find the `forward()` method (around line 466). The **original** code looks like:
+```python
+    def forward(self) -> None:
+        """Updates articulation kinematics and fabric for rendering."""
+        if self._fabric_iface is not None:
+            if self.physics_sim_view is not None and self.is_playing():
+                # Update the articulations' link's poses before rendering
+                self.physics_sim_view.update_articulations_kinematic()
+            self._update_fabric(0.0, 0.0)
+```
+
+**Step 3**: Replace it with the following patched version:
+```python
+    def forward(self) -> None:
+        """Updates articulation kinematics and fabric for rendering."""
+        # [PATCHED] Always sync articulation link poses to renderer, even without fabric.
+        # Original code gated this on _fabric_iface, causing stale camera images
+        # when disable_fabric=1 (Camera sensor requirement).
+        if self.physics_sim_view is not None and self.is_playing():
+            self.physics_sim_view.update_articulations_kinematic()
+        if self._fabric_iface is not None:
+            self._update_fabric(0.0, 0.0)
+        else:
+            # [PATCHED] When Isaac Lab's fabric is disabled (disable_fabric=1), we still
+            # need to sync PhysX data to the renderer via the physx fabric interface.
+            # The base class SimulationContext.render() does this lazily, but since Isaac Lab
+            # overrides render() and calls forward() instead of super().render(), we handle it here.
+            if not hasattr(self, '_physx_fabric_fallback'):
+                self._physx_fabric_fallback = None
+                try:
+                    if self._extension_manager.is_extension_enabled("omni.physx.fabric"):
+                        from omni.physxfabric import get_physx_fabric_interface
+                        self._physx_fabric_fallback = get_physx_fabric_interface()
+                except Exception:
+                    pass
+            if self._physx_fabric_fallback is not None:
+                self._physx_fabric_fallback.force_update(0.0, 0.0)
+```
+
+**Step 4**: Clear the `.pyc` cache so Python recompiles the module:
+```bash
+find "$(dirname "$SIMCTX")/__pycache__" -name "simulation_context*" -delete
+```
+
+**Step 5** (optional): Back up the original file before patching:
+```bash
+cp "$SIMCTX" "${SIMCTX}.bak"
+```
+
+#### Automated Patch Script
+
+For convenience, here is a one-shot Python script that applies Patch 2 automatically:
+
+```python
+"""Apply camera rendering patch to Isaac Lab's simulation_context.py.
+Run with the target conda environment activated."""
+
+import isaaclab.sim.simulation_context as m
+import os
+
+simctx_path = os.path.abspath(m.__file__)
+print(f"Patching: {simctx_path}")
+
+with open(simctx_path, 'r') as f:
+    content = f.read()
+
+# The original forward() — match both possible indentation styles
+ORIGINAL = '''    def forward(self) -> None:
+        """Updates articulation kinematics and fabric for rendering."""
+        if self._fabric_iface is not None:
+            if self.physics_sim_view is not None and self.is_playing():
+                # Update the articulations' link's poses before rendering
+                self.physics_sim_view.update_articulations_kinematic()
+            self._update_fabric(0.0, 0.0)'''
+
+PATCHED = '''    def forward(self) -> None:
+        """Updates articulation kinematics and fabric for rendering."""
+        # [PATCHED] Always sync articulation link poses to renderer, even without fabric.
+        # Original code gated this on _fabric_iface, causing stale camera images
+        # when disable_fabric=1 (Camera sensor requirement).
+        if self.physics_sim_view is not None and self.is_playing():
+            self.physics_sim_view.update_articulations_kinematic()
+        if self._fabric_iface is not None:
+            self._update_fabric(0.0, 0.0)
+        else:
+            # [PATCHED] When Isaac Lab's fabric is disabled (disable_fabric=1), we still
+            # need to sync PhysX data to the renderer via the physx fabric interface.
+            if not hasattr(self, '_physx_fabric_fallback'):
+                self._physx_fabric_fallback = None
+                try:
+                    if self._extension_manager.is_extension_enabled("omni.physx.fabric"):
+                        from omni.physxfabric import get_physx_fabric_interface
+                        self._physx_fabric_fallback = get_physx_fabric_interface()
+                except Exception:
+                    pass
+            if self._physx_fabric_fallback is not None:
+                self._physx_fabric_fallback.force_update(0.0, 0.0)'''
+
+if '[PATCHED]' in content:
+    print("Already patched — skipping.")
+elif ORIGINAL in content:
+    content = content.replace(ORIGINAL, PATCHED, 1)
+    # Back up original
+    with open(simctx_path + '.bak', 'w') as f_bak:
+        f_bak.write(content)
+    with open(simctx_path, 'w') as f:
+        f.write(content)
+    print("Patched successfully.")
+    # Clear .pyc
+    cache_dir = os.path.join(os.path.dirname(simctx_path), '__pycache__')
+    if os.path.isdir(cache_dir):
+        for fname in os.listdir(cache_dir):
+            if fname.startswith('simulation_context'):
+                os.remove(os.path.join(cache_dir, fname))
+                print(f"  Removed cache: {fname}")
+    print("Done.")
+else:
+    print("ERROR: Could not find the original forward() code to patch.")
+    print("The file may have been modified or the Isaac Lab version is different.")
+    print("Please apply the patch manually — see README for the exact code.")
+```
+
+**Usage**:
+```bash
+conda activate <your_env>
+python scripts/scripts_nut/patch_simulation_context.py
+```
+
+#### Verification
+
+After applying both patches, run a short test and check that camera images actually update:
+
+```python
+import numpy as np
+data = np.load("data/test.npz", allow_pickle=True)
+imgs = data["episodes"][0]["images"]
+# Frame-to-frame diff should be >> 1.0 (typically 2-10)
+diff = np.abs(imgs[1].astype(float) - imgs[0].astype(float)).mean()
+print(f"Frame 0→1 mean pixel diff: {diff:.2f}")  # Should be > 1.5, not ~0.5
+# Large gap diff should show significant change
+diff_large = np.abs(imgs[-1].astype(float) - imgs[0].astype(float)).mean()
+print(f"Frame 0→{len(imgs)-1} mean pixel diff: {diff_large:.2f}")  # Should be > 5.0
+```
+
+---
+
+### About `--disable_fabric`
+
+When collecting data with camera sensors, the Fabric backend must be disabled to ensure USD stage
+synchronization:
 
 ```bash
 python scripts/scripts_nut/1_collect_data_nut_thread.py --headless --disable_fabric 1 ...
 ```
 
-如果不加 `--disable_fabric 1`，相机可能仍然工作，但在某些配置下可能导致
-场景数据不同步。建议图像采集时始终加此参数。
+Without `--disable_fabric 1`, cameras may still capture images in some configurations, but scene data
+may be out of sync. **Always use this flag when collecting image data.**
+
+---
+
+## Quick-Start Reproduction Checklist
+
+On a fresh Isaac Lab installation, apply patches in this order:
+
+```bash
+# 0. Activate environment
+conda activate rev2fwd_il
+
+# 1. Apply Patch 1: Gripper control (copy workspace forge_env.py → site-packages)
+SITE_PKG=$(python -c "import isaaclab_tasks; import os; print(os.path.dirname(isaaclab_tasks.__file__))")
+cp isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py "$SITE_PKG/direct/forge/forge_env.py"
+find "$SITE_PKG/direct/forge/__pycache__" -name "*.pyc" -delete 2>/dev/null
+
+# 2. Apply Patch 2: Camera rendering (run automated script or patch manually)
+python scripts/scripts_nut/patch_simulation_context.py
+
+# 3. (If needed) Install libGLU for RTX shader loading
+conda install -c conda-forge libglu
+
+# 4. Verify with a short collection
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_nut/1_collect_data_nut_thread.py \
+    --headless --num_episodes 1 --horizon 50 --disable_fabric 1 \
+    --out /tmp/patch_test.npz
+
+# 5. Check image updates
+python -c "
+import numpy as np
+d = np.load('/tmp/patch_test.npz', allow_pickle=True)
+imgs = d['episodes'][0]['images']
+diff = np.abs(imgs[-1].astype(float) - imgs[0].astype(float)).mean()
+print(f'First-to-last frame diff: {diff:.2f} (should be > 5.0)')
+act = d['episodes'][0]['action']
+print(f'Gripper action range: [{act[:,6].min():.1f}, {act[:,6].max():.1f}] (should be [-1.0, 1.0])')
+"
+```

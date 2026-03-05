@@ -526,7 +526,6 @@ class NutThreadingExpert:
         max_torque_threshold: float = 3.0,       # Max Z-torque before stopping (Nm, increased from 1.5)
         # Engagement parameters
         engage_rotation_speed: float = 0.4,      # Rotation during engage (faster than before)
-        reverse_rotation_steps: int = 15,        # Steps to reverse-rotate to find thread start
     ):
         """Initialize the nut threading expert with force feedback.
         
@@ -564,14 +563,14 @@ class NutThreadingExpert:
         self.thread_downward_action = thread_downward_action
         self.max_torque_threshold = max_torque_threshold
         self.engage_rotation_speed = engage_rotation_speed
-        self.reverse_rotation_steps = reverse_rotation_steps
+        self.engage_yaw_increment = 0.005  # Very slow CW rotation during engage to catch threads
         
         # State tracking
         self.step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
         self.phase = torch.zeros(num_envs, dtype=torch.int32, device=device)
         # Phases: 
-        #   0=approach, 1=search, 2=engage, 3=thread, 4=done
-        #   5=release (let go of nut), 6=reposition (rotate back to -1), 7=regrasp (grab nut again)
+        #   0=approach, 1=search, 2=engage (CW rotation to catch threads), 3=thread (CW until limit)
+        #   4=done, 5=release (open gripper), 6=reposition (CCW to recover range), 7=regrasp (close gripper)
         
         self.phase_step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
         
@@ -596,11 +595,14 @@ class NutThreadingExpert:
         # Phase timing limits
         self.approach_timeout = 60     # Max steps in approach (reduced)
         self.search_timeout = 100      # Max steps in search (reduced from 200)
-        self.engage_timeout = 60       # Max steps in engage attempt (reduced)
+        self.engage_timeout = 40       # Max steps in engage (shorter to avoid wasting yaw range)
         self.thread_timeout = 400      # Max steps in threading
-        self.release_timeout = 30      # Max steps in release phase
-        self.reposition_timeout = 60   # Max steps in reposition phase
-        self.regrasp_timeout = 60      # Max steps in regrasp phase
+        self.release_depress_steps = 5  # Steps to cancel downward pressure before opening gripper
+        self.release_open_steps = 20   # Steps to open gripper (ensure fully open before moving)
+        self.release_timeout = 25      # Total steps in release phase (depress + open gripper)
+        self.reposition_timeout = 80   # Max steps in reposition phase (CCW back to -1.0)
+        self.regrasp_close_steps = 20  # Steps to close gripper (ensure fully clamped)
+        self.regrasp_timeout = 20      # = close_steps. REGRASP only grips, pressing is in THREAD
         
         # Debug: phase entry timestamps
         self.phase_entry_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
@@ -615,7 +617,7 @@ class NutThreadingExpert:
         # Multi-turn tracking
         self.regrasp_count = torch.zeros(num_envs, dtype=torch.int32, device=device)  # How many times we've regripped
         self.max_regrasp_cycles = 15  # Allow up to 15 regrasp cycles (~15 * 270° = 4050° = ~11 turns)
-        self.yaw_threshold_for_regrasp = 0.9  # When to trigger regrasp (close to +1.0 limit)
+        self.yaw_threshold_for_regrasp = 0.95  # When to trigger regrasp (maximize CW range)
         
     def reset(self, env_ids=None):
         """Reset expert state for specified environments."""
@@ -780,7 +782,8 @@ class NutThreadingExpert:
             next_phase = torch.where(timeout, torch.full_like(next_phase, 2), next_phase)
         
         # =====================================================================
-        # PHASE 2: ENGAGE - Try to catch threads with rotation + pressure
+        # PHASE 2: ENGAGE - Clockwise rotation + downward pressure to catch threads
+        # Straightforward CW rotation with slower increment than THREAD
         # =====================================================================
         engage_mask = phase_snapshot == 2
         if engage_mask.any():
@@ -790,23 +793,16 @@ class NutThreadingExpert:
                 self.engage_step_count[first_step] = 0
                 self.initial_z[first_step] = current_z[first_step]
             
-            # Center on bolt + downward pressure + rotation
+            # Center on bolt + downward pressure + clockwise rotation
             action[engage_mask, 0:2] = 0.0  # Center XY
-            action[engage_mask, 2] = -0.4   # Firm downward pressure (increased)
+            action[engage_mask, 2] = -0.4   # Firm downward pressure
             
-            # TRICK: Reverse-then-forward rotation to find thread start
-            # First few steps: rotate backwards (CCW) to find thread engagement point
-            # Then: rotate forwards (CW) to catch and start threading
-            # FORGE uses TARGET poses, so we increment cumulative target
-            is_reverse_phase = self.phase_step_count <= self.reverse_rotation_steps
-            yaw_delta = torch.where(
-                is_reverse_phase,
-                torch.full((self.num_envs,), -self.yaw_increment_per_step * 2, device=self.device),  # Reverse faster
-                torch.full((self.num_envs,), self.yaw_increment_per_step, device=self.device)       # Forward
-            )
+            # Clockwise rotation: slower increment to carefully catch threads
+            # engage_yaw_increment (0.02) is slower than thread's 0.05
+            # This keeps yaw below regrasp threshold during engagement
             self.cumulative_yaw_target = torch.where(
                 engage_mask,
-                (self.cumulative_yaw_target + yaw_delta).clamp(-1.0, 1.0),
+                (self.cumulative_yaw_target + self.engage_yaw_increment).clamp(-1.0, 1.0),
                 self.cumulative_yaw_target
             )
             action[engage_mask, 5] = self.cumulative_yaw_target[engage_mask]
@@ -842,7 +838,8 @@ class NutThreadingExpert:
             next_phase = torch.where(timeout, torch.full_like(next_phase, 3), next_phase)
         
         # =====================================================================
-        # PHASE 3: THREAD - Continuous rotation with adaptive pressure
+        # PHASE 3: THREAD - Continue CW rotation until reaching motor limit
+        # When yaw reaches threshold, trigger RELEASE→REPOSITION→REGRASP cycle
         # =====================================================================
         thread_mask = phase_snapshot == 3
         if thread_mask.any():
@@ -860,12 +857,15 @@ class NutThreadingExpert:
             
             # Stall detection: check if progress has stalled
             # Every stall_threshold steps, check if we made minimum progress
+            # NOTE: Only go back to SEARCH if we haven't done any regrasp cycles yet.
+            # After regrasp, the nut is already engaged - stalling likely means we need
+            # more force or the threading is done, not that we lost alignment.
             check_stall = thread_mask & (self.phase_step_count % self.stall_threshold == 0) & (self.phase_step_count > 0)
             if check_stall.any():
                 progress_delta = self.z_progress - self.last_z_progress
                 is_stalled = check_stall & (progress_delta < self.min_progress_per_window)
-                # If stalled and force is low (not engaged), go back to SEARCH
-                stall_and_low_force = is_stalled & (fz.abs() < self.engage_force_threshold * 0.8)
+                # Only go back to SEARCH if no regrasp has happened (first threading attempt)
+                stall_and_low_force = is_stalled & (fz.abs() < self.engage_force_threshold * 0.8) & (self.regrasp_count == 0)
                 next_phase = torch.where(stall_and_low_force, torch.full_like(next_phase, 1), next_phase)
                 # Update last_z_progress for next check
                 self.last_z_progress = torch.where(check_stall, self.z_progress.clone(), self.last_z_progress)
@@ -945,7 +945,10 @@ class NutThreadingExpert:
             next_phase = torch.where(timeout, torch.full_like(next_phase, 4), next_phase)
         
         # =====================================================================
-        # PHASE 5: RELEASE - Lift up and open gripper to release nut
+        # PHASE 5: RELEASE - Cancel pressure, then open gripper fully before any movement
+        # Sub-phase A (steps 1..depress_steps): Stop pressing, keep gripper CLOSED
+        # Sub-phase B (steps depress+1..timeout): Open gripper, hold everything else still
+        # Only transitions after gripper has had enough time to fully open.
         # =====================================================================
         release_mask = phase_snapshot == 5
         if release_mask.any():
@@ -954,78 +957,92 @@ class NutThreadingExpert:
             if first_step.any():
                 self.regrasp_count[first_step] += 1
             
-            # Lift up to create clearance, maintain current yaw
-            action[release_mask, 0:2] = 0.0  # Stay centered XY
-            action[release_mask, 2] = 0.5    # Move UP
-            action[release_mask, 3:5] = 0.0  # No roll/pitch change
+            # No translation at all — only rotate. Keep yaw.
+            action[release_mask, 0:2] = 0.0  # No XY
+            action[release_mask, 2] = 0.0    # No Z (cancel pressure)
+            action[release_mask, 3:5] = 0.0  # No roll/pitch
             action[release_mask, 5] = self.cumulative_yaw_target[release_mask]  # Keep yaw
-            action[release_mask, 6] = 1.0    # OPEN GRIPPER (release nut)
             
-            # After some steps, transition to REPOSITION
-            lifted_enough = release_mask & (self.phase_step_count > self.release_timeout)
-            next_phase = torch.where(lifted_enough, torch.full_like(next_phase, 6), next_phase)
+            # Sub-phase A: Keep gripper CLOSED while canceling pressure
+            still_depressing = release_mask & (self.phase_step_count <= self.release_depress_steps)
+            action[still_depressing, 6] = -1.0  # Keep CLOSED
+            
+            # Sub-phase B: Open gripper — stay completely still until fully open
+            ready_to_open = release_mask & (self.phase_step_count > self.release_depress_steps)
+            action[ready_to_open, 6] = 1.0  # OPEN GRIPPER
+            
+            # Only transition after release_timeout — gripper must be fully open first
+            released = release_mask & (self.phase_step_count > self.release_timeout)
+            next_phase = torch.where(released, torch.full_like(next_phase, 6), next_phase)
         
         # =====================================================================
-        # PHASE 6: REPOSITION - Rotate yaw back to starting position (-1.0)
+        # PHASE 6: REPOSITION - Rotate counterclockwise to recover motor range
+        # Gripper open, yaw target set to -1.0 immediately. The FORGE env's
+        # rot_threshold clips the actual rotation per physics step, so the
+        # wrist rotates CCW at max controller speed until reaching -1.0.
+        # Transition uses actual EE yaw (from fingertip_quat) to confirm
+        # the robot physically reached the target, not just the command.
         # =====================================================================
         reposition_mask = phase_snapshot == 6
         if reposition_mask.any():
-            # Keep lifted, rotate yaw back towards -1.0 (starting position)
-            action[reposition_mask, 0:2] = 0.0  # Stay centered XY
-            action[reposition_mask, 2] = 0.3    # Stay lifted
+            # Stay in place, rotate yaw back. Nut is on bolt, gripper open.
+            # Use z=-0.2 to compensate for upward kinematic drift during wrist rotation.
+            # (action[2]=0.0 maps to center-Z which is ABOVE the threading level,
+            #  and wrist rotation kinematic coupling lifts the EE ~12mm if uncompensated)
+            action[reposition_mask, 0:2] = 0.0  # No XY movement
+            action[reposition_mask, 2] = -0.2   # Light downward to prevent upward drift
             action[reposition_mask, 3:5] = 0.0  # No roll/pitch change
             action[reposition_mask, 6] = 1.0    # Keep gripper OPEN
             
-            # Decrement yaw target back towards -0.8 (leave some margin from -1.0)
-            # Use larger steps for faster repositioning
-            reposition_yaw_step = 0.08
+            # Immediately set yaw target to full CCW limit (-1.0)
+            # The FORGE rot_threshold handles the actual rotation speed limiting.
+            # With ema_factor=1.0, the env receives -1.0 directly.
             self.cumulative_yaw_target = torch.where(
                 reposition_mask,
-                (self.cumulative_yaw_target - reposition_yaw_step).clamp(-0.8, 1.0),
+                torch.full_like(self.cumulative_yaw_target, -1.0),
                 self.cumulative_yaw_target
             )
-            action[reposition_mask, 5] = self.cumulative_yaw_target[reposition_mask]
+            action[reposition_mask, 5] = -1.0
             
-            # Transition to REGRASP when yaw is back near starting position
-            yaw_repositioned = reposition_mask & (self.cumulative_yaw_target <= -0.75)
-            next_phase = torch.where(yaw_repositioned, torch.full_like(next_phase, 7), next_phase)
+            # Check actual joint6 position for transition. Joint6 is the wrist yaw joint.
+            # When it reaches below the initial approach value (~-1.15 rad = -66°), the
+            # reposition has recovered sufficient rotation range.
+            # Note: fingertip_quat yaw extraction is unreliable for a downward-pointing gripper
+            # (Euler gimbal lock near ±180°), so we use the raw joint position instead.
+            # We get joint_pos from the environment if available.
+            if hasattr(self, '_forge_env') and self._forge_env is not None:
+                robot_joint_pos = self._forge_env._robot.data.joint_pos[:, 6]  # Joint 6 = wrist yaw
+                # Target: j6 <= -1.15 rad (-66°), similar to the initial approach position
+                j6_repositioned = reposition_mask & (robot_joint_pos <= -1.15)
+                next_phase = torch.where(j6_repositioned, torch.full_like(next_phase, 7), next_phase)
             
-            # Timeout: force transition
+            # Timeout: force transition after reposition_timeout steps
             timeout = reposition_mask & (self.phase_step_count > self.reposition_timeout)
             next_phase = torch.where(timeout, torch.full_like(next_phase, 7), next_phase)
         
         # =====================================================================
-        # PHASE 7: REGRASP - Descend and close gripper to regrasp nut
+        # PHASE 7: REGRASP - ONLY close gripper. No pressing here.
+        # Pressing happens in the next phase (THREAD) after the gripper is
+        # confirmed fully clamped. This ensures we don't push down on a
+        # half-open gripper which would miss the nut.
         # =====================================================================
         regrasp_mask = phase_snapshot == 7
         if regrasp_mask.any():
-            # Descend towards nut
-            action[regrasp_mask, 0:2] = 0.0  # Stay centered XY
+            # No translation at all — only yaw rotation while closing
+            action[regrasp_mask, 0:2] = 0.0  # No XY movement
+            action[regrasp_mask, 2] = 0.0    # No Z movement (no pressing!)
             action[regrasp_mask, 3:5] = 0.0  # No roll/pitch change
             action[regrasp_mask, 5] = self.cumulative_yaw_target[regrasp_mask]  # Keep yaw
+            action[regrasp_mask, 6] = -1.0   # CLOSE gripper throughout
             
-            # Two sub-phases: descend, then close gripper
-            descend_steps = self.regrasp_timeout // 2
-            is_descending = self.phase_step_count <= descend_steps
-            
-            # Descend phase: move down with open gripper
-            action[regrasp_mask, 2] = torch.where(
-                is_descending[regrasp_mask],
-                torch.full((regrasp_mask.sum(),), -0.4, device=self.device),
-                torch.full((regrasp_mask.sum(),), -0.2, device=self.device)  # Lighter when closing
-            )
-            action[regrasp_mask, 6] = torch.where(
-                is_descending[regrasp_mask],
-                torch.full((regrasp_mask.sum(),), 1.0, device=self.device),   # Open during descend
-                torch.full((regrasp_mask.sum(),), -1.0, device=self.device)   # Close to grasp
-            )
-            
-            # Transition back to THREAD after completing regrasp
+            # Transition back to THREAD after full regrasp sequence
             regrasp_done = regrasp_mask & (self.phase_step_count > self.regrasp_timeout)
             if regrasp_done.any():
                 # Reset z_progress for the new threading cycle (keeping z_progress_total)
                 self.z_progress[regrasp_done] = 0.0
                 self.initial_z[regrasp_done] = current_z[regrasp_done]
+                self.stall_counter[regrasp_done] = 0
+                self.last_z_progress[regrasp_done] = 0.0
             next_phase = torch.where(regrasp_done, torch.full_like(next_phase, 3), next_phase)
         
         # =====================================================================
@@ -1065,7 +1082,18 @@ class NutThreadingExpert:
         return self.phase == 4
     
     def get_phase_names(self) -> list:
-        """Return human-readable phase names for debugging."""
+        """Return human-readable phase names for debugging.
+        
+        Phase indices:
+            0: APPROACH  - Move down until contact
+            1: SEARCH    - Spiral to find thread alignment
+            2: ENGAGE    - Reverse-then-forward rotation to catch threads
+            3: THREAD    - Continuous rotation + downward pressure
+            4: DONE      - Task complete
+            5: RELEASE   - Open gripper in-place (nut stays on bolt)
+            6: REPOSITION - Rotate yaw back with gripper open
+            7: REGRASP   - Close gripper, then resume THREAD
+        """
         return ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE", "RELEASE", "REPOSITION", "REGRASP"]
     
     def get_debug_info(self) -> dict:
@@ -1137,6 +1165,19 @@ def rollout_nut_threading(
     
     # Get the underlying FORGE env
     forge_env = env.unwrapped
+    
+    # Give expert a reference to forge_env for joint position checks
+    expert._forge_env = forge_env
+    
+    # =========================================================================
+    # Override EMA factor for deterministic scripted data collection.
+    # FORGE randomizes ema_factor in [0.025, 0.1], which causes extreme smoothing
+    # that prevents rapid yaw changes (e.g., REPOSITION CCW never completes).
+    # Setting ema_factor=1.0 means the raw action is used directly (no smoothing).
+    # =========================================================================
+    import torch as _torch
+    forge_env.ema_factor = _torch.ones_like(forge_env.ema_factor)
+    print(f"[DEBUG] rollout: Overrode ema_factor to 1.0 (was randomized in [{forge_env.cfg.ctrl.ema_factor_range[0]}, {forge_env.cfg.ctrl.ema_factor_range[1]}])")
     
     # =========================================================================
     # Step 2: Initialize per-env recording buffers
@@ -1261,8 +1302,18 @@ def rollout_nut_threading(
             ft_force_raw = torch.zeros(num_envs, 6, device=device)
             ft_force = torch.zeros(num_envs, 3, device=device)
         
-        # Joint positions
+        # Joint positions (arm only for backward compatibility)
         joint_pos = forge_env._robot.data.joint_pos[:, :7]
+        
+        # Also capture finger joint positions for gripper debugging
+        finger_joint_pos = forge_env._robot.data.joint_pos[:, 7:9]
+        if t == 0 or (t + 1) % 50 == 0:
+            ema_gripper = forge_env.actions[:, 6].item() if num_envs == 1 else forge_env.actions[0, 6].item()
+            raw_gripper = getattr(forge_env, '_raw_gripper_action', None)
+            raw_val = raw_gripper[0].item() if raw_gripper is not None else 'N/A'
+            finger_pos_val = finger_joint_pos[0].cpu().numpy()
+            print(f"[GRIPPER DEBUG] t={t+1}: raw_action={raw_val}, ema_action={ema_gripper:.4f}, "
+                  f"finger_joints=[{finger_pos_val[0]:.5f}, {finger_pos_val[1]:.5f}]")
         
         # EE pose
         ee_pose = torch.cat([fingertip_pos, fingertip_quat], dim=-1)
@@ -1379,7 +1430,7 @@ def rollout_nut_threading(
             "ft_force_raw": np.array(ft_force_raw_lists[i], dtype=np.float32),
             "joint_pos": np.array(joint_pos_lists[i], dtype=np.float32),
             "phase": np.array(phase_lists[i], dtype=np.int32),  # Expert state machine phase
-            "phase_names": ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE"],  # Phase name mapping
+            "phase_names": ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE", "RELEASE", "REPOSITION", "REGRASP"],  # Phase name mapping
             "episode_length": len(obs_lists[i]),
             "success": False,  # Will be determined by inspection
             "success_threshold": success_threshold,

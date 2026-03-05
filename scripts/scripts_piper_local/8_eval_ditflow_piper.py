@@ -1601,16 +1601,17 @@ def run_episode(
 
         gripper_val = float(action[6]) if len(action) > 6 else 1.0
 
-        # Force gripper OPEN for the last 50 steps before max_steps
-        remaining_steps = max_steps - step
-        if remaining_steps <= 50:
-            action[6] = 1.0
-            if remaining_steps == 50:
-                print(f"\033[1;33m  🖐 Step {step}: FORCE GRIPPER OPEN for last 50 steps (remaining={remaining_steps})\033[0m", flush=True)
-        # Every-frame gripper close detection: force to 0.3 to ensure tight closure
-        elif gripper_val < 0.9:
+        # Gripper forcing: when the model predicts "close" (val < 0.9),
+        # override to a small value (0.3) to ensure the gripper applies
+        # enough clamping force—some objects slip if the target is too high.
+        if gripper_val < 0.9:
             action[6] = 0.3
-            print(f"\033[1;31m  ✊ Step {step}: GRIPPER CLOSE  gripper={gripper_val:.3f} (forced to 0.3)\033[0m", flush=True)
+            print(f"  Step {step}: gripper forcing {gripper_val:.3f} -> 0.3", flush=True)
+
+        # In the last 50 steps, force gripper open so the arm returns to
+        # its initial (open) state, ready for the next episode.
+        if step >= max_steps - 50:
+            action[6] = 1.0
 
         # Record action into episode data (after gripper forcing)
         if episode_data is not None:
@@ -1661,6 +1662,16 @@ def run_episode(
         actual_positions.append(current_xyz.copy())
         integrated_xyz_snapshot = np.array([integrated_pose['x'], integrated_pose['y'], integrated_pose['z']])
         integrated_positions.append(integrated_xyz_snapshot.copy())
+
+        # =================================================================
+        # Clamp integrated pose to workspace limits BEFORE sending.
+        # This prevents "pose debt" where the integrated pose drifts
+        # far beyond workspace bounds, requiring many reverse deltas
+        # before the arm starts responding to directional changes.
+        # =================================================================
+        integrated_pose['x'] = max(WORKSPACE_LIMITS["x_min"], min(WORKSPACE_LIMITS["x_max"], integrated_pose['x']))
+        integrated_pose['y'] = max(WORKSPACE_LIMITS["y_min"], min(WORKSPACE_LIMITS["y_max"], integrated_pose['y']))
+        integrated_pose['z'] = max(WORKSPACE_LIMITS["z_min"], min(WORKSPACE_LIMITS["z_max"], integrated_pose['z']))
 
         # =================================================================
         # Send integrated pose to robot (NOT current_pose + delta)

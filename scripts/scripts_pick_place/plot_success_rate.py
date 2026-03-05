@@ -20,6 +20,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def wilson_ci(successes, total, z=1.96):
+    """Wilson score 95% confidence interval for a proportion.
+    
+    Returns (lower_bound, upper_bound) as percentages (0-100).
+    """
+    if total == 0:
+        return 0.0, 0.0
+    p_hat = successes / total
+    denom = 1 + z**2 / total
+    center = (p_hat + z**2 / (2 * total)) / denom
+    margin = z / denom * np.sqrt(p_hat * (1 - p_hat) / total + z**2 / (4 * total**2))
+    lo = max(0.0, center - margin) * 100
+    hi = min(1.0, center + margin) * 100
+    return lo, hi
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot success rate curves.")
     parser.add_argument("--record", type=str, required=True,
@@ -63,27 +79,46 @@ def main():
     a_rates = np.array(a_rates)
     b_rates = np.array(b_rates)
 
-    # ---- Plot ----
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    # ---- Compute Wilson 95% confidence intervals ----
+    a_ci_lo = np.array([wilson_ci(k, n)[0] for k, n in zip(a_counts, total_a)])
+    a_ci_hi = np.array([wilson_ci(k, n)[1] for k, n in zip(a_counts, total_a)])
+    b_ci_lo = np.array([wilson_ci(k, n)[0] for k, n in zip(b_counts, total_b)])
+    b_ci_hi = np.array([wilson_ci(k, n)[1] for k, n in zip(b_counts, total_b)])
 
-    # Left: success rate curves
+    # ---- Plot ----
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), sharey=True)
+
+    # Left: success rate curves with CI bands
     ax = axes[0]
-    ax.plot(iter_nums, a_rates, "o-", color="#2196F3", linewidth=2, markersize=7, label="Task A (pick → goal)")
-    ax.plot(iter_nums, b_rates, "s-", color="#F44336", linewidth=2, markersize=7, label="Task B (goal → table)")
+
+    # CI shaded bands
+    ax.fill_between(iter_nums, a_ci_lo, a_ci_hi, color="#2196F3", alpha=0.15, label="_nolegend_")
+    ax.fill_between(iter_nums, b_ci_lo, b_ci_hi, color="#F44336", alpha=0.15, label="_nolegend_")
+
+    # Lines with error bars
+    ax.errorbar(iter_nums, a_rates,
+                yerr=[a_rates - a_ci_lo, a_ci_hi - a_rates],
+                fmt="o-", color="#2196F3", linewidth=2, markersize=7, capsize=4, capthick=1.2,
+                label="Task A (pick → goal)")
+    ax.errorbar(iter_nums, b_rates,
+                yerr=[b_rates - b_ci_lo, b_ci_hi - b_rates],
+                fmt="s-", color="#F44336", linewidth=2, markersize=7, capsize=4, capthick=1.2,
+                label="Task B (goal → table)")
+
     ax.set_xlabel("Iteration", fontsize=13)
     ax.set_ylabel("Success Rate (%)", fontsize=13)
-    ax.set_title("Success Rate Over Iterations", fontsize=14, fontweight="bold")
+    ax.set_title("Success Rate Over Iterations (95% Wilson CI)", fontsize=14, fontweight="bold")
     ax.set_ylim(-5, 105)
     ax.set_xticks(iter_nums)
     ax.legend(fontsize=11, loc="lower right")
     ax.grid(True, alpha=0.3)
 
-    # Annotate points
+    # Annotate points with rate and CI
     for i, (x, ya, yb) in enumerate(zip(iter_nums, a_rates, b_rates)):
         ax.annotate(f"{ya:.0f}%", (x, ya), textcoords="offset points",
-                    xytext=(0, 10), ha="center", fontsize=8, color="#2196F3")
+                    xytext=(0, 12), ha="center", fontsize=7.5, color="#1565C0", fontweight="bold")
         ax.annotate(f"{yb:.0f}%", (x, yb), textcoords="offset points",
-                    xytext=(0, -14), ha="center", fontsize=8, color="#F44336")
+                    xytext=(0, -15), ha="center", fontsize=7.5, color="#C62828", fontweight="bold")
 
     # Right: success counts (bar chart)
     ax2 = axes[1]
@@ -112,15 +147,57 @@ def main():
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
     print(f"Saved success rate plot to: {out_path}")
 
-    # Also print a text summary
-    print(f"\n{'='*50}")
-    print("Success Rate Summary")
-    print(f"{'='*50}")
-    print(f"{'Iter':>4}  {'A Rate':>8}  {'B Rate':>8}  {'A (ok/tot)':>12}  {'B (ok/tot)':>12}")
-    print(f"{'-'*50}")
+    # Also print a text summary with CIs
+    print(f"\n{'='*80}")
+    print("Success Rate Summary (with 95% Wilson CI)")
+    print(f"{'='*80}")
+    print(f"{'Iter':>4}  {'A Rate':>8}  {'A 95% CI':>16}  {'B Rate':>8}  {'B 95% CI':>16}  {'A (ok/tot)':>10}  {'B (ok/tot)':>10}")
+    print(f"{'-'*80}")
     for i in range(len(iter_nums)):
-        print(f"{iter_nums[i]:4d}  {a_rates[i]:7.1f}%  {b_rates[i]:7.1f}%  "
-              f"{a_counts[i]:4d}/{total_a[i]:<4d}     {b_counts[i]:4d}/{total_b[i]:<4d}")
+        print(f"{iter_nums[i]:4d}  {a_rates[i]:7.1f}%  [{a_ci_lo[i]:5.1f}%, {a_ci_hi[i]:5.1f}%]"
+              f"  {b_rates[i]:7.1f}%  [{b_ci_lo[i]:5.1f}%, {b_ci_hi[i]:5.1f}%]"
+              f"  {a_counts[i]:4d}/{total_a[i]:<4d}   {b_counts[i]:4d}/{total_b[i]:<4d}")
+
+    # ---- Analysis: check if B decline is significant ----
+    print(f"\n{'='*80}")
+    print("Confidence Interval Analysis")
+    print(f"{'='*80}")
+    # Compare first few iters (1-3) vs last few iters (8-10) for Task B
+    early_b_counts = sum(b_counts[:3])
+    early_b_total = sum(total_b[:3])
+    late_b_counts = sum(b_counts[-3:])
+    late_b_total = sum(total_b[-3:])
+    early_lo, early_hi = wilson_ci(early_b_counts, early_b_total)
+    late_lo, late_hi = wilson_ci(late_b_counts, late_b_total)
+    early_rate = early_b_counts / early_b_total * 100
+    late_rate = late_b_counts / late_b_total * 100
+    print(f"  Task B early (iter 1-3):  {early_b_counts}/{early_b_total} = {early_rate:.1f}%  CI [{early_lo:.1f}%, {early_hi:.1f}%]")
+    print(f"  Task B late  (iter 8-10): {late_b_counts}/{late_b_total} = {late_rate:.1f}%  CI [{late_lo:.1f}%, {late_hi:.1f}%]")
+    if late_hi < early_lo:
+        print(f"  → CIs do NOT overlap → Task B decline is statistically significant (p<0.05)")
+    elif late_lo > early_hi:
+        print(f"  → CIs do NOT overlap → Task B actually improved significantly")
+    else:
+        print(f"  → CIs overlap → Task B decline is NOT statistically significant at 95% level")
+        print(f"    (overlap region: [{max(late_lo, early_lo):.1f}%, {min(late_hi, early_hi):.1f}%])")
+    
+    # Same for Task A
+    early_a_counts = sum(a_counts[:3])
+    early_a_total = sum(total_a[:3])
+    late_a_counts = sum(a_counts[-3:])
+    late_a_total = sum(total_a[-3:])
+    early_a_lo, early_a_hi = wilson_ci(early_a_counts, early_a_total)
+    late_a_lo, late_a_hi = wilson_ci(late_a_counts, late_a_total)
+    early_a_rate = early_a_counts / early_a_total * 100
+    late_a_rate = late_a_counts / late_a_total * 100
+    print(f"\n  Task A early (iter 1-3):  {early_a_counts}/{early_a_total} = {early_a_rate:.1f}%  CI [{early_a_lo:.1f}%, {early_a_hi:.1f}%]")
+    print(f"  Task A late  (iter 8-10): {late_a_counts}/{late_a_total} = {late_a_rate:.1f}%  CI [{late_a_lo:.1f}%, {late_a_hi:.1f}%]")
+    if late_a_lo > early_a_hi:
+        print(f"  → CIs do NOT overlap → Task A improvement is statistically significant (p<0.05)")
+    elif late_a_hi < early_a_lo:
+        print(f"  → CIs do NOT overlap → Task A actually declined significantly")
+    else:
+        print(f"  → CIs overlap → Task A improvement is NOT statistically significant at 95% level")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,19 @@ class ForgeEnv(FactoryEnv):
         self.pos_threshold = self.default_pos_threshold.clone()
         self.rot_threshold = self.default_rot_threshold.clone()
 
+    def _pre_physics_step(self, action):
+        """Override to capture raw gripper action before EMA smoothing.
+
+        The parent FactoryEnv._pre_physics_step applies EMA to ALL action dims.
+        For gripper control, we want instant response (open/close), not a slow
+        exponential ramp. So we save the raw gripper command here and use it
+        directly in _apply_action.
+        """
+        # Save raw gripper action BEFORE EMA smoothing
+        self._raw_gripper_action = action[:, 6].clone()
+        # Call parent which applies EMA to self.actions
+        super()._pre_physics_step(action)
+
     def _compute_intermediate_values(self, dt):
         """Add noise to observations for force sensing."""
         super()._compute_intermediate_values(dt)
@@ -221,7 +234,16 @@ class ForgeEnv(FactoryEnv):
         # Step (3): Gripper control from action[:, 6].
         # action[:, 6] ∈ [-1, 1] → gripper DOF pos ∈ [0.0, 0.04] (closed → open).
         # Franka finger joints range: 0.0 (fully closed) to 0.04 (fully open).
-        gripper_action = (self.actions[:, 6] + 1.0) / 2.0 * 0.04  # [-1,1] → [0, 0.04]
+        #
+        # IMPORTANT: Bypass EMA smoothing for gripper commands.
+        # The EMA (factor 0.025-0.1) is designed for smooth arm motion but makes
+        # gripper open/close extremely sluggish. Instead, we read the RAW action
+        # directly from the last action passed to _pre_physics_step.
+        # self.actions[:, 6] is EMA-smoothed; self._raw_gripper_action is instant.
+        if hasattr(self, '_raw_gripper_action'):
+            gripper_action = (self._raw_gripper_action + 1.0) / 2.0 * 0.04
+        else:
+            gripper_action = (self.actions[:, 6] + 1.0) / 2.0 * 0.04  # fallback
 
         self.generate_ctrl_signals(
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
@@ -298,6 +320,12 @@ class ForgeEnv(FactoryEnv):
         yaw_action = (fingertip_yaw_bolt + np.deg2rad(180.0)) / np.deg2rad(270.0) * 2.0 - 1.0
         self.actions[:, 5] = self.prev_actions[:, 5] = yaw_action
         self.actions[:, 6] = self.prev_actions[:, 6] = -1.0
+
+        # Initialize raw gripper action to closed (consistent with EMA-smoothed value)
+        if not hasattr(self, '_raw_gripper_action'):
+            self._raw_gripper_action = torch.full((self.num_envs,), -1.0, device=self.device)
+        else:
+            self._raw_gripper_action[:] = -1.0
 
         # EMA randomization.
         ema_rand = torch.rand((self.num_envs, 1), dtype=torch.float32, device=self.device)
