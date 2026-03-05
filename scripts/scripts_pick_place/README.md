@@ -102,6 +102,31 @@ Iter 3: original_data + rollout_iter1 + rollout_iter2 + rollout_iter3
 
 This **DAgger-style** aggregation allows the model to learn from its own mistakes and progressively improve.
 
+### Weighted Sampling
+
+When rollout data is merged into the training set, the new data is typically much smaller than the original data. Uniform sampling would cause the model to rarely see the new data, limiting its ability to learn from recent experience.
+
+To address this, we use **weighted sampling** to balance old and new data **1:1**:
+
+| Data Group | Frame Count | Per-Frame Weight | Total Sampling Probability |
+|------------|-------------|------------------|---------------------------|
+| Old (original) | $N_{\text{old}}$ | $\frac{1}{2 N_{\text{old}}}$ | **50%** |
+| New (rollout) | $N_{\text{new}}$ | $\frac{1}{2 N_{\text{new}}}$ | **50%** |
+
+The per-frame weight is **inversely proportional** to the group size, ensuring equal total probability regardless of data imbalance.
+
+**Implementation**:
+
+1. `7_finetune_with_rollout.py` saves `sampling_weights.json` after merging rollout data, recording `old_frames` and `new_frames`
+2. `4_train_diffusion.py` accepts `--sample_weights <path>` and passes it to the training function
+3. `lerobot_train_with_viz.py` constructs a `WeightedRandomSampler` with per-frame weights
+
+**Edge cases handled**:
+
+- No rollout data provided → no `sampling_weights.json` generated → uniform sampling
+- Rollout has 0 successful episodes (`new_frames=0`) → file not saved → uniform sampling
+- Dataset length mismatch with weights file → fallback to uniform sampling with warning
+
 ---
 
 ## 3. Baseline Experiment Design
@@ -244,7 +269,7 @@ python scripts/scripts_pick_place/plot_success_rate.py --record data/success_rat
 
 ---
 
-## 6. References
+## 7. References
 
 - [LeRobot](https://github.com/huggingface/lerobot): Diffusion Policy implementation
 - [DAgger](https://arxiv.org/abs/1011.0686): Dataset Aggregation algorithm

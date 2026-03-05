@@ -325,6 +325,14 @@ def _parse_args() -> argparse.Namespace:
         help="Overwrite existing checkpoints directory if it exists. Default: True. Use --no-overwrite to disable.",
     )
     parser.add_argument(
+        "--sample_weights",
+        type=str,
+        default=None,
+        help="Path to sampling_weights.json for weighted sampling. "
+             "When provided, uses WeightedRandomSampler to balance old/new data 1:1. "
+             "Created by 7_finetune_with_rollout.py when merging rollout data.",
+    )
+    parser.add_argument(
         "--viz_save_freq",
         type=int,
         default=20000,
@@ -1024,6 +1032,9 @@ def train_with_lerobot_api(
     if resume_config_path is not None:
         sys.argv = [sys.argv[0], f"--config_path={resume_config_path}"]
     
+    # Resolve sample weights path
+    sample_weights_path = getattr(args, 'sample_weights', None)
+    
     try:
         if args.enable_xyz_viz:
             xyz_viz_dir = out_dir / "xyz_viz"
@@ -1034,10 +1045,11 @@ def train_with_lerobot_api(
                 val_dataset_cfg=val_dataset_cfg,
                 val_freq=args.val_freq,
                 state_slice_end=state_slice_end,
+                sample_weights_path=sample_weights_path,
             )
         else:
             # For regular training without xyz viz, we need to use custom train if slicing
-            if state_slice_end is not None:
+            if state_slice_end is not None or sample_weights_path is not None:
                 train_with_xyz_visualization(
                     train_cfg,
                     viz_save_freq=0,  # Disable viz
@@ -1045,6 +1057,7 @@ def train_with_lerobot_api(
                     val_dataset_cfg=val_dataset_cfg,
                     val_freq=args.val_freq,
                     state_slice_end=state_slice_end,
+                    sample_weights_path=sample_weights_path,
                 )
             else:
                 train(train_cfg)

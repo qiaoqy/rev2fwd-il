@@ -562,6 +562,7 @@ def train_with_xyz_visualization(
     val_dataset_cfg=None,
     val_freq: int = 500,
     state_slice_end: int | None = None,
+    sample_weights_path: str | Path | None = None,
 ):
     """
     Train a policy with XYZ curve visualization.
@@ -571,6 +572,7 @@ def train_with_xyz_visualization(
     2. XYZ curve visualization for debugging
     3. Validation loss computation and logging
     4. State dimension slicing for training with subset of state features
+    5. Weighted sampling to balance old/new data when finetuning with rollout data
     
     Args:
         cfg: A `TrainPipelineConfig` object containing all training configurations.
@@ -581,6 +583,8 @@ def train_with_xyz_visualization(
         val_freq: Frequency (in steps) to compute validation loss.
         state_slice_end: If set, slice observation.state to [:state_slice_end].
                          Useful for training with subset of state without re-converting data.
+        sample_weights_path: Path to sampling_weights.json for weighted sampling.
+                             When provided, uses WeightedRandomSampler to balance old/new data 1:1.
     """
     cfg.validate()
 
@@ -754,7 +758,72 @@ def train_with_xyz_visualization(
         logging.info(f"XYZ visualization save frequency: {viz_save_freq} steps")
 
     # Create dataloader - let accelerator handle distributed sampling
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if sample_weights_path is not None:
+        # =====================================================================
+        # Weighted sampling: balance old/new data 1:1
+        # =====================================================================
+        import json as _json
+        from pathlib import Path as _Path
+        
+        weights_file = _Path(sample_weights_path)
+        if not weights_file.exists():
+            raise FileNotFoundError(f"Sampling weights file not found: {weights_file}")
+        
+        with open(weights_file, "r") as f:
+            weights_info = _json.load(f)
+        
+        old_frames = weights_info["old_frames"]
+        new_frames = weights_info["new_frames"]
+        total_frames = old_frames + new_frames
+        
+        if is_main_process:
+            logging.info(f"[Weighted Sampling] old_frames={old_frames}, new_frames={new_frames}")
+        
+        # Guard: weighted sampling only makes sense when both groups have frames
+        if old_frames <= 0 or new_frames <= 0:
+            if is_main_process:
+                logging.warning(
+                    f"[Weighted Sampling] Cannot balance: old_frames={old_frames}, new_frames={new_frames}. "
+                    f"Falling back to uniform sampling."
+                )
+            shuffle = True
+            sampler = None
+        else:
+            if is_main_process:
+                logging.info(f"[Weighted Sampling] Per-frame weight: old=1/(2*{old_frames}), new=1/(2*{new_frames})")
+                logging.info(f"[Weighted Sampling] Weight ratio (new/old per frame) = {old_frames / new_frames:.2f}")
+            
+            # Build per-frame weight vector: first old_frames get w_old, rest get w_new
+            # w_old = 1 / (2 * old_frames), w_new = 1 / (2 * new_frames)
+            # For WeightedRandomSampler, only relative weights matter, so we can simplify:
+            #   w_old = new_frames  (proportional)
+            #   w_new = old_frames  (proportional)
+            # This ensures total_weight_old = old_frames * new_frames = total_weight_new
+            sample_weights = torch.zeros(total_frames, dtype=torch.double)
+            sample_weights[:old_frames] = float(new_frames)   # old data weight
+            sample_weights[old_frames:] = float(old_frames)    # new data weight
+            
+            # Verify dataset size matches
+            actual_dataset_len = len(dataset)
+            if actual_dataset_len != total_frames:
+                if is_main_process:
+                    logging.warning(
+                        f"[Weighted Sampling] Dataset length ({actual_dataset_len}) != "
+                        f"total_frames in weights file ({total_frames}). "
+                        f"Falling back to uniform sampling."
+                    )
+                shuffle = True
+                sampler = None
+            else:
+                shuffle = False
+                sampler = torch.utils.data.WeightedRandomSampler(
+                    weights=sample_weights,
+                    num_samples=total_frames,
+                    replacement=True,  # Required for weighted sampling
+                )
+                if is_main_process:
+                    logging.info(f"[Weighted Sampling] Created WeightedRandomSampler with {total_frames} samples")
+    elif hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],

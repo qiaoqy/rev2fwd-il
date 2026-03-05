@@ -304,6 +304,14 @@ train_policy() {
     TARGET=$((CUR_STEP + STEPS_PER_ITER))
     echo "  Training Policy $NAME: step $CUR_STEP → $TARGET ($NUM_TRAINING_GPUS GPUs)"
 
+    # Build weighted sampling flag if metadata exists
+    local SAMPLE_WEIGHTS_ARG=""
+    local SW_PATH="$LAST/lerobot_dataset/meta/sampling_weights.json"
+    if [ -f "$SW_PATH" ]; then
+        SAMPLE_WEIGHTS_ARG="--sample_weights $SW_PATH"
+        echo "  Using weighted sampling (balancing old/new data 1:1)"
+    fi
+
     CUDA_VISIBLE_DEVICES=$TRAINING_GPUS torchrun --nproc_per_node=$NUM_TRAINING_GPUS \
         scripts/scripts_pick_place/4_train_diffusion.py \
         --dataset dummy.npz \
@@ -314,7 +322,8 @@ train_policy() {
         --n_action_steps $N_ACTION_STEPS \
         --save_freq $STEPS_PER_ITER \
         --skip_convert --resume \
-        --include_obj_pose --include_gripper --wandb
+        --include_obj_pose --include_gripper --wandb \
+        $SAMPLE_WEIGHTS_ARG
 
     echo "  ✓ Policy $NAME trained"
 

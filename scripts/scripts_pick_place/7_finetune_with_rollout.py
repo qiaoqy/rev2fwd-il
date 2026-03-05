@@ -227,7 +227,7 @@ def add_episodes_to_lerobot_dataset(
     episodes: list[dict],
     include_obj_pose: bool = None,  # Auto-detect from dataset if None
     include_gripper: bool = None,   # Auto-detect from dataset if None
-) -> None:
+) -> dict:
     """Add episodes from NPZ to existing LeRobot dataset.
     
     Args:
@@ -235,6 +235,13 @@ def add_episodes_to_lerobot_dataset(
         episodes: List of episode dictionaries from NPZ.
         include_obj_pose: Whether to include object pose in state. Auto-detected from dataset if None.
         include_gripper: Whether to include gripper state. Auto-detected from dataset if None.
+    
+    Returns:
+        Dictionary with keys:
+            - old_frames: Number of frames in the original dataset before adding.
+            - new_frames: Number of frames added from the rollout episodes.
+            - old_episodes: Number of episodes in the original dataset.
+            - new_episodes: Number of episodes added.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     
@@ -284,10 +291,14 @@ def add_episodes_to_lerobot_dataset(
         print(f"  WARNING: State dimension mismatch! Expected {expected_dim}, dataset has {state_dim}")
         print(f"           Will use dataset's state_dim={state_dim}")
     
+    # Record original frame/episode counts for weighted sampling
+    old_frames = info["total_frames"]
+    old_episodes = info["total_episodes"]
+    
     print(f"  FPS: {fps}")
     print(f"  Has wrist camera: {has_wrist}")
-    print(f"  Original episodes: {info['total_episodes']}")
-    print(f"  Original frames: {info['total_frames']}")
+    print(f"  Original episodes: {old_episodes}")
+    print(f"  Original frames: {old_frames}")
     
     # Open dataset for appending (LeRobot v3.0 API)
     # We need to use the resume functionality
@@ -368,6 +379,35 @@ def add_episodes_to_lerobot_dataset(
     print(f"  Added frames: {total_frames}")
     print(f"  Time: {elapsed:.1f}s")
     print(f"{'='*60}\n")
+    
+    # Save sampling weights metadata for weighted sampling during training
+    # Only save when both old and new data have frames; otherwise weighted sampling
+    # makes no sense (one group would get zero weight).
+    weights_info = {
+        "old_frames": old_frames,
+        "new_frames": total_frames,
+        "old_episodes": old_episodes,
+        "new_episodes": num_episodes,
+    }
+    
+    if total_frames > 0 and old_frames > 0:
+        weights_info["description"] = (
+            "Weighted sampling metadata. During training, use WeightedRandomSampler "
+            "so that old and new data are sampled with equal total probability (1:1). "
+            "Per-frame weight for old data = 1/(2*old_frames), "
+            "per-frame weight for new data = 1/(2*new_frames)."
+        )
+        weights_path = lerobot_dir / "meta" / "sampling_weights.json"
+        with open(weights_path, "w") as f:
+            json.dump(weights_info, f, indent=2)
+        print(f"  Saved sampling weights metadata to: {weights_path}")
+        print(f"    old_frames={old_frames}, new_frames={total_frames}")
+        print(f"    Per-frame weight ratio (new/old) = {old_frames / total_frames:.2f}")
+    else:
+        print(f"  Skipping sampling weights: old_frames={old_frames}, new_frames={total_frames}")
+        print(f"  (Weighted sampling requires both old and new data to have frames)")
+    
+    return weights_info
 
 
 def finetune_from_checkpoint(
@@ -497,6 +537,9 @@ def finetune_from_checkpoint(
     # Use --lerobot_dataset_dir and --skip_convert to use pre-converted dataset
     script_path = Path(__file__).parent / "4_train_diffusion.py"
     
+    # Check if sampling weights metadata exists (created when rollout data was added)
+    sample_weights_path = Path(lerobot_dataset_dir) / "meta" / "sampling_weights.json"
+    
     cmd = [
         sys.executable,  # Use same Python interpreter
         str(script_path),
@@ -510,6 +553,10 @@ def finetune_from_checkpoint(
         "--skip_convert",  # Skip conversion, use existing LeRobot dataset
         "--resume",  # Resume from checkpoint
     ]
+    
+    # Add weighted sampling if metadata exists
+    if sample_weights_path.exists():
+        cmd.extend(["--sample_weights", str(sample_weights_path)])
     
     if include_obj_pose:
         cmd.append("--include_obj_pose")
@@ -622,6 +669,9 @@ def main() -> None:
         print(f"  Merged dataset: {merged_lerobot_dir}")
         print(f"  Checkpoint: {target_pretrained}")
         
+        # Check if sampling weights metadata exists (for prepare_only hint)
+        sample_weights_path = merged_lerobot_dir / "meta" / "sampling_weights.json"
+        
         # If --prepare_only, stop here
         if args.prepare_only:
             print(f"\n--prepare_only mode: Skipping training.")
@@ -635,6 +685,8 @@ def main() -> None:
             print(f"      --batch_size {args.batch_size} \\")
             print(f"      --n_action_steps {args.n_action_steps} \\")
             print(f"      --skip_convert --resume \\")
+            if sample_weights_path.exists():
+                print(f"      --sample_weights {sample_weights_path} \\")
             if args.include_obj_pose:
                 print(f"      --include_obj_pose \\")
             if args.wandb:

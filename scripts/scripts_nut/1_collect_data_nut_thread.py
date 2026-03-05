@@ -578,6 +578,8 @@ class NutThreadingExpert:
         self.search_angle = torch.zeros(num_envs, device=device)
         self.search_attempts = torch.zeros(num_envs, dtype=torch.int32, device=device)
         self.max_search_attempts = 3  # Number of spiral cycles (reduced for speed)
+        self.initial_nut_z = torch.zeros(num_envs, device=device)  # Nut Z at search entry
+        self.nut_drop_threshold = 0.0003  # 0.3mm nut Z drop indicates thread alignment
         
         # Engagement tracking
         self.engage_step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
@@ -631,6 +633,7 @@ class NutThreadingExpert:
         self.phase_step_count[env_ids] = 0
         self.search_angle[env_ids] = 0.0
         self.search_attempts[env_ids] = 0
+        self.initial_nut_z[env_ids] = 0.0
         self.engage_step_count[env_ids] = 0
         self.initial_z[env_ids] = 0.0
         self.z_progress[env_ids] = 0.0
@@ -648,6 +651,7 @@ class NutThreadingExpert:
         fixed_pos: "torch.Tensor",
         force_sensor: "torch.Tensor",
         torque_sensor: "torch.Tensor",
+        nut_pos: "torch.Tensor" = None,
         dt: float,
     ) -> "torch.Tensor":
         """Compute expert action with force feedback control.
@@ -730,15 +734,21 @@ class NutThreadingExpert:
         
         # =====================================================================
         # PHASE 1: SEARCH - Spiral motion to find thread alignment
+        # The primary alignment signal is NUT Z drop: when the nut's threads
+        # mesh with the bolt, the nut physically drops slightly (gravity +
+        # downward pressure pulls it into the thread groove).
         # =====================================================================
         search_mask = phase_snapshot == 1
         if search_mask.any():
-            # Reset initial_z when first entering search phase
+            # Reset state when first entering search phase
             first_step_search = search_mask & (self.phase_step_count == 1)
             if first_step_search.any():
                 self.initial_z[first_step_search] = current_z[first_step_search]
                 self.search_angle[first_step_search] = 0.0
                 self.search_attempts[first_step_search] = 0
+                # Record initial nut Z for drop detection
+                if nut_pos is not None:
+                    self.initial_nut_z[first_step_search] = nut_pos[first_step_search, 2]
             
             # Update search angle
             self.search_angle[search_mask] += self.search_speed * dt
@@ -757,23 +767,35 @@ class NutThreadingExpert:
             spiral_x = current_radius * torch.cos(self.search_angle)
             spiral_y = current_radius * torch.sin(self.search_angle)
             
-            # Action: spiral XY + stronger downward pressure
-            action[search_mask, 0] = spiral_x[search_mask] * 15.0  # Scale to action space (increased)
+            # Action: spiral XY + steady downward pressure
+            action[search_mask, 0] = spiral_x[search_mask] * 15.0  # Scale to action space
             action[search_mask, 1] = spiral_y[search_mask] * 15.0
-            action[search_mask, 2] = -0.4   # Stronger downward pressure (increased from -0.25)
+            action[search_mask, 2] = -0.4   # Firm downward pressure
             
-            # Larger rotation oscillation to help find thread
-            # Also include reverse rotation trick during search
-            rot_osc = 0.3 * torch.sin(self.search_angle * 2)  # Larger amplitude, slower frequency
-            action[search_mask, 5] = rot_osc[search_mask]
+            # Gentle CW rotation during search to help threads catch
+            # Small incremental yaw target (slower than engage) combined with oscillation
+            self.cumulative_yaw_target = torch.where(
+                search_mask,
+                (self.cumulative_yaw_target + 0.003).clamp(-1.0, 1.0),
+                self.cumulative_yaw_target
+            )
+            rot_osc = 0.15 * torch.sin(self.search_angle * 2)  # Oscillation overlay
+            action[search_mask, 5] = (self.cumulative_yaw_target + rot_osc)[search_mask]
             
-            # Transition to ENGAGE if we detect significant vertical force
-            # (indicating thread tips are touching)
-            engage_ready = search_mask & (fz.abs() > self.engage_force_threshold * 0.5)
+            # ---- PRIMARY SIGNAL: Nut Z drop ----
+            # When threads align, the nut drops into the bolt groove.
+            # This is the most reliable alignment indicator.
+            if nut_pos is not None:
+                nut_z_drop = self.initial_nut_z - nut_pos[:, 2]
+                nut_aligned = search_mask & (nut_z_drop > self.nut_drop_threshold)
+                next_phase = torch.where(nut_aligned, torch.full_like(next_phase, 2), next_phase)
+            
+            # ---- SECONDARY SIGNAL: Force spike ----
+            # High vertical force can also indicate thread contact
+            engage_ready = search_mask & (fz.abs() > self.engage_force_threshold * 0.7)
             next_phase = torch.where(engage_ready, torch.full_like(next_phase, 2), next_phase)
             
-            # Also transition if Z has dropped (thread starting to catch)
-            # Use initial_z set at SEARCH phase entry, not APPROACH phase
+            # ---- TERTIARY SIGNAL: EE Z drop ----
             z_dropped = search_mask & ((self.initial_z - current_z) > 0.002)
             next_phase = torch.where(z_dropped, torch.full_like(next_phase, 2), next_phase)
             
@@ -1329,6 +1351,7 @@ def rollout_nut_threading(
             fixed_pos=bolt_pos,
             force_sensor=ft_force,
             torque_sensor=ft_torque,
+            nut_pos=nut_pos,
             dt=physics_dt,
         )
         
