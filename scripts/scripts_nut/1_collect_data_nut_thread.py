@@ -986,11 +986,13 @@ class NutThreadingExpert:
         reposition_mask = phase_snapshot == 6
         if reposition_mask.any():
             # Stay in place, rotate yaw back. Nut is on bolt, gripper open.
-            # Use z=-0.2 to compensate for upward kinematic drift during wrist rotation.
-            # (action[2]=0.0 maps to center-Z which is ABOVE the threading level,
-            #  and wrist rotation kinematic coupling lifts the EE ~12mm if uncompensated)
+            # Use z=-0.2 to aggressively compensate upward kinematic drift during wrist rotation.
+            # The wrist rotation (joint6) couples into EE Z through the kinematic chain,
+            # causing up to +12mm upward drift with z=0. z=-0.2 limits peak upward
+            # drift to ~3mm. Some downward overshoot is acceptable (user only cares
+            # about preventing upward lift).
             action[reposition_mask, 0:2] = 0.0  # No XY movement
-            action[reposition_mask, 2] = -0.2   # Light downward to prevent upward drift
+            action[reposition_mask, 2] = -0.2   # Compensate upward drift from rotation
             action[reposition_mask, 3:5] = 0.0  # No roll/pitch change
             action[reposition_mask, 6] = 1.0    # Keep gripper OPEN
             
@@ -1030,7 +1032,7 @@ class NutThreadingExpert:
         if regrasp_mask.any():
             # No translation at all — only yaw rotation while closing
             action[regrasp_mask, 0:2] = 0.0  # No XY movement
-            action[regrasp_mask, 2] = 0.0    # No Z movement (no pressing!)
+            action[regrasp_mask, 2] = -0.1   # Light downward to prevent upward drift (same as REPOSITION)
             action[regrasp_mask, 3:5] = 0.0  # No roll/pitch change
             action[regrasp_mask, 5] = self.cumulative_yaw_target[regrasp_mask]  # Keep yaw
             action[regrasp_mask, 6] = -1.0   # CLOSE gripper throughout

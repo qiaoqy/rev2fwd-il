@@ -117,24 +117,84 @@ pip install pygame==2.6.1
 
 ## 2. Workflow
 
-The complete pipeline consists of 5 scripts:
+### 2.1 Individual Scripts
+
+The core pipeline consists of these Python scripts (under `scripts/scripts_pick_place/`):
 
 | Script | Description | Input | Output |
 |--------|-------------|-------|--------|
-| `1_collect_data.py` | Collect reverse trajectory data | - | `data/B_*.npz` |
+| `1_collect_data_pick_place.py` | Collect reverse trajectory data | - | `data/B_*.npz` |
 | `2_inspect_data.py` | Visualize and inspect data | NPZ file | PNG/MP4/JSON |
 | `3_make_forward_data.py` | Time-reverse to generate forward data | `data/B_*.npz` | `data/A_*.npz` |
 | `4_train_diffusion.py` | Train Diffusion Policy | `data/A_*.npz` | `runs/*/checkpoints` |
 | `5_eval_diffusion.py` | Evaluate and visualize | checkpoint | `runs/*/videos` |
+| `7_finetune_with_rollout.py` | Prepare data + checkpoint for finetuning | lerobot dataset + rollout npz | merged dataset |
+| `9_eval_with_recovery.py` | Evaluate A-B cycles with failure recovery | two checkpoints | rollout npz + stats json |
+
+### 2.2 Iterative Training Pipeline (Pick & Place, Isaac Lab)
+
+Two bash scripts orchestrate the full iterative training loop. Both are **auto-resumable** — on crash or interrupt, simply re-run the same command to pick up where it left off.
+
+| Script | Mode | Description |
+|--------|------|-------------|
+| `run_pipeline.sh` | **DAgger** | Evaluate → aggregate successful rollout data → finetune → repeat |
+| `run_ablation.sh` | **Baseline** | Evaluate → finetune on original data only (no rollout aggregation) → repeat |
+
+**Experiment directory structure:**
+
+All results are stored under `data/pick_place_isaac_lab_simulation/exp{N}/` with auto-incrementing experiment numbers:
+
+```
+data/pick_place_isaac_lab_simulation/
+  exp1/                              # First experiment
+    config.json                      # Mode, hyperparams, source policies
+    record.json                      # Per-iteration success rate metrics
+    success_rate_curve.png           # Generated plot
+    pipeline.log  or  ablation.log   # Full console output
+    iter1_eval_A.npz                 # Rollout data (Task A, iteration 1)
+    iter1_eval_A.stats.json          # Evaluation statistics
+    iter1_eval_B.npz                 # Rollout data (Task B, iteration 1)
+    ...
+    .done_iter1_eval                 # Phase markers (for auto-resume)
+    .done_iter1_train_A
+    .done_iter1_train_B
+    .complete                        # Set when all iterations finish
+  exp2/                              # Next experiment (auto-numbered)
+    ...
+```
+
+Working checkpoint directories are scoped per-experiment in `runs/`:
+```
+runs/
+  exp1_PP_A_temp/                    # Policy A working directory for exp1
+  exp1_PP_B_temp/                    # Policy B working directory for exp1
+```
+
+**Usage:**
+
+```bash
+# Run the DAgger pipeline (aggregates rollout data)
+bash scripts/scripts_pick_place/run_pipeline.sh
+
+# Run the ablation baseline (no rollout aggregation, isolates training-step effect)
+bash scripts/scripts_pick_place/run_ablation.sh
+
+# On crash, just re-run the same command — resumes automatically
+bash scripts/scripts_pick_place/run_pipeline.sh
+```
+
+**Auto-resume mechanism:**
+
+Each iteration has 3 phases (evaluate, train_A, train_B). After each phase completes, a marker file (`.done_iter{N}_{phase}`) is written. On restart, completed phases are skipped. Directory state is also recovered (e.g., if a crash occurs mid-rotation between `last → temp`).
 
 ---
 
-## 3. Usage Examples
+## 3. Usage Examples (Individual Scripts)
 
 ### Step 1: Collect Reverse Trajectory Data
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/1_collect_data.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/1_collect_data_pick_place.py \
     --headless --num_episodes 500 --num_envs 256 \
     --out data/B_2images_goal.npz
 ```
@@ -142,7 +202,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/1_collect_data.py \
 ### Step 2: Visualize and Inspect Data
 
 ```bash
-python scripts/2_inspect_data.py \
+python scripts/scripts_pick_place/2_inspect_data.py \
     --dataset data/B_2images_goal.npz \
     --episode 0 --enable_xyz_viz
 ```
@@ -150,7 +210,7 @@ python scripts/2_inspect_data.py \
 ### Step 3: Generate Forward Training Data
 
 ```bash
-python scripts/3_make_forward_data.py \
+python scripts/scripts_pick_place/3_make_forward_data.py \
     --input data/B_2images_goal.npz \
     --out data/A_2images_goal.npz
 ```
@@ -159,7 +219,7 @@ python scripts/3_make_forward_data.py \
 
 ```bash
 # Single GPU training
-CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_2images_goal.npz \
     --out runs/diffusion_A_goal \
     --batch_size 64 --steps 50000 \
@@ -167,7 +227,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/4_train_diffusion.py \
 
 # Multi-GPU training
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
-    scripts/4_train_diffusion.py \
+    scripts/scripts_pick_place/4_train_diffusion.py \
     --dataset data/A_2images_goal.npz \
     --out runs/diffusion_A_goal \
     --batch_size 64 --steps 50000 \
@@ -177,7 +237,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
 ### Step 5: Evaluate and Visualize
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/5_eval_diffusion.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place/5_eval_diffusion.py \
     --checkpoint runs/diffusion_A_goal/checkpoints/checkpoints/last/pretrained_model \
     --out_dir runs/diffusion_A_goal/videos \
     --num_episodes 5 --visualize_xyz --headless
