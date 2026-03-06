@@ -19,7 +19,9 @@ This directory contains data collection scripts for the nut threading task based
 - **Task ID**: `Isaac-Forge-NutThread-Direct-v0`
 - **Robot**: Franka Panda (7-DOF arm + 2-DOF parallel gripper)
 - **Task**: Thread a nut onto a bolt
-- **Control frequency**: 15 Hz (120 Hz sim / 8 decimation)
+- **Control frequency**: 30 Hz (90 Hz physics / 3 decimation)
+- **Physics frequency**: 90 Hz (`sim.dt = 1/90`)
+- **Camera render frequency**: 30 Hz (`update_period = 3/90`, matches control frequency)
 - **Force sensor**: 6-DOF F/T sensor (force_sensor link), EMA smoothed (α=0.25)
 
 ### Action Space (7D)

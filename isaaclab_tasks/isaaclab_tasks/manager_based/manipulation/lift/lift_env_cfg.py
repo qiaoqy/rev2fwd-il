@@ -209,10 +209,10 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self):
         """Post initialization."""
         # general settings
-        self.decimation = 2
+        self.decimation = 3
         self.episode_length_s = 5.0
         # simulation settings
-        self.sim.dt = 0.01  # 100Hz
+        self.sim.dt = 1 / 90  # 90Hz physics, 30Hz control (decimation=3)
         self.sim.render_interval = self.decimation
 
         self.sim.physx.bounce_threshold_velocity = 0.2

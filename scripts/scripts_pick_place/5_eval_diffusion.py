@@ -215,7 +215,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int) -> None:
 
     env_cfg.scene.table_cam = CameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
-        update_period=0.0,
+        update_period=3.0 / 90.0,  # Match control freq: 90Hz / decimation=3 → 30Hz
         height=image_height,
         width=image_width,
         data_types=["rgb"],
@@ -231,13 +231,13 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int) -> None:
             convention="ros",
         ),
     )
-    
+
     # =========================================================================
     # Wrist Camera - Eye-in-hand, attached to robot gripper
     # =========================================================================
     env_cfg.scene.wrist_cam = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_cam",
-        update_period=0.0,
+        update_period=3.0 / 90.0,  # Match control freq: 90Hz / decimation=3 → 30Hz
         height=image_height,
         width=image_width,
         data_types=["rgb"],

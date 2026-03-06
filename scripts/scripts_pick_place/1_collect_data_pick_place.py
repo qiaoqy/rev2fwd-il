@@ -347,7 +347,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # Use standard CameraCfg (same as wrist camera for consistency)
     env_cfg.scene.table_cam = CameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
-        update_period=0.0,  # Update every physics step
+        update_period=3.0 / 90.0,  # Match control freq: 90Hz / decimation=3 → 30Hz
         height=image_height,
         width=image_width,
         data_types=["rgb"],
@@ -375,7 +375,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     env_cfg.scene.wrist_cam = CameraCfg(
         # Mount camera on panda_hand link - it will move with the gripper
         prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_cam",
-        update_period=0.0,  # Update every physics step
+        update_period=3.0 / 90.0,  # Match control freq: 90Hz / decimation=3 → 30Hz
         height=image_height,
         width=image_width,
         data_types=["rgb"],

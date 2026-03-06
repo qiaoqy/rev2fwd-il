@@ -102,13 +102,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_episodes",
         type=int,
-        default=100,
+        default=30,
         help="Number of episodes to collect.",
     )
     parser.add_argument(
         "--horizon",
         type=int,
-        default=600,
+        default=1200,
         help="Maximum simulation steps per episode. FORGE nut threading is 30s at 50Hz=1500 steps, "
              "but we use scripted motion which is faster.",
     )
@@ -254,7 +254,7 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     
     env_cfg.scene.table_cam = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
-        update_period=0.0,  # Update every physics step
+        update_period=3.0 / 90.0,  # Match control freq: 90Hz / decimation=3 → 30Hz
         height=image_height,
         width=image_width,
         data_types=["rgb"],
@@ -287,10 +287,10 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int):
     # =========================================================================
     # Extend episode length to prevent auto-reset during data collection
     # =========================================================================
-    # Default is 30s at 15Hz = 450 steps. We extend to allow horizon steps.
-    # Control freq = 120Hz (sim) / 8 (decimation) = 15Hz
+    # Default is 30s at 30Hz = 900 steps. We extend to allow horizon steps.
+    # Control freq = 90Hz (sim) / 3 (decimation) = 30Hz
     # Set episode_length_s high enough to cover our horizon
-    env_cfg.episode_length_s = 120.0  # 120 seconds = 1800 steps at 15Hz
+    env_cfg.episode_length_s = 120.0  # 120 seconds = 3600 steps at 30Hz
 
 
 def add_wrist_camera_post_creation(env, num_envs: int, image_width: int, image_height: int):
@@ -603,7 +603,7 @@ class NutThreadingExpert:
         self.release_depress_steps = 5  # Steps to cancel downward pressure before opening gripper
         self.release_open_steps = 20   # Steps to open gripper (ensure fully open before moving)
         self.release_timeout = 25      # Total steps in release phase (depress + open gripper)
-        self.reposition_timeout = 80   # Max steps in reposition phase (CCW back to -1.0)
+        self.reposition_timeout = 150  # Max steps in reposition phase (CCW back to -1.0, relaxed from 80)
         self.regrasp_close_steps = 20  # Steps to close gripper (ensure fully clamped)
         self.regrasp_timeout = 20      # = close_steps. REGRASP only grips, pressing is in THREAD
         
@@ -1441,9 +1441,14 @@ def rollout_nut_threading(
     # Check success using FORGE's success metric
     success_threshold = forge_env.cfg_task.success_threshold
     
+    # Determine success per env: expert reached DONE (phase 4) with meaningful z progress
+    is_done = expert.is_done().cpu().numpy()  # (num_envs,)
+    total_z_progress = (expert.z_progress_total + expert.z_progress).cpu().numpy()  # (num_envs,)
+    min_success_progress = 0.003  # At least 3mm threading progress to count as success
+    
     for i in range(num_envs):
-        # Determine success based on final state
-        # In FORGE, success is based on how much the nut has been threaded onto the bolt
+        # Success = reached DONE phase AND made meaningful threading progress
+        ep_success = bool(is_done[i]) and (total_z_progress[i] > min_success_progress)
         episode_dict = {
             "obs": np.array(obs_lists[i], dtype=np.float32),
             "state": np.array(state_lists[i], dtype=np.float32),
@@ -1461,11 +1466,13 @@ def rollout_nut_threading(
             "phase": np.array(phase_lists[i], dtype=np.int32),  # Expert state machine phase
             "phase_names": ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE", "RELEASE", "REPOSITION", "REGRASP"],  # Phase name mapping
             "episode_length": len(obs_lists[i]),
-            "success": False,  # Will be determined by inspection
+            "success": ep_success,
+            "z_progress_total": float(total_z_progress[i]),
             "success_threshold": success_threshold,
             "wrist_cam_names": wrist_cam_names,  # Store camera names for reference
         }
         results.append(episode_dict)
+        print(f"[DEBUG] rollout: env {i} success={ep_success}, z_progress={total_z_progress[i]*1000:.1f}mm, phase={expert.phase[i].item()}")
     
     print(f"[DEBUG] rollout: Done. Returning {len(results)} episodes")
     return results
@@ -1639,17 +1646,21 @@ def main() -> None:
                 horizon=args.horizon,
             )
             
-            # Add results to episode list
+            # Add only SUCCESSFUL results to episode list
+            n_success = sum(1 for ep in results if ep["success"])
+            n_fail = len(results) - n_success
             for episode_dict in results:
-                episodes.append(episode_dict)
-                if len(episodes) >= args.num_episodes:
-                    break
+                if episode_dict["success"]:
+                    episodes.append(episode_dict)
+                    if len(episodes) >= args.num_episodes:
+                        break
             
             # Print progress
             elapsed = time.time() - start_time
             rate = len(episodes) / elapsed if elapsed > 0 else 0
             print(
                 f"Batch {batch_count:3d} ({num_envs} envs) | "
+                f"Success: {n_success}, Fail: {n_fail} | "
                 f"Collected: {len(episodes)}/{args.num_episodes} | "
                 f"Rate: {rate:.1f} ep/s"
             )

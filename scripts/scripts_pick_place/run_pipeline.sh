@@ -152,6 +152,24 @@ get_step() {
 phase_done() { [ -f "$EXP_DIR/.done_iter${1}_${2}" ]; }
 mark_done()  { touch "$EXP_DIR/.done_iter${1}_${2}"; }
 
+# Save a copy of the pretrained_model checkpoint for a given iteration
+save_iter_checkpoint() {
+    local ITER=$1       # iteration number
+    local NAME=$2       # "A" or "B"
+    local TEMP=$3       # temp working directory (has latest checkpoint)
+    local CKPT_SRC
+    CKPT_SRC=$(get_ckpt "$TEMP")
+    local DEST="$EXP_DIR/iter${ITER}_ckpt_${NAME}"
+    if [ -d "$CKPT_SRC" ] && [ ! -d "$DEST" ]; then
+        echo "  Saving checkpoint: $DEST"
+        cp -r "$CKPT_SRC" "$DEST"
+    elif [ -d "$DEST" ]; then
+        echo "  Checkpoint already saved: $DEST"
+    else
+        echo "  WARNING: No checkpoint found at $CKPT_SRC"
+    fi
+}
+
 # =============================================================================
 # Find or Create Experiment Directory
 # =============================================================================
@@ -498,6 +516,7 @@ print(f\"  B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s['tas
     if ! phase_done $iter train_A; then
         echo "--- Train Policy A ($STEPS_PER_ITER steps) ---"
         train_policy A "$PA_TEMP" "$PA_LAST" "$ROLLOUT_A"
+        save_iter_checkpoint $iter A "$PA_TEMP"
         mark_done $iter train_A
     else
         echo "  [Train A] Already done — skipping"
@@ -507,6 +526,7 @@ print(f\"  B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s['tas
     if ! phase_done $iter train_B; then
         echo "--- Train Policy B ($STEPS_PER_ITER steps) ---"
         train_policy B "$PB_TEMP" "$PB_LAST" "$ROLLOUT_B"
+        save_iter_checkpoint $iter B "$PB_TEMP"
         mark_done $iter train_B
     else
         echo "  [Train B] Already done — skipping"

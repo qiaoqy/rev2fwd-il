@@ -6,6 +6,15 @@ This project implements a **Reverse-to-Forward (Rev2Fwd)** imitation learning ap
 
 ## 1. Method Overview
 
+### Simulation Timing
+
+| Parameter | Value |
+|-----------|-------|
+| **Physics frequency** | 90 Hz (`sim.dt = 1/90`) |
+| **Decimation** | 3 |
+| **Control frequency** | 30 Hz (90 / 3) |
+| **Camera render frequency** | 30 Hz (`update_period = 3/90`, matches control) |
+
 ### Core Idea
 
 Pick-and-Place can be decomposed into two inverse sub-tasks:
