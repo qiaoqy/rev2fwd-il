@@ -268,7 +268,95 @@ Same format, but trajectory direction is reversed (from random table position to
 
 ## 5. Nut Threading Task (FORGE Environment)
 
-### Camera Rendering Fix (2026-03-03)
+### 5.1 PhysX Collision Volume 问题（2026-03-05）
+
+**现象**：夹爪和螺母明明没有接触，但仍然被检测为碰撞（contact penalty 被触发）。
+
+**根因**：PhysX 的 `contact_offset` 参数决定了接触检测的"提前量"——两个物体之间的间距小于 `contact_offset_A + contact_offset_B` 时就会生成接触对。Isaac Lab Factory 任务中，所有碰撞体的默认 `contact_offset = 0.005m (5mm)`，导致：
+
+| 碰撞对 | 间隙阈值 | 说明 |
+|---------|----------|------|
+| 夹爪 ↔ 螺母 | 5mm + 5mm = **10mm** | 等于螺母整体高度 (10mm)！ |
+| 螺母 ↔ 螺栓 | 5mm + 5mm = **10mm** | 5倍于螺纹螺距 (2mm) |
+
+也就是说螺母在距离夹爪还有 10mm 时就会被算作碰撞。
+
+**碰撞体详情**（运行时通过 `debug_collision.py` 获取）：
+
+| 物体 | contact_offset | mesh_type | 备注 |
+|------|---------------|-----------|------|
+| Robot (panda_link0 ~ rightfinger) | 0.005m | convexHull | 所有12个link |
+| Bolt (FixedAsset, BoltM16) | 0.005m | **SDF** | 24mm直径, 25mm高 |
+| Nut (HeldAsset, NutM16) | 0.005m | **SDF** | 24mm直径, 10mm高 |
+
+> SDF (Signed Distance Field) 碰撞体精度高但计算开销大；convexHull 是凸包近似。
+
+**修复**（需修改 site-packages 中的实际加载文件，见下文 §5.2 模块遮蔽问题）：
+
+| 物体 | 修改前 | 修改后 | 间隙阈值变化 |
+|------|--------|--------|-------------|
+| Robot (所有link) | 5mm | **1mm** | 夹爪↔螺母: 10mm → **1.5mm** |
+| Bolt (FixedAsset) | 5mm | **0.5mm** | 螺母↔螺栓: 10mm → **1mm** |
+| Nut (HeldAsset) | 5mm | **0.5mm** | |
+
+修改的文件（**两处都要改**，见 §5.2）：
+
+```
+# factory_env_cfg.py (robot contact_offset)
+collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.001, rest_offset=0.0)
+
+# factory_tasks_cfg.py (NutThread 的 fixed_asset 和 held_asset)
+collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.0005, rest_offset=0.0)
+```
+
+**调试工具**：`scripts/scripts_nut/debug_collision.py` 可以在运行时检查所有碰撞体的实际属性：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/scripts_nut/debug_collision.py --headless --disable_fabric 1
+```
+
+输出包括每个碰撞体的 `contact_offset`、`rest_offset`、`mesh_type`、几何尺寸等信息。
+
+### 5.2 Isaac Lab Task 模块遮蔽问题
+
+**现象**：修改了 workspace 中的 `isaaclab_tasks/` 配置文件后，运行时完全不生效。
+
+**根因**：`isaaclab_tasks` 包存在两份拷贝，Python import 加载的是 isaaclab 主包内嵌的副本，而不是 workspace 中 `pip install -e ./isaaclab_tasks` 安装的版本：
+
+```
+# ✅ workspace 中的 editable install（我们修改的）
+/mnt/.../workspace/rev2fwd-il/isaaclab_tasks/isaaclab_tasks/direct/factory/
+
+# ❌ 实际被 import 的（isaaclab 包自带的副本）
+$CONDA_PREFIX/lib/python3.11/site-packages/isaaclab/source/isaaclab_tasks/isaaclab_tasks/direct/factory/
+```
+
+**原因**：`isaaclab` 主包在安装时把 `isaaclab_tasks` 的源码也打包进了自己的 `source/` 目录，并在 `sys.path` 中注册了该路径。由于 site-packages 中的路径优先级高于 editable install 的 `.pth` 文件，所以 workspace 中的修改永远不会被加载。
+
+**解决方案**：
+
+1. **修改实际加载的文件**（推荐，当前采用的方案）：
+
+```bash
+# 找到实际加载路径
+python -c "import isaaclab_tasks.direct.factory.factory_tasks_cfg as m; print(m.__file__)"
+
+# 直接修改该文件
+# $CONDA_PREFIX/lib/python3.11/site-packages/isaaclab/source/isaaclab_tasks/...
+```
+
+2. **同步修改两处**：workspace 中的修改用于版本管理（git），site-packages 中的修改用于运行时生效。
+
+3. **验证模块来源**：任何涉及 `isaaclab_tasks` 的修改都应验证实际加载路径：
+
+```python
+import isaaclab_tasks.direct.factory.factory_tasks_cfg as m
+print(m.__file__)  # 检查是否来自预期路径
+```
+
+> ⚠️ **注意**：`simulation_context.py` 的 Camera 渲染 patch（见 §5.3）同样受此问题影响，需要修改 site-packages 中的文件。
+
+### 5.3 Camera Rendering Fix (2026-03-03)
 
 在 Isaac Lab 2.3.0 中使用 FORGE 环境 + `Camera` sensor 采集图像时，发现**相机画面完全不会随机械臂运动更新**。经过深入排查，发现了以下问题：
 
@@ -287,7 +375,7 @@ Same format, but trajectory direction is reversed (from random table position to
 
 **验证**：通过连通分量分析（connected component analysis）证实，机械臂从 home 位置到 arm_up 位置（末端执行器移动 40+ cm），相机画面中最大连通变化区域为 461 像素的连贯形状，而随机噪声基线仅 3 像素。
 
-### 采集 Nut Threading 数据
+### 5.4 采集 Nut Threading 数据
 
 ```bash
 # 基本用法（不需要 --disable_fabric）
@@ -300,7 +388,37 @@ CUDA_VISIBLE_DEVICES=0 python scripts/scripts_nut/1_collect_data_nut_thread.py \
     --image_width 128 --image_height 128 --out data/nut_thread_128.npz
 ```
 
-### 可视化 Nut Threading 数据
+### 5.5 NPZ 大文件 CRC-32 校验错误（2026-03-06）
+
+**现象**：`np.load('data/nut_thread_0305.npz', allow_pickle=True)` 时抛出：
+
+```
+zipfile.BadZipFile: Bad CRC-32 for file 'episodes.npy'
+```
+
+**根因**：`np.savez_compressed` 将所有 episode 序列化为一个 pickle 对象数组（`episodes.npy`），使用 zlib 压缩后写入 ZIP 容器。当未压缩数据超过 **4GB**（此处为 5.93GB / 100 episodes × 600 steps × 128×128 images），ZIP 内部的 CRC-32 校验和会因为 32-bit 整数溢出而产生错误值。文件内容本身是完整的。
+
+**修复方法**：
+
+```python
+import zipfile
+# Monkey-patch 跳过 CRC 校验
+zipfile.ZipExtFile._update_crc = lambda self, newdata: None
+
+import numpy as np
+data = np.load('data/nut_thread_0305.npz', allow_pickle=True)
+episodes = data['episodes']  # 正常读取 100 episodes
+
+# 用不压缩的 np.savez 重新保存（避免 CRC 问题）
+np.savez('data/nut_thread_0305_resaved.npz', episodes=episodes)
+```
+
+**预防**：对于大数据集（>100 episodes + images），建议：
+1. 使用 `np.savez`（不压缩）代替 `np.savez_compressed`，避免 CRC 溢出
+2. 或将 episodes 拆分为多个小文件保存（如每 20 个 episode 一个文件）
+3. 或改用 HDF5 格式（`h5py`），天然支持大文件和分块读取
+
+### 5.6 可视化 Nut Threading 数据
 
 ```bash
 python scripts/scripts_nut/2_inspect_nut_data.py \

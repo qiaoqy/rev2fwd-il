@@ -580,6 +580,7 @@ class NutThreadingExpert:
         self.max_search_attempts = 3  # Number of spiral cycles (reduced for speed)
         self.initial_nut_z = torch.zeros(num_envs, device=device)  # Nut Z at search entry
         self.nut_drop_threshold = 0.0003  # 0.3mm nut Z drop indicates thread alignment
+        self.search_min_steps = 15  # Minimum steps in SEARCH before allowing transition
         
         # Engagement tracking
         self.engage_step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
@@ -651,8 +652,8 @@ class NutThreadingExpert:
         fixed_pos: "torch.Tensor",
         force_sensor: "torch.Tensor",
         torque_sensor: "torch.Tensor",
-        nut_pos: "torch.Tensor" = None,
         dt: float,
+        nut_pos: "torch.Tensor" = None,
     ) -> "torch.Tensor":
         """Compute expert action with force feedback control.
         
@@ -782,21 +783,24 @@ class NutThreadingExpert:
             rot_osc = 0.15 * torch.sin(self.search_angle * 2)  # Oscillation overlay
             action[search_mask, 5] = (self.cumulative_yaw_target + rot_osc)[search_mask]
             
+            # ---- All transition checks require minimum search duration ----
+            past_min = search_mask & (self.phase_step_count >= self.search_min_steps)
+            
             # ---- PRIMARY SIGNAL: Nut Z drop ----
             # When threads align, the nut drops into the bolt groove.
             # This is the most reliable alignment indicator.
             if nut_pos is not None:
                 nut_z_drop = self.initial_nut_z - nut_pos[:, 2]
-                nut_aligned = search_mask & (nut_z_drop > self.nut_drop_threshold)
+                nut_aligned = past_min & (nut_z_drop > self.nut_drop_threshold)
                 next_phase = torch.where(nut_aligned, torch.full_like(next_phase, 2), next_phase)
             
             # ---- SECONDARY SIGNAL: Force spike ----
-            # High vertical force can also indicate thread contact
-            engage_ready = search_mask & (fz.abs() > self.engage_force_threshold * 0.7)
+            # High vertical force can also indicate thread contact (stricter threshold)
+            engage_ready = past_min & (fz.abs() > self.engage_force_threshold)
             next_phase = torch.where(engage_ready, torch.full_like(next_phase, 2), next_phase)
             
             # ---- TERTIARY SIGNAL: EE Z drop ----
-            z_dropped = search_mask & ((self.initial_z - current_z) > 0.002)
+            z_dropped = past_min & ((self.initial_z - current_z) > 0.002)
             next_phase = torch.where(z_dropped, torch.full_like(next_phase, 2), next_phase)
             
             # Timeout: force transition to engage

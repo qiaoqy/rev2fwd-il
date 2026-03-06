@@ -3,14 +3,83 @@
 # DAgger Iterative Training Pipeline (Auto-Resumable)
 # =============================================================================
 #
-# Loop: Evaluate → Aggregate successful rollout data → Finetune → Repeat
+# 概述:
+#   DAgger (Dataset Aggregation) 迭代训练管线。每轮迭代:
+#     1. 评估: 用当前 Policy A 和 B 在仿真中跑 N 个 A-B cycle, 收集成功的 rollout 数据
+#     2. 训练 A: 将 rollout 数据合并到原始数据集, 对 Policy A 微调
+#     3. 训练 B: 同理微调 Policy B
+#   重复以上循环, 策略性能逐步提升。
 #
-# Results stored in: data/pick_place_isaac_lab_simulation/exp{N}/
-#   - Auto-creates new experiment directory (exp1, exp2, ...)
-#   - On crash, re-run this script — auto-resumes from last completed phase
+# 目录结构:
+#   data/pick_place_isaac_lab_simulation/exp{N}/   — 实验结果
+#     config.json          — 实验配置
+#     record.json          — 每轮迭代的成功率记录
+#     iter{i}_eval_A.npz   — 第 i 轮 Policy A 的 rollout 数据
+#     iter{i}_eval_B.npz   — 第 i 轮 Policy B 的 rollout 数据
+#     .done_iter{i}_{phase} — 阶段完成标记 (用于断点恢复)
+#     success_rate_curve.png — 训练结束后的成功率曲线图
+#   runs/exp{N}_PP_{A,B}_{temp,last}/              — 工作目录 (checkpoint + dataset)
 #
-# Usage:
-#   bash scripts/scripts_pick_place/run_pipeline.sh
+# 自动恢复:
+#   脚本通过 .done_iter{i}_{phase} 标记文件跟踪进度。
+#   如果中途崩溃, 直接重新运行同一命令即可自动从上次完成的阶段恢复。
+#
+# =============================================================================
+# 使用示例
+# =============================================================================
+#
+# 1) 基本用法 — 使用 CUDA_VISIBLE_DEVICES 指定训练 GPU:
+#
+#      CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/scripts_pick_place/run_pipeline.sh
+#
+#    说明: 评估用 GPU 0, 训练用 GPU 0,1,2,3 (4 卡并行)。
+#          如果不设 CUDA_VISIBLE_DEVICES, 默认使用 0,4,5,6。
+#
+# 2) 后台运行 + 日志输出:
+#
+#      CUDA_VISIBLE_DEVICES=0,1 nohup bash scripts/scripts_pick_place/run_pipeline.sh \
+#          > pipeline_run.log 2>&1 &
+#
+#    说明: 适合长时间运行。脚本内部也会自动将输出 tee 到
+#          data/pick_place_isaac_lab_simulation/exp{N}/pipeline.log。
+#
+# 3) 崩溃后恢复 — 直接重新运行:
+#
+#      CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/scripts_pick_place/run_pipeline.sh
+#
+#    说明: 脚本会自动检测未完成的实验 (同 mode + 无 .complete 标记),
+#          跳过已完成的阶段, 从断点继续。
+#
+# 4) 查看训练进度:
+#
+#      # 实时查看日志
+#      tail -f data/pick_place_isaac_lab_simulation/exp{N}/pipeline.log
+#
+#      # 查看各轮成功率
+#      python3 -c "
+#      import json
+#      with open('data/pick_place_isaac_lab_simulation/exp{N}/record.json') as f:
+#          rec = json.load(f)
+#      for it in rec['iterations']:
+#          m = it['performance_metrics']
+#          print(f'Iter {it[\"iteration\"]:2d}: A={m[\"task_A_success_rate\"]*100:.1f}%  B={m[\"task_B_success_rate\"]*100:.1f}%')
+#      "
+#
+# =============================================================================
+# 关键配置参数说明
+# =============================================================================
+#
+#   MAX_ITERATIONS    迭代总轮数 (默认 10)
+#   NUM_CYCLES        每轮评估的 A-B cycle 数 (默认 50, 即每个策略评估 50 个 episode)
+#   STEPS_PER_ITER    每轮训练步数 (默认 5000)
+#   HORIZON           每个 episode 最大步数 (默认 400)
+#   BATCH_SIZE        训练 batch size (默认 32)
+#   N_ACTION_STEPS    Diffusion policy 的 action chunk 长度 (默认 16)
+#   DISTANCE_THRESHOLD 判定 pick/place 成功的距离阈值 (默认 0.05m)
+#   POLICY_A_SRC      Policy A 的预训练源路径 (只读, 不会被修改)
+#   POLICY_B_SRC      Policy B 的预训练源路径 (只读, 不会被修改)
+#   TRAINING_GPUS     训练用 GPU 列表, 从 CUDA_VISIBLE_DEVICES 继承
+#   DATA_COLLECTION_GPU  评估/数据收集用的单 GPU (默认 0)
 #
 # =============================================================================
 
@@ -312,7 +381,12 @@ train_policy() {
         echo "  Using weighted sampling (balancing old/new data 1:1)"
     fi
 
-    CUDA_VISIBLE_DEVICES=$TRAINING_GPUS torchrun --nproc_per_node=$NUM_TRAINING_GPUS \
+    # Pick a random free port to avoid EADDRINUSE on default 29500
+    local MASTER_PORT
+    MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+    echo "  Using master_port=$MASTER_PORT"
+
+    CUDA_VISIBLE_DEVICES=$TRAINING_GPUS torchrun --nproc_per_node=$NUM_TRAINING_GPUS --master_port=$MASTER_PORT \
         scripts/scripts_pick_place/4_train_diffusion.py \
         --dataset dummy.npz \
         --lerobot_dataset_dir "$LAST/lerobot_dataset" \

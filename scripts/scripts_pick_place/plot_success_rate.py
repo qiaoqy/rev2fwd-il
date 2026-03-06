@@ -42,6 +42,10 @@ def main():
                         help="Path to the JSON record file from the pipeline.")
     parser.add_argument("--out", type=str, default=None,
                         help="Output image path. Default: <record>_curve.png")
+    parser.add_argument("--metrics_key", type=str, default="performance_metrics",
+                        help="Key in each iteration entry to read metrics from. "
+                             "Default: 'performance_metrics'. Use 'fair_test_metrics' "
+                             "for pipeline_fair experiments.")
     args = parser.parse_args()
 
     record_path = Path(args.record)
@@ -66,7 +70,7 @@ def main():
     total_b = []
 
     for it in iterations:
-        metrics = it.get("performance_metrics", {})
+        metrics = it.get(args.metrics_key, it.get("performance_metrics", {}))
         iter_nums.append(it["iteration"])
         a_rates.append(metrics.get("task_A_success_rate", 0) * 100)
         b_rates.append(metrics.get("task_B_success_rate", 0) * 100)
