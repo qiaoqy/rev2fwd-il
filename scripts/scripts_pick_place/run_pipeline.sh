@@ -129,6 +129,14 @@ BASE_DIR="data/pick_place_isaac_lab_simulation"
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+# Timestamp prefix for log lines: [2026-03-06 22:41:05]
+add_timestamps() {
+    while IFS= read -r line; do
+        printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"
+    done
+}
+
 print_header() {
     echo ""
     echo "======================================================"
@@ -444,8 +452,8 @@ echo "  Iterations: $MAX_ITERATIONS × $NUM_CYCLES cycles"
 echo "  Training:   $STEPS_PER_ITER steps/iter, GPUs=$TRAINING_GPUS ($NUM_TRAINING_GPUS)"
 echo ""
 
-# Tee all output to log file (append on resume)
-exec > >(tee -a "$EXP_DIR/${MODE}.log") 2>&1
+# Tee all output to log file (append on resume), with timestamps
+exec > >(add_timestamps | tee -a "$EXP_DIR/${MODE}.log") 2>&1
 
 if [ "$IS_RESUME" = false ]; then
     init_experiment
