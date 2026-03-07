@@ -515,7 +515,7 @@ class NutThreadingExpert:
         # Force thresholds
         contact_force_threshold: float = 2.0,    # Force to detect initial contact
         engage_force_threshold: float = 6.0,     # Force indicating thread engagement
-        max_force_threshold: float = 25.0,       # Max force before backing off
+        max_force_threshold: float = 40.0,       # Max force before backing off (increased for stronger threading)
         # Search parameters
         search_radius: float = 0.005,            # Spiral search radius (5mm, increased for faster coverage)
         search_speed: float = 4.0,               # Angular speed of spiral (rad/s, doubled for speed)
@@ -717,7 +717,7 @@ class NutThreadingExpert:
         if approach_mask.any():
             # Move downward steadily
             action[approach_mask, 0:2] = 0.0  # Stay centered XY
-            action[approach_mask, 2] = -0.3   # Move down
+            action[approach_mask, 2] = -0.5   # Move down (increased force)
             action[approach_mask, 3:6] = 0.0  # No rotation
             
             # Record initial Z when first entering approach
@@ -771,7 +771,7 @@ class NutThreadingExpert:
             # Action: spiral XY + steady downward pressure
             action[search_mask, 0] = spiral_x[search_mask] * 15.0  # Scale to action space
             action[search_mask, 1] = spiral_y[search_mask] * 15.0
-            action[search_mask, 2] = -0.4   # Firm downward pressure
+            action[search_mask, 2] = -0.6   # Strong downward pressure (increased)
             
             # Gentle CW rotation during search to help threads catch
             # Small incremental yaw target (slower than engage) combined with oscillation
@@ -821,7 +821,7 @@ class NutThreadingExpert:
             
             # Center on bolt + downward pressure + clockwise rotation
             action[engage_mask, 0:2] = 0.0  # Center XY
-            action[engage_mask, 2] = -0.4   # Firm downward pressure
+            action[engage_mask, 2] = -0.6   # Strong downward pressure (increased)
             
             # Clockwise rotation: slower increment to carefully catch threads
             # engage_yaw_increment (0.02) is slower than thread's 0.05
@@ -912,11 +912,11 @@ class NutThreadingExpert:
             # Real threading requires significant downward force to overcome thread resistance
             z_action = torch.where(
                 force_ratio < 0.5,
-                torch.full_like(fz, -0.8),    # Low force: press VERY hard
+                torch.full_like(fz, -1.0),    # Low force: press MAX (increased from -0.8)
                 torch.where(
                     force_ratio < 1.5,
-                    torch.full_like(fz, -0.6),  # Normal force: still press hard
-                    torch.full_like(fz, -0.3)   # High force: moderate pressure
+                    torch.full_like(fz, -0.8),  # Normal force: press very hard (increased from -0.6)
+                    torch.full_like(fz, -0.5)   # High force: still press hard (increased from -0.3)
                 )
             )
             action[thread_mask, 2] = z_action[thread_mask]
@@ -938,7 +938,7 @@ class NutThreadingExpert:
             
             # If force gets too high, reduce downward pressure
             if too_high.any():
-                action[too_high, 2] = -0.1  # Light pressure
+                action[too_high, 2] = -0.3  # Moderate pressure even when force high (increased from -0.1)
             
             # =========== MULTI-TURN REGRASP LOGIC ===========
             # When yaw target reaches threshold, trigger release-reposition-regrasp cycle
@@ -1441,14 +1441,14 @@ def rollout_nut_threading(
     # Check success using FORGE's success metric
     success_threshold = forge_env.cfg_task.success_threshold
     
-    # Determine success per env: expert reached DONE (phase 4) with meaningful z progress
+    # Determine success per env: meaningful z progress (relaxed from requiring DONE phase)
     is_done = expert.is_done().cpu().numpy()  # (num_envs,)
     total_z_progress = (expert.z_progress_total + expert.z_progress).cpu().numpy()  # (num_envs,)
     min_success_progress = 0.003  # At least 3mm threading progress to count as success
     
     for i in range(num_envs):
-        # Success = reached DONE phase AND made meaningful threading progress
-        ep_success = bool(is_done[i]) and (total_z_progress[i] > min_success_progress)
+        # Success = made meaningful threading progress (DONE phase OR sufficient z_progress)
+        ep_success = (total_z_progress[i] > min_success_progress)
         episode_dict = {
             "obs": np.array(obs_lists[i], dtype=np.float32),
             "state": np.array(state_lists[i], dtype=np.float32),

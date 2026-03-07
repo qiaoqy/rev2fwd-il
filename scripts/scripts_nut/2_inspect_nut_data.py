@@ -103,6 +103,21 @@ def create_combined_video(episode_data: dict, output_path: Path, fps: int) -> No
     nut_euler = quat_to_euler(nut_quat)
 
     phase_data = episode_data.get("phase", None)
+
+    # Find the first frame after SEARCH completes (phase 1 → anything else)
+    # so the relative origin excludes the approach/search descent.
+    ref_idx = 0
+    if phase_data is not None:
+        in_search = False
+        for i in range(len(phase_data)):
+            if int(phase_data[i]) == 1:  # SEARCH
+                in_search = True
+            elif in_search:
+                ref_idx = i
+                break
+    # Convert positions to relative values (mm) from the post-SEARCH reference
+    ee_pos_rel = (ee_pos - ee_pos[ref_idx:ref_idx+1]) * 1000.0
+    nut_pos_rel = (nut_pos - nut_pos[ref_idx:ref_idx+1]) * 1000.0
     phase_names = episode_data.get(
         "phase_names",
         ["APPROACH", "SEARCH", "ENGAGE", "THREAD", "DONE",
@@ -140,9 +155,9 @@ def create_combined_video(episode_data: dict, output_path: Path, fps: int) -> No
 
     force_ylim = _ylim(ft_force)
     torque_ylim = _ylim(ft_torque)
-    pos_ylim = _ylim(ee_pos)
+    pos_ylim = _ylim(ee_pos_rel)
     rot_ylim = _ylim(ee_euler)
-    nut_pos_ylim = _ylim(nut_pos)
+    nut_pos_ylim = _ylim(nut_pos_rel)
     nut_rot_ylim = _ylim(nut_euler)
 
     def _shade_phases(ax, phase_data):
@@ -231,16 +246,16 @@ def create_combined_video(episode_data: dict, output_path: Path, fps: int) -> No
         ax_t.grid(True, alpha=0.3); ax_t.tick_params(labelsize=7)
         ax_t.set_xticklabels([])
 
-        # Row 2 left: EE position
+        # Row 2 left: EE position (relative to t=0, in mm)
         ax_p = fig.add_axes([lm, r2_bot, pw, r2_h])
         _shade_phases(ax_p, phase_data)
-        ax_p.plot(ts, ee_pos[:t+1, 0], "r-", lw=1.2, label="x")
-        ax_p.plot(ts, ee_pos[:t+1, 1], "g-", lw=1.2, label="y")
-        ax_p.plot(ts, ee_pos[:t+1, 2], "b-", lw=1.2, label="z")
+        ax_p.plot(ts, ee_pos_rel[:t+1, 0], "r-", lw=1.2, label="\u0394x")
+        ax_p.plot(ts, ee_pos_rel[:t+1, 1], "g-", lw=1.2, label="\u0394y")
+        ax_p.plot(ts, ee_pos_rel[:t+1, 2], "b-", lw=1.2, label="\u0394z")
         ax_p.axvline(t, color="k", ls="--", alpha=0.5, lw=0.8)
         ax_p.set_xlim(0, T); ax_p.set_ylim(*pos_ylim)
-        ax_p.set_ylabel("Position (m)", fontsize=9)
-        ax_p.set_title("EE Position", fontsize=10)
+        ax_p.set_ylabel("\u0394 Position (mm)", fontsize=9)
+        ax_p.set_title("EE Position (rel. to ENGAGE start)", fontsize=10)
         ax_p.legend(loc="upper right", fontsize=7, ncol=3)
         ax_p.grid(True, alpha=0.3); ax_p.tick_params(labelsize=7)
         ax_p.set_xticklabels([])
@@ -259,17 +274,17 @@ def create_combined_video(episode_data: dict, output_path: Path, fps: int) -> No
         ax_r.grid(True, alpha=0.3); ax_r.tick_params(labelsize=7)
         ax_r.set_xticklabels([])
 
-        # Row 3 left: Nut position
+        # Row 3 left: Nut position (relative to t=0, in mm)
         ax_np = fig.add_axes([lm, r3_bot, pw, r3_h])
         _shade_phases(ax_np, phase_data)
-        ax_np.plot(ts, nut_pos[:t+1, 0], "r-", lw=1.2, label="x")
-        ax_np.plot(ts, nut_pos[:t+1, 1], "g-", lw=1.2, label="y")
-        ax_np.plot(ts, nut_pos[:t+1, 2], "b-", lw=1.2, label="z")
+        ax_np.plot(ts, nut_pos_rel[:t+1, 0], "r-", lw=1.2, label="\u0394x")
+        ax_np.plot(ts, nut_pos_rel[:t+1, 1], "g-", lw=1.2, label="\u0394y")
+        ax_np.plot(ts, nut_pos_rel[:t+1, 2], "b-", lw=1.2, label="\u0394z")
         ax_np.axvline(t, color="k", ls="--", alpha=0.5, lw=0.8)
         ax_np.set_xlim(0, T); ax_np.set_ylim(*nut_pos_ylim)
         ax_np.set_xlabel("Step", fontsize=9)
-        ax_np.set_ylabel("Position (m)", fontsize=9)
-        ax_np.set_title("Nut Position", fontsize=10)
+        ax_np.set_ylabel("\u0394 Position (mm)", fontsize=9)
+        ax_np.set_title("Nut Position (rel. to ENGAGE start)", fontsize=10)
         ax_np.legend(loc="upper right", fontsize=7, ncol=3)
         ax_np.grid(True, alpha=0.3); ax_np.tick_params(labelsize=7)
 
