@@ -52,13 +52,13 @@ Usage:
     python scripts/hf_sync.py download-model ditflow_pickplace_piper_0221_B_0222 \
         --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs
 
-    python scripts/hf_sync.py download-model pickplace_piper_0226_A_ps5collected \
+    python scripts/hf_sync.py download-model pickplace_piper_0226_A_ps5collected_euler \
         --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs    
-    python scripts/hf_sync.py download-model pickplace_piper_0226_B_reversed \
+    python scripts/hf_sync.py download-model pickplace_piper_0226_B_reversed_euler \
         --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs 
-    python scripts/hf_sync.py download-model pickplace_piper_0226_B \
+    python scripts/hf_sync.py download-model pickplace_piper_0226_B_euler \
         --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs
-    python scripts/hf_sync.py download-model pickplace_piper_0226_A \
+    python scripts/hf_sync.py download-model pickplace_piper_0226_A_euler \
         --local_dir /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs
 
 

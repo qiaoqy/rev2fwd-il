@@ -118,6 +118,20 @@ python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
     /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs/pickplace_piper_0226_B_reversed/checkpoints/checkpoints/040000/pretrained_model\
     --max_steps 800 \
     --n_action_steps 16 --num_inference_steps 100
+
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint \
+    /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs/pickplace_piper_0226_A_ps5collected_euler/checkpoints/checkpoints/040000/pretrained_model\
+    --max_steps 800 \
+    --n_action_steps 16 --num_inference_steps 100
+
+
+
+python scripts/scripts_piper_local/8_eval_ditflow_piper.py \
+    --checkpoint \
+    /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/runs/pickplace_piper_0226_B_reversed_euler/checkpoints/checkpoints/040000/pretrained_model\
+    --max_steps 800 \
+    --n_action_steps 16 --num_inference_steps 100
 =============================================================================
 """
 
