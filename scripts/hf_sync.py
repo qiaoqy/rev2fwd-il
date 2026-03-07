@@ -75,6 +75,8 @@ Usage:
     python scripts/hf_sync.py upload-dataset \
         /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pickplace_piper_0226_A_ps5collected
 
+    python scripts/hf_sync.py upload-dataset \
+        /media/qiyuan/6ce654b6-642f-46b6-9872-efff633bb16a/piper_file/rev2fwd_data/pickplace_piper_0307_B
 
 
     # Download dataset (auto-appends dataset name as subdirectory)
