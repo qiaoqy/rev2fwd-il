@@ -75,7 +75,7 @@
 #   HORIZON           每个 episode 最大步数 (默认 400)
 #   BATCH_SIZE        训练 batch size (默认 32)
 #   N_ACTION_STEPS    Diffusion policy 的 action chunk 长度 (默认 16)
-#   DISTANCE_THRESHOLD 判定 pick/place 成功的距离阈值 (默认 0.05m)
+#   DISTANCE_THRESHOLD 判定 pick/place 成功的距离阈值 (默认 0.03m)
 #   POLICY_A_SRC      Policy A 的预训练源路径 (只读, 不会被修改)
 #   POLICY_B_SRC      Policy B 的预训练源路径 (只读, 不会被修改)
 #   TRAINING_GPUS     训练用 GPU 列表, 从 CUDA_VISIBLE_DEVICES 继承
@@ -98,7 +98,7 @@ NUM_CYCLES=50               # A-B eval cycles per iteration
 STEPS_PER_ITER=5000         # Training steps per iteration
 HORIZON=400                 # Max steps per robot attempt
 BATCH_SIZE=32
-DISTANCE_THRESHOLD=0.05
+DISTANCE_THRESHOLD=0.03
 N_ACTION_STEPS=16
 
 # Pretrained source policies (read-only, never modified)

@@ -950,33 +950,6 @@ class AlternatingTester:
 
             action_np = action[0].cpu().numpy()
             
-            # =========================================================================
-            # Force gripper open when XY aligned and Z is low enough
-            # =========================================================================
-            # Check if we should force gripper open:
-            # - XY distance to target < threshold
-            # - Object Z height < 0.15m (approaching table)
-            # This helps ensure the object is released at the right position.
-            from rev2fwd_il.sim.scene_api import get_object_pose_w as _get_obj_pose
-            _obj_pose = _get_obj_pose(self.env)[0].cpu().numpy()
-            _obj_z = _obj_pose[2]
-            _obj_xy = _obj_pose[:2]
-            
-            # Determine target XY based on task
-            if task_name == "Task A":
-                _target_xy = self.goal_xy
-            else:  # Task B
-                _target_xy = np.array(self.current_place_xy) if self.current_place_xy is not None else self.goal_xy
-            
-            _dist_to_target = np.linalg.norm(_obj_xy - _target_xy)
-            _xy_aligned = _dist_to_target < self.distance_threshold
-            _z_low_enough = _obj_z < 0.15
-            
-            if _xy_aligned and _z_low_enough and action_np[7] < 0.5:
-                # Force gripper open (1.0 = open)
-                print(f"    [{task_name}] Step {t+1}: Forcing gripper open (XY dist={_dist_to_target:.4f}, Z={_obj_z:.4f})")
-                action_np[7] = 1.0
-            
             action_list.append(action_np)
             
             # Update gripper state from action (last dimension)
@@ -998,8 +971,8 @@ class AlternatingTester:
                 success_step = t + 1
                 print(f"    [{task_name}] ✓ SUCCESS at step {t+1}")
                 # Success! Execute 20 more frames and record them.
-                # IMPORTANT: Keep gripper open during all post-success frames
-                print(f"    [{task_name}] Recording 20 additional frames after success (gripper forced open)...")
+                # Record 20 additional frames after success
+                print(f"    [{task_name}] Recording 20 additional frames after success...")
                 for extra_t in range(20):
                     # Get observation
                     table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
@@ -1036,15 +1009,12 @@ class AlternatingTester:
                     
                     action_np = action[0].cpu().numpy()
                     
-                    # FORCE GRIPPER OPEN: After success, always keep gripper open
-                    action_np[7] = 1.0
-                    
                     action_list.append(action_np)
                     
-                    # Update gripper state (always open after success)
-                    self.current_gripper_state = 1.0
+                    # Update gripper state from policy output
+                    self.current_gripper_state = float(action_np[7])
                     
-                    # Execute action in environment (with forced open gripper)
+                    # Execute action in environment
                     action_t = torch.from_numpy(action_np).float().unsqueeze(0).to(self.device)
                     num_envs = self.env.unwrapped.num_envs
                     if action_t.ndim == 1:
@@ -1087,10 +1057,7 @@ class AlternatingTester:
         Success criteria:
         - Object XY position is near the goal position (green marker)
         - Object Z height < 0.15m (approaching or on table)
-        - Gripper is open (object has been released) - forced open when conditions met
-        
-        Note: When XY is aligned and Z < 0.15m, the gripper is forced open in _run_task,
-        so checking gripper state here confirms the release action was taken.
+        - Gripper is open (object has been released)
         """
         from rev2fwd_il.sim.scene_api import get_object_pose_w
 
@@ -1116,7 +1083,7 @@ class AlternatingTester:
         Success criteria:
         - Object XY position is near the target place position (red marker)
         - Object Z height < 0.15m (approaching or on table)
-        - Gripper is open (object has been released) - forced open when conditions met
+        - Gripper is open (object has been released)
         """
         from rev2fwd_il.sim.scene_api import get_object_pose_w
 
@@ -1190,8 +1157,7 @@ class AlternatingTester:
         This is used after a task succeeds to allow the robot to continue
         moving before switching to the next task.
         
-        IMPORTANT: Gripper is forced open during all transition frames to ensure
-        the object remains released.
+        Transition frames are not recorded as training data.
         
         Args:
             n_frames: Number of frames to execute.
@@ -1204,7 +1170,7 @@ class AlternatingTester:
             has_wrist: Whether policy expects wrist camera input.
             task_name: Name of the task for logging.
         """
-        print(f"    [{task_name}] Running {n_frames} transition frames (gripper forced open, not recording)...")
+        print(f"    [{task_name}] Running {n_frames} transition frames (not recording)...")
         
         for t in range(n_frames):
             # Get observation
@@ -1235,13 +1201,10 @@ class AlternatingTester:
             
             action_np = action[0].cpu().numpy()
             
-            # FORCE GRIPPER OPEN: During transition, always keep gripper open
-            action_np[7] = 1.0
+            # Update gripper state from policy output
+            self.current_gripper_state = float(action_np[7])
             
-            # Update gripper state (always open during transition)
-            self.current_gripper_state = 1.0
-            
-            # Execute action in environment (with forced open gripper)
+            # Execute action in environment
             action_t = torch.from_numpy(action_np).float().unsqueeze(0).to(self.device)
             num_envs = self.env.unwrapped.num_envs
             if action_t.ndim == 1:

@@ -17,7 +17,7 @@ After EVERY task execution (regardless of success or failure), the script:
 
 Specifically:
   After Task A success:
-    - Run 100 transition frames with Policy A (gripper open, not recorded)
+    - Run 100 transition frames with Policy A (not recorded)
     - env.reset() (arm home)
     - Teleport object to goal position (Task B picks from goal)
 
@@ -26,7 +26,7 @@ Specifically:
     - Teleport object to goal position (Task B picks from goal)
 
   After Task B success:
-    - Run 100 transition frames with Policy B (gripper open, not recorded)
+    - Run 100 transition frames with Policy B (not recorded)
     - env.reset() (arm home)
     - Teleport object to random table position (Task A picks from table)
 
