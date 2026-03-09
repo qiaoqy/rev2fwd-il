@@ -71,6 +71,9 @@ def main():
 
     for it in iterations:
         metrics = it.get(args.metrics_key, it.get("performance_metrics", {}))
+        # Skip iterations with empty metrics
+        if not metrics:
+            continue
         iter_nums.append(it["iteration"])
         a_rates.append(metrics.get("task_A_success_rate", 0) * 100)
         b_rates.append(metrics.get("task_B_success_rate", 0) * 100)
@@ -90,7 +93,7 @@ def main():
     b_ci_hi = np.array([wilson_ci(k, n)[1] for k, n in zip(b_counts, total_b)])
 
     # ---- Plot ----
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.3), sharey=False)
 
     # Left: success rate curves with CI bands
     ax = axes[0]
@@ -137,6 +140,8 @@ def main():
     ax2.set_ylabel("Success Count", fontsize=13)
     ax2.set_title("Successes per Iteration", fontsize=14, fontweight="bold")
     ax2.set_xticks(iter_nums)
+    max_count = max(max(a_counts), max(b_counts)) if len(a_counts) > 0 else 1
+    ax2.set_ylim(0, max_count * 1.12)
     ax2.legend(fontsize=11)
     ax2.grid(True, alpha=0.3, axis="y")
 

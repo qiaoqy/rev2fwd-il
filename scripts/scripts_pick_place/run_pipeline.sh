@@ -541,6 +541,13 @@ print(f\"  B: {s['task_B_success_count']}/{s['total_task_B_episodes']} = {s['tas
     fi
 
     echo "  ✓ Iteration $iter complete"
+
+    # ---- Update plot after every iteration (crash-resilient) ----
+    echo "  Updating plot..."
+    python scripts/scripts_pick_place/plot_success_rate.py \
+        --record "$RECORD_FILE" \
+        --out "$EXP_DIR/success_rate_curve.png" 2>/dev/null || true
+    echo "  ✓ Plot saved to $EXP_DIR/success_rate_curve.png"
 done
 
 # =============================================================================

@@ -625,6 +625,17 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
     # ---- Skip training on last iteration ----
     if [ "$IS_LAST_ITER" = true ]; then
         echo "  ✓ Iteration $iter complete (test only, no training)"
+        # Still generate plots for the final iteration
+        echo "  Updating plots..."
+        python scripts/scripts_pick_place/plot_success_rate.py \
+            --record "$RECORD_FILE" \
+            --out "$EXP_DIR/fair_test_curve.png" \
+            --metrics_key fair_test_metrics 2>/dev/null || true
+        python scripts/scripts_pick_place/plot_success_rate.py \
+            --record "$RECORD_FILE" \
+            --out "$EXP_DIR/collection_curve.png" \
+            --metrics_key collection_metrics 2>/dev/null || true
+        echo "  ✓ Plots saved to $EXP_DIR/"
         continue
     fi
 
@@ -649,6 +660,18 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
     fi
 
     echo "  ✓ Iteration $iter complete"
+
+    # ---- Update plots after every iteration (crash-resilient) ----
+    echo "  Updating plots..."
+    python scripts/scripts_pick_place/plot_success_rate.py \
+        --record "$RECORD_FILE" \
+        --out "$EXP_DIR/fair_test_curve.png" \
+        --metrics_key fair_test_metrics 2>/dev/null || true
+    python scripts/scripts_pick_place/plot_success_rate.py \
+        --record "$RECORD_FILE" \
+        --out "$EXP_DIR/collection_curve.png" \
+        --metrics_key collection_metrics 2>/dev/null || true
+    echo "  ✓ Plots saved to $EXP_DIR/"
 done
 
 # =============================================================================

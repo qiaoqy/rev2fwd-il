@@ -869,15 +869,23 @@ class NutThreadingExpert:
         # =====================================================================
         thread_mask = phase_snapshot == 3
         if thread_mask.any():
-            # Record starting Z on phase entry
+            # Record starting NUT Z on phase entry (not EE z!)
+            # Nut z-drop is the true threading progress indicator.
             first_step = thread_mask & (self.phase_step_count == 1)
             if first_step.any():
-                self.initial_z[first_step] = current_z[first_step]
+                if nut_pos is not None:
+                    self.initial_z[first_step] = nut_pos[first_step, 2]
+                else:
+                    self.initial_z[first_step] = current_z[first_step]
                 self.last_z_progress[first_step] = 0.0
                 self.stall_counter[first_step] = 0
             
-            # Track threading progress (only for envs in thread phase)
-            z_progress_thread = self.initial_z - current_z
+            # Track threading progress using NUT z-drop (not EE z-drop)
+            # Positive z_progress means nut moved downward (threaded onto bolt)
+            if nut_pos is not None:
+                z_progress_thread = self.initial_z - nut_pos[:, 2]
+            else:
+                z_progress_thread = self.initial_z - current_z
             # Only update z_progress for thread phase envs
             self.z_progress = torch.where(thread_mask, z_progress_thread, self.z_progress)
             
@@ -1068,7 +1076,11 @@ class NutThreadingExpert:
             if regrasp_done.any():
                 # Reset z_progress for the new threading cycle (keeping z_progress_total)
                 self.z_progress[regrasp_done] = 0.0
-                self.initial_z[regrasp_done] = current_z[regrasp_done]
+                # Use nut z as baseline for next cycle (consistent with THREAD tracking)
+                if nut_pos is not None:
+                    self.initial_z[regrasp_done] = nut_pos[regrasp_done, 2]
+                else:
+                    self.initial_z[regrasp_done] = current_z[regrasp_done]
                 self.stall_counter[regrasp_done] = 0
                 self.last_z_progress[regrasp_done] = 0.0
             next_phase = torch.where(regrasp_done, torch.full_like(next_phase, 3), next_phase)
@@ -1441,13 +1453,13 @@ def rollout_nut_threading(
     # Check success using FORGE's success metric
     success_threshold = forge_env.cfg_task.success_threshold
     
-    # Determine success per env: meaningful z progress (relaxed from requiring DONE phase)
+    # Determine success per env: meaningful NUT z-drop (not EE z-drop)
     is_done = expert.is_done().cpu().numpy()  # (num_envs,)
-    total_z_progress = (expert.z_progress_total + expert.z_progress).cpu().numpy()  # (num_envs,)
-    min_success_progress = 0.003  # At least 3mm threading progress to count as success
+    total_z_progress = (expert.z_progress_total + expert.z_progress).cpu().numpy()  # (num_envs,) - now nut-based
+    min_success_progress = 0.003  # At least 3mm NUT z-drop to count as success
     
     for i in range(num_envs):
-        # Success = made meaningful threading progress (DONE phase OR sufficient z_progress)
+        # Success = nut actually moved downward on bolt (true threading progress)
         ep_success = (total_z_progress[i] > min_success_progress)
         episode_dict = {
             "obs": np.array(obs_lists[i], dtype=np.float32),

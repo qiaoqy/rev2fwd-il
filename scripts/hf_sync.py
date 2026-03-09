@@ -86,7 +86,7 @@ Usage:
     python scripts/hf_sync.py download-dataset pullout_piper_0225_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
     python scripts/hf_sync.py download-dataset pickplace_piper_0226_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
     python scripts/hf_sync.py download-dataset pickplace_piper_0226_A_ps5collected --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
-
+    python scripts/hf_sync.py download-dataset pickplace_piper_0307_B --local_dir /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/
 
 
     

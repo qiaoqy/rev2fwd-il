@@ -395,12 +395,10 @@ class NutThread(FactoryTask):
     engage_threshold: float = 0.5
     keypoint_scale: float = 0.05
 
-    # Collision contact_offset: reduced from 0.005 (5mm) to 0.0005 (0.5mm).
+    # Collision contact_offset: reduced to 0.00001 (0.01mm).
     # PhysX generates contacts when shapes are within (contact_offset_A + contact_offset_B).
-    # With the old 5mm: gripper↔nut contacts triggered at 10mm gap (= nut height!),
-    # causing phantom collisions when gripper and nut aren't actually touching.
-    # With 0.5mm: nut↔bolt triggers at 1mm gap (suitable for 2mm thread pitch).
-    _collision_contact_offset: float = 0.0005
+    # With 0.01mm: nut↔bolt triggers at 0.02mm gap — very tight for 2mm thread pitch.
+    _collision_contact_offset: float = 0.00001
 
     fixed_asset: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/FixedAsset",
@@ -415,12 +413,12 @@ class NutThread(FactoryTask):
                 max_linear_velocity=1000.0,
                 max_angular_velocity=3666.0,
                 enable_gyroscopic_forces=True,
-                solver_position_iteration_count=192,
+                solver_position_iteration_count=256,
                 solver_velocity_iteration_count=1,
                 max_contact_impulse=1e32,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=fixed_asset_cfg.mass),
-            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.0005, rest_offset=0.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.00001, rest_offset=0.0),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.6, 0.0, 0.05), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}, joint_vel={}
@@ -440,12 +438,12 @@ class NutThread(FactoryTask):
                 max_linear_velocity=1000.0,
                 max_angular_velocity=3666.0,
                 enable_gyroscopic_forces=True,
-                solver_position_iteration_count=192,
+                solver_position_iteration_count=256,
                 solver_velocity_iteration_count=1,
                 max_contact_impulse=1e32,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=held_asset_cfg.mass),
-            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.0005, rest_offset=0.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.00001, rest_offset=0.0),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.4, 0.1), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}, joint_vel={}
