@@ -608,6 +608,147 @@ def load_diffusion_policy(
     return policy, preprocessor, postprocessor, actual_inference_steps, actual_n_action_steps
 
 
+def load_ditflow_policy(
+    pretrained_dir: str,
+    device: str,
+    image_height: int = 128,
+    image_width: int = 128,
+    num_inference_steps: int | None = None,
+    n_action_steps: int | None = None,
+) -> Tuple[Any, Any, Any, int, int]:
+    """Load LeRobot DiT Flow policy from checkpoint directory."""
+    import dataclasses
+    import json
+    from pathlib import Path
+
+    from safetensors.torch import load_file
+    from lerobot.configs.types import FeatureType, PolicyFeature, NormalizationMode
+    from lerobot.policies.factory import make_pre_post_processors
+
+    from lerobot.utils.import_utils import register_third_party_plugins
+    register_third_party_plugins()
+    from lerobot_policy_ditflow import DiTFlowConfig, DiTFlowPolicy
+
+    pretrained_path = Path(pretrained_dir)
+    config_path = pretrained_path / "config.json"
+    model_path = pretrained_path / "model.safetensors"
+
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+
+    if "type" in config_dict:
+        del config_dict["type"]
+
+    # Parse input_features
+    input_features_raw = config_dict.get("input_features", {})
+    input_features = {}
+    for key, val in input_features_raw.items():
+        feat_type = FeatureType[val["type"]] if isinstance(val["type"], str) else val["type"]
+        input_features[key] = PolicyFeature(type=feat_type, shape=tuple(val["shape"]))
+    config_dict["input_features"] = input_features
+
+    # Parse output_features
+    output_features_raw = config_dict.get("output_features", {})
+    output_features = {}
+    for key, val in output_features_raw.items():
+        feat_type = FeatureType[val["type"]] if isinstance(val["type"], str) else val["type"]
+        output_features[key] = PolicyFeature(type=feat_type, shape=tuple(val["shape"]))
+    config_dict["output_features"] = output_features
+
+    # Parse normalization_mapping
+    if "normalization_mapping" in config_dict:
+        norm_mapping_raw = config_dict["normalization_mapping"]
+        norm_mapping = {}
+        for key, val in norm_mapping_raw.items():
+            norm_mode = NormalizationMode[val] if isinstance(val, str) else val
+            norm_mapping[key] = norm_mode
+        config_dict["normalization_mapping"] = norm_mapping
+
+    # Convert lists to tuples
+    for field_name in ["crop_shape", "optimizer_betas"]:
+        if field_name in config_dict and isinstance(config_dict[field_name], list):
+            config_dict[field_name] = tuple(config_dict[field_name])
+
+    # Override settings if specified
+    if num_inference_steps is not None:
+        config_dict["num_inference_steps"] = num_inference_steps
+
+    if n_action_steps is not None:
+        horizon = config_dict.get("horizon", 16)
+        if n_action_steps > horizon:
+            n_action_steps = horizon
+        config_dict["n_action_steps"] = n_action_steps
+
+    # Filter out unknown fields
+    valid_fields = {f.name for f in dataclasses.fields(DiTFlowConfig)}
+    unknown_keys = set(config_dict.keys()) - valid_fields
+    if unknown_keys:
+        for k in unknown_keys:
+            del config_dict[k]
+
+    cfg = DiTFlowConfig(**config_dict)
+    policy = DiTFlowPolicy(cfg)
+
+    state_dict = load_file(model_path)
+    result = policy.load_state_dict(state_dict, strict=False)
+    if result.missing_keys:
+        unexpected_missing = [
+            k for k in result.missing_keys
+            if not ((".mlp.0." in k or ".mlp.3." in k) and "decoder.layers" in k)
+        ]
+        if unexpected_missing:
+            raise RuntimeError(f"Unexpected missing keys: {unexpected_missing}")
+    policy = policy.to(device)
+
+    preprocessor_overrides = {"device_processor": {"device": device}}
+    postprocessor_overrides = {"device_processor": {"device": device}}
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=cfg,
+        pretrained_path=str(pretrained_path),
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
+
+    actual_inference_steps = cfg.num_inference_steps or 100
+    actual_n_action_steps = cfg.n_action_steps
+
+    return policy, preprocessor, postprocessor, actual_inference_steps, actual_n_action_steps
+
+
+def detect_policy_type(pretrained_dir: str) -> str:
+    """Detect whether a checkpoint is 'diffusion' or 'ditflow'."""
+    import json
+    from pathlib import Path
+    config_path = Path(pretrained_dir) / "config.json"
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+    return config_dict.get("type", "diffusion")
+
+
+def load_policy_auto(
+    pretrained_dir: str,
+    device: str,
+    image_height: int = 128,
+    image_width: int = 128,
+    num_inference_steps: int | None = None,
+    n_action_steps: int | None = None,
+) -> Tuple[Any, Any, Any, int, int]:
+    """Auto-detect policy type and load accordingly."""
+    policy_type = detect_policy_type(pretrained_dir)
+    print(f"  [Auto-detect] Policy type: {policy_type} ({pretrained_dir})")
+    if policy_type == "ditflow":
+        return load_ditflow_policy(
+            pretrained_dir, device, image_height, image_width,
+            num_inference_steps, n_action_steps,
+        )
+    else:
+        return load_diffusion_policy(
+            pretrained_dir, device, image_height, image_width,
+            num_inference_steps, n_action_steps,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Alternating Tester Class
 # ---------------------------------------------------------------------------

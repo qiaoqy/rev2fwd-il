@@ -3,118 +3,23 @@
 # DAgger Pipeline with Parallel Fair Testing
 # =============================================================================
 #
-# Overview:
-#   Extends the standard DAgger iterative training loop with an independent
-#   fair test at every iteration, providing unbiased evaluation of policy
-#   performance at each training stage.
-#   Uses two GPUs: one for data collection, one for fair testing (in parallel);
-#   both GPUs are combined for distributed training.
+# Each iteration (0-9):
+#   GPU 0: Collect rollout data (9_eval_with_recovery.py, 50 A-B cycles)  ─┐
+#   GPU 1: Fair test (10_eval_independent.py, 50 episodes/task)            ─┘ parallel
+#   GPU 0,1: DAgger train Policy A (merge rollout data + original)
+#   GPU 0,1: DAgger train Policy B (merge rollout data + original)
 #
-# Pipeline (11 iterations total, iter 0-10):
+# Iteration 10 (final):
+#   GPU 1: Fair test only (no collection or training)
 #
-#   Iteration 0-9 (3 phases each):
-#     Phase 1 — Parallel evaluation (two GPUs working simultaneously):
-#       GPU 0: Data collection — run 50 A-B cycles, collect successful rollouts
-#              for DAgger aggregation (9_eval_with_recovery.py)
-#       GPU 2: Fair test — independently evaluate Policy A and B for N episodes
-#              each (10_eval_independent.py)
-#     Phase 2 — Train Policy A (GPU 0+2 joint, torchrun distributed):
-#       Merge successful rollouts from Phase 1 into original dataset, train 5000 steps
-#     Phase 3 — Train Policy B (GPU 0+2 joint, same as above)
+# Total: 11 fair-test data points (model_0 pretrained → model_10)
 #
-#   Iteration 10 (final):
-#     Fair test only — no data collection or training. Produces the 11th eval point.
+# Results stored in: data/pick_place_isaac_lab_simulation/exp{N}/
+#   - Auto-creates new experiment directory (exp1, exp2, ...)
+#   - On crash, re-run this script — auto-resumes from last completed phase
 #
-# Output directory structure:
-#   data/pick_place_isaac_lab_simulation/exp{N}/     — Experiment results
-#     config.json                    — Experiment config (all hyperparameters)
-#     record.json                    — Per-iteration success rates (collection + fair test)
-#     iter{i}_collect_A.npz          — Policy A rollout data from iteration i
-#     iter{i}_collect_B.npz          — Policy B rollout data from iteration i
-#     iter{i}_collect_A.stats.json   — Data collection statistics for iteration i
-#     iter{i}_fair_test.stats.json   — Fair test statistics for iteration i
-#     iter{i}_collect.log            — Data collection subprocess log for iteration i
-#     iter{i}_fair_test.log          — Fair test subprocess log for iteration i
-#     iter{i}_ckpt_A/                — Policy A checkpoint backup after iteration i
-#     iter{i}_ckpt_B/                — Policy B checkpoint backup after iteration i
-#     .done_iter{i}_{phase}          — Phase completion markers (for crash recovery)
-#     .complete                      — Experiment completion marker
-#     pipeline_fair.log              — Full timestamped pipeline log
-#     fair_test_curve.png            — Fair test success rate plot
-#     collection_curve.png           — Data collection success rate plot
-#   runs/exp{N}_PP_{A,B}_{temp,last}/ — Working directories (checkpoints + datasets)
-#
-# Auto-resume:
-#   The script tracks progress via .done_iter{i}_{phase} marker files.
-#   On crash, simply re-run the same command — it will automatically skip
-#   completed phases and resume from where it left off.
-#   The script also auto-detects incomplete pipeline_fair experiments to resume.
-#
-# =============================================================================
-# Usage Examples
-# =============================================================================
-#
-# 1) Basic run (defaults to GPU 0 and GPU 2):
-#
-#      bash scripts/scripts_pick_place/run_ablation.sh
-#
-# 2) Background run (recommended — survives SSH disconnection):
-#
-#      nohup bash scripts/scripts_pick_place/run_ablation.sh > ablation_nohup.log 2>&1 &
-#
-#    The script also internally writes timestamped output to:
-#      data/pick_place_isaac_lab_simulation/exp{N}/pipeline_fair.log
-#
-# 3) Run with modified parameters (e.g., change fair test count):
-#    Copy the script, edit the configuration section, then run:
-#
-#      cp scripts/scripts_pick_place/run_ablation.sh scripts/scripts_pick_place/run_my_exp.sh
-#      # Edit NUM_FAIR_TEST_EPISODES, DISTANCE_THRESHOLD, etc. in run_my_exp.sh
-#      nohup bash scripts/scripts_pick_place/run_my_exp.sh > my_exp_nohup.log 2>&1 &
-#
-# 4) Resume after crash — just re-run the same command:
-#
-#      nohup bash scripts/scripts_pick_place/run_ablation.sh > ablation_nohup.log 2>&1 &
-#
-#    The script auto-detects incomplete experiments (same mode + no .complete marker),
-#    skips finished phases, and continues from the last checkpoint.
-#
-# 5) Monitor progress:
-#
-#      # Watch the pipeline log in real time
-#      tail -f data/pick_place_isaac_lab_simulation/exp{N}/pipeline_fair.log
-#
-#      # Print fair test success rates for each iteration
-#      python3 -c "
-#      import json
-#      with open('data/pick_place_isaac_lab_simulation/exp{N}/record.json') as f:
-#          rec = json.load(f)
-#      for it in rec['iterations']:
-#          ft = it.get('fair_test_metrics', {})
-#          print(f'Iter {it[\"iteration\"]:2d}: A={ft.get(\"task_A_success_rate\",0)*100:.1f}%  B={ft.get(\"task_B_success_rate\",0)*100:.1f}%')
-#      "
-#
-#      # View detailed subprocess log for a specific iteration's fair test
-#      cat data/pick_place_isaac_lab_simulation/exp{N}/iter5_fair_test.log
-#
-# =============================================================================
-# Configuration Reference
-# =============================================================================
-#
-#   MODE                 pipeline_fair (do not change)
-#   MAX_ITERATIONS       Total training rounds (default 10; runs iter 0-10 = 11 eval points)
-#   NUM_CYCLES           A-B cycles per iteration for data collection (default 50)
-#   NUM_FAIR_TEST_EPISODES  Episodes per task per iteration for fair test (default 200)
-#   STEPS_PER_ITER       Training steps per iteration (default 5000)
-#   HORIZON              Max steps per episode (default 400)
-#   BATCH_SIZE           Training batch size (default 32)
-#   N_ACTION_STEPS       Diffusion policy action chunk length (default 16)
-#   DISTANCE_THRESHOLD   Pick/place success distance threshold in meters (default 0.05)
-#   POLICY_A_SRC         Pretrained Policy A source path (read-only, never modified)
-#   POLICY_B_SRC         Pretrained Policy B source path (read-only, never modified)
-#   COLLECT_GPU          GPU for data collection (default 0)
-#   FAIR_TEST_GPU        GPU for fair testing (default 2)
-#   TRAINING_GPUS        GPU list for distributed training (default "0,2")
+# Usage:
+#   bash scripts/scripts_pick_place/run_ablation.sh
 #
 # =============================================================================
 
@@ -134,7 +39,7 @@ NUM_FAIR_TEST_EPISODES=100  # Independent episodes per task (fair test)
 STEPS_PER_ITER=5000         # Training steps per iteration
 HORIZON=400                 # Max steps per robot attempt
 BATCH_SIZE=32
-DISTANCE_THRESHOLD=0.03
+DISTANCE_THRESHOLD=0.05
 N_ACTION_STEPS=16
 
 # Pretrained source policies (read-only, never modified)

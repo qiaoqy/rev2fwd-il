@@ -1,120 +1,37 @@
 #!/bin/bash
 # =============================================================================
-# DAgger Pipeline with Parallel Fair Testing
+# Exp7: DAgger Pipeline with DiT Flow Policy
 # =============================================================================
 #
-# Overview:
-#   Extends the standard DAgger iterative training loop with an independent
-#   fair test at every iteration, providing unbiased evaluation of policy
-#   performance at each training stage.
-#   Uses two GPUs: one for data collection, one for fair testing (in parallel);
-#   both GPUs are combined for distributed training.
+# Same DAgger pipeline as exp5/exp6 but using DiT Flow policy instead of
+# Diffusion Policy. DiT Flow uses:
+#   - Transformer architecture (instead of U-Net)
+#   - Flow Matching objective (instead of DDPM)
+#   - Faster inference (~100 steps vs 100 DDIM steps)
 #
-# Pipeline (11 iterations total, iter 0-10):
+# Pipeline overview:
+#   Phase 0 — Pretrain base DiT Flow policies A and B from the same data
+#             used for PP_A_circle / PP_B_circle (50,000 steps each)
 #
 #   Iteration 0-9 (3 phases each):
-#     Phase 1 — Parallel evaluation (two GPUs working simultaneously):
-#       GPU 0: Data collection — run 50 A-B cycles, collect successful rollouts
-#              for DAgger aggregation (9_eval_with_recovery.py)
-#       GPU 2: Fair test — independently evaluate Policy A and B for N episodes
-#              each (10_eval_independent.py)
-#     Phase 2 — Train Policy A (GPU 0+2 joint, torchrun distributed):
-#       Merge successful rollouts from Phase 1 into original dataset, train 5000 steps
-#     Phase 3 — Train Policy B (GPU 0+2 joint, same as above)
+#     Phase 1 — Parallel evaluation (two GPUs):
+#       GPU 1: Data collection — 50 A-B cycles (9_eval_with_recovery.py)
+#       GPU 4: Fair test — 100 episodes/task (10_eval_independent.py)
+#     Phase 2 — Train Policy A (GPU 0,1,4,5 joint, torchrun distributed)
+#     Phase 3 — Train Policy B (GPU 0,1,4,5 joint, torchrun distributed)
 #
 #   Iteration 10 (final):
-#     Fair test only — no data collection or training. Produces the 11th eval point.
+#     Fair test only — the 11th evaluation point
 #
-# Output directory structure:
-#   data/pick_place_isaac_lab_simulation/exp{N}/     — Experiment results
-#     config.json                    — Experiment config (all hyperparameters)
-#     record.json                    — Per-iteration success rates (collection + fair test)
-#     iter{i}_collect_A.npz          — Policy A rollout data from iteration i
-#     iter{i}_collect_B.npz          — Policy B rollout data from iteration i
-#     iter{i}_collect_A.stats.json   — Data collection statistics for iteration i
-#     iter{i}_fair_test.stats.json   — Fair test statistics for iteration i
-#     iter{i}_collect.log            — Data collection subprocess log for iteration i
-#     iter{i}_fair_test.log          — Fair test subprocess log for iteration i
-#     iter{i}_ckpt_A/                — Policy A checkpoint backup after iteration i
-#     iter{i}_ckpt_B/                — Policy B checkpoint backup after iteration i
-#     .done_iter{i}_{phase}          — Phase completion markers (for crash recovery)
-#     .complete                      — Experiment completion marker
-#     pipeline_fair.log              — Full timestamped pipeline log
-#     fair_test_curve.png            — Fair test success rate plot
-#     collection_curve.png           — Data collection success rate plot
-#   runs/exp{N}_PP_{A,B}_{temp,last}/ — Working directories (checkpoints + datasets)
+# GPU allocation: 0,1,4,5 — avoids exp5 (GPUs 0,2) and exp6 (GPUs 0,5,6,7,8,9)
+#   - Collection: GPU 1 (avoids exp5/6 training GPUs)
+#   - Fair test:  GPU 4 (unused by exp5/6)
+#   - Training:   GPU 0,1,4,5 (4 GPUs)
 #
-# Auto-resume:
-#   The script tracks progress via .done_iter{i}_{phase} marker files.
-#   On crash, simply re-run the same command — it will automatically skip
-#   completed phases and resume from where it left off.
-#   The script also auto-detects incomplete pipeline_fair experiments to resume.
+# Auto-resume: re-run the same command to resume from where it left off.
 #
-# =============================================================================
-# Usage Examples
-# =============================================================================
-#
-# 1) Basic run (defaults to GPU 0 and GPU 2):
-#
-#      bash scripts/scripts_pick_place/run_ablation.sh
-#
-# 2) Background run (recommended — survives SSH disconnection):
-#
-#      nohup bash scripts/scripts_pick_place/run_ablation.sh > ablation_nohup.log 2>&1 &
-#
-#    The script also internally writes timestamped output to:
-#      data/pick_place_isaac_lab_simulation/exp{N}/pipeline_fair.log
-#
-# 3) Run with modified parameters (e.g., change fair test count):
-#    Copy the script, edit the configuration section, then run:
-#
-#      cp scripts/scripts_pick_place/run_ablation.sh scripts/scripts_pick_place/run_my_exp.sh
-#      # Edit NUM_FAIR_TEST_EPISODES, DISTANCE_THRESHOLD, etc. in run_my_exp.sh
-#      nohup bash scripts/scripts_pick_place/run_my_exp.sh > my_exp_nohup.log 2>&1 &
-#
-# 4) Resume after crash — just re-run the same command:
-#
-#      nohup bash scripts/scripts_pick_place/run_ablation.sh > ablation_nohup.log 2>&1 &
-#
-#    The script auto-detects incomplete experiments (same mode + no .complete marker),
-#    skips finished phases, and continues from the last checkpoint.
-#
-# 5) Monitor progress:
-#
-#      # Watch the pipeline log in real time
-#      tail -f data/pick_place_isaac_lab_simulation/exp{N}/pipeline_fair.log
-#
-#      # Print fair test success rates for each iteration
-#      python3 -c "
-#      import json
-#      with open('data/pick_place_isaac_lab_simulation/exp{N}/record.json') as f:
-#          rec = json.load(f)
-#      for it in rec['iterations']:
-#          ft = it.get('fair_test_metrics', {})
-#          print(f'Iter {it[\"iteration\"]:2d}: A={ft.get(\"task_A_success_rate\",0)*100:.1f}%  B={ft.get(\"task_B_success_rate\",0)*100:.1f}%')
-#      "
-#
-#      # View detailed subprocess log for a specific iteration's fair test
-#      cat data/pick_place_isaac_lab_simulation/exp{N}/iter5_fair_test.log
-#
-# =============================================================================
-# Configuration Reference
-# =============================================================================
-#
-#   MODE                 pipeline_fair (do not change)
-#   MAX_ITERATIONS       Total training rounds (default 10; runs iter 0-10 = 11 eval points)
-#   NUM_CYCLES           A-B cycles per iteration for data collection (default 50)
-#   NUM_FAIR_TEST_EPISODES  Episodes per task per iteration for fair test (default 200)
-#   STEPS_PER_ITER       Training steps per iteration (default 5000)
-#   HORIZON              Max steps per episode (default 400)
-#   BATCH_SIZE           Training batch size (default 32)
-#   N_ACTION_STEPS       Diffusion policy action chunk length (default 16)
-#   DISTANCE_THRESHOLD   Pick/place success distance threshold in meters (default 0.05)
-#   POLICY_A_SRC         Pretrained Policy A source path (read-only, never modified)
-#   POLICY_B_SRC         Pretrained Policy B source path (read-only, never modified)
-#   COLLECT_GPU          GPU for data collection (default 0)
-#   FAIR_TEST_GPU        GPU for fair testing (default 2)
-#   TRAINING_GPUS        GPU list for distributed training (default "0,2")
+# Usage:
+#   nohup bash scripts/scripts_pick_place/run_exp7.sh > exp7_nohup.log 2>&1 &
 #
 # =============================================================================
 
@@ -127,28 +44,30 @@ echo "Activated: $CONDA_DEFAULT_ENV"
 # =============================================================================
 # Configuration
 # =============================================================================
-MODE="pipeline_fair"        # DAgger with parallel fair testing
-MAX_ITERATIONS=10           # Iterations 0-9 collect+train; iteration 10 test-only
-NUM_CYCLES=50               # A-B eval cycles per iteration (data collection)
-NUM_FAIR_TEST_EPISODES=100  # Independent episodes per task (fair test)
-STEPS_PER_ITER=5000         # Training steps per iteration
-HORIZON=400                 # Max steps per robot attempt
+MODE="pipeline_fair_ditflow"  # DiT Flow DAgger pipeline with fair testing
+MAX_ITERATIONS=10             # Iterations 0-9 collect+train; iteration 10 test-only
+NUM_CYCLES=50                 # A-B eval cycles per iteration (data collection)
+NUM_FAIR_TEST_EPISODES=100    # Independent episodes per task (fair test)
+STEPS_PER_ITER=5000           # Training steps per DAgger iteration
+PRETRAIN_STEPS=50000          # Steps for initial base policy pretraining
+HORIZON=400                   # Max steps per robot attempt
 BATCH_SIZE=32
 DISTANCE_THRESHOLD=0.03
 N_ACTION_STEPS=16
 
-# Pretrained source policies (read-only, never modified)
-POLICY_A_SRC="runs/PP_A_circle"
-POLICY_B_SRC="runs/PP_B_circle"
+# Source data — reuse the same lerobot_dataset from diffusion pretraining
+# (the data format is identical; only the policy architecture differs)
+DATA_A_SRC="runs/PP_A_circle/lerobot_dataset"
+DATA_B_SRC="runs/PP_B_circle/lerobot_dataset"
 
 GOAL_X=0.5
 GOAL_Y=0.0
 
-# GPUs — two for parallel eval, both for training
-COLLECT_GPU=0               # GPU for data collection (9_eval_with_recovery.py)
-FAIR_TEST_GPU=2             # GPU for fair testing (10_eval_independent.py)
-TRAINING_GPUS="0,2"         # GPUs for training
-NUM_TRAINING_GPUS=2
+# GPUs — avoid exp5 (0,2) and exp6 (0,5,6,7,8,9)
+COLLECT_GPU=1               # GPU for data collection (avoids exp5/6 collision)
+FAIR_TEST_GPU=4             # GPU for fair testing
+TRAINING_GPUS="0,1,4,5"    # GPUs for distributed training
+NUM_TRAINING_GPUS=4
 
 # NCCL robustness (prevents hangs on multi-GPU training)
 export NCCL_P2P_DISABLE=1
@@ -167,7 +86,6 @@ BASE_DIR="data/pick_place_isaac_lab_simulation"
 # Helper Functions
 # =============================================================================
 
-# Timestamp prefix for log lines: [2026-03-06 22:41:05]
 add_timestamps() {
     while IFS= read -r line; do
         printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"
@@ -197,11 +115,10 @@ get_step() {
 phase_done() { [ -f "$EXP_DIR/.done_iter${1}_${2}" ]; }
 mark_done()  { touch "$EXP_DIR/.done_iter${1}_${2}"; }
 
-# Save a copy of the pretrained_model checkpoint for a given iteration
 save_iter_checkpoint() {
-    local ITER=$1       # iteration number
-    local NAME=$2       # "A" or "B"
-    local TEMP=$3       # temp working directory (has latest checkpoint)
+    local ITER=$1
+    local NAME=$2
+    local TEMP=$3
     local CKPT_SRC
     CKPT_SRC=$(get_ckpt "$TEMP")
     local DEST="$EXP_DIR/iter${ITER}_ckpt_${NAME}"
@@ -231,7 +148,6 @@ find_or_create_exp() {
         [[ "$n" =~ ^[0-9]+$ ]] || continue
         [ "$n" -gt "$max_num" ] && max_num=$n
 
-        # Check: same mode + incomplete → candidate for resume
         if [ -f "$d/config.json" ] && [ ! -f "$d/.complete" ]; then
             local m
             m=$(python3 -c "import json; print(json.load(open('${d}config.json'))['mode'])")
@@ -256,35 +172,102 @@ find_or_create_exp() {
 }
 
 # =============================================================================
+# Pretrain Base DiT Flow Policies
+# =============================================================================
+pretrain_base_policies() {
+    print_header "Phase 0: Pretrain Base DiT Flow Policies ($PRETRAIN_STEPS steps)"
+
+    local PRETRAIN_A="runs/exp${EXP_NUM}_ditflow_pretrain_A"
+    local PRETRAIN_B="runs/exp${EXP_NUM}_ditflow_pretrain_B"
+
+    # --- Pretrain Policy A ---
+    if [ ! -f "$EXP_DIR/.done_pretrain_A" ]; then
+        echo "  Training base DiT Flow Policy A ($PRETRAIN_STEPS steps)..."
+
+        # Copy source lerobot_dataset
+        mkdir -p "$PRETRAIN_A"
+        if [ ! -d "$PRETRAIN_A/lerobot_dataset" ]; then
+            cp -r "$DATA_A_SRC" "$PRETRAIN_A/lerobot_dataset"
+        fi
+
+        local MASTER_PORT
+        MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+
+        CUDA_VISIBLE_DEVICES=$TRAINING_GPUS torchrun --nproc_per_node=$NUM_TRAINING_GPUS --master_port=$MASTER_PORT \
+            scripts/scripts_pick_place/4_train_ditflow.py \
+            --dataset dummy.npz \
+            --lerobot_dataset_dir "$PRETRAIN_A/lerobot_dataset" \
+            --out "$PRETRAIN_A" \
+            --steps $PRETRAIN_STEPS \
+            --batch_size $BATCH_SIZE \
+            --n_action_steps $N_ACTION_STEPS \
+            --save_freq 10000 \
+            --skip_convert \
+            --include_obj_pose --include_gripper --wandb \
+            > "$EXP_DIR/pretrain_A.log" 2>&1
+
+        touch "$EXP_DIR/.done_pretrain_A"
+        echo "  ✓ Policy A pretrained"
+    else
+        echo "  [Pretrain A] Already done — skipping"
+    fi
+
+    # --- Pretrain Policy B ---
+    if [ ! -f "$EXP_DIR/.done_pretrain_B" ]; then
+        echo "  Training base DiT Flow Policy B ($PRETRAIN_STEPS steps)..."
+
+        mkdir -p "$PRETRAIN_B"
+        if [ ! -d "$PRETRAIN_B/lerobot_dataset" ]; then
+            cp -r "$DATA_B_SRC" "$PRETRAIN_B/lerobot_dataset"
+        fi
+
+        local MASTER_PORT
+        MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+
+        CUDA_VISIBLE_DEVICES=$TRAINING_GPUS torchrun --nproc_per_node=$NUM_TRAINING_GPUS --master_port=$MASTER_PORT \
+            scripts/scripts_pick_place/4_train_ditflow.py \
+            --dataset dummy.npz \
+            --lerobot_dataset_dir "$PRETRAIN_B/lerobot_dataset" \
+            --out "$PRETRAIN_B" \
+            --steps $PRETRAIN_STEPS \
+            --batch_size $BATCH_SIZE \
+            --n_action_steps $N_ACTION_STEPS \
+            --save_freq 10000 \
+            --skip_convert \
+            --include_obj_pose --include_gripper --wandb \
+            > "$EXP_DIR/pretrain_B.log" 2>&1
+
+        touch "$EXP_DIR/.done_pretrain_B"
+        echo "  ✓ Policy B pretrained"
+    else
+        echo "  [Pretrain B] Already done — skipping"
+    fi
+
+    # Set these as the source policies for the DAgger loop
+    POLICY_A_SRC="$PRETRAIN_A"
+    POLICY_B_SRC="$PRETRAIN_B"
+}
+
+# =============================================================================
 # Initialize New Experiment
 # =============================================================================
 init_experiment() {
     print_header "Initializing Experiment $EXP_NUM ($MODE)"
 
-    # Pre-flight checks
-    for d in "$POLICY_A_SRC/lerobot_dataset" "$POLICY_B_SRC/lerobot_dataset" \
-             "$(get_ckpt "$POLICY_A_SRC")" "$(get_ckpt "$POLICY_B_SRC")"; do
-        [ -d "$d" ] || { echo "ERROR: Not found: $d"; exit 1; }
+    # Pre-flight checks: verify source data exists
+    for d in "$DATA_A_SRC" "$DATA_B_SRC"; do
+        [ -d "$d" ] || { echo "ERROR: Source data not found: $d"; exit 1; }
     done
-
-    # Copy source → temp working directories
-    echo "  Copying Policy A → temp"
-    mkdir -p "$PA_TEMP"
-    cp -r "$POLICY_A_SRC/checkpoints" "$PA_TEMP/checkpoints"
-    cp -r "$POLICY_A_SRC/lerobot_dataset" "$PA_TEMP/lerobot_dataset"
-
-    echo "  Copying Policy B → temp"
-    mkdir -p "$PB_TEMP"
-    cp -r "$POLICY_B_SRC/checkpoints" "$PB_TEMP/checkpoints"
-    cp -r "$POLICY_B_SRC/lerobot_dataset" "$PB_TEMP/lerobot_dataset"
 
     # Write config
     python3 -c "
 import json, datetime
 json.dump({
     'mode': '$MODE',
+    'policy_type': 'ditflow',
     'created_at': datetime.datetime.now().isoformat(),
     'max_iterations': $MAX_ITERATIONS,
+    'pretrain_steps': $PRETRAIN_STEPS,
     'num_cycles': $NUM_CYCLES,
     'num_fair_test_episodes': $NUM_FAIR_TEST_EPISODES,
     'steps_per_iter': $STEPS_PER_ITER,
@@ -292,8 +275,8 @@ json.dump({
     'batch_size': $BATCH_SIZE,
     'distance_threshold': $DISTANCE_THRESHOLD,
     'n_action_steps': $N_ACTION_STEPS,
-    'policy_A_source': '$POLICY_A_SRC',
-    'policy_B_source': '$POLICY_B_SRC',
+    'data_A_source': '$DATA_A_SRC',
+    'data_B_source': '$DATA_B_SRC',
     'goal_xy': [$GOAL_X, $GOAL_Y],
     'collect_gpu': $COLLECT_GPU,
     'fair_test_gpu': $FAIR_TEST_GPU,
@@ -305,11 +288,25 @@ json.dump({
     python3 -c "
 import json
 json.dump({
-    'description': 'DAgger pipeline with parallel fair testing (11 data points, iter 0-10)',
+    'description': 'DiT Flow DAgger pipeline with parallel fair testing (11 data points, iter 0-10)',
     'config': json.load(open('$EXP_DIR/config.json')),
     'iterations': []
 }, open('$RECORD_FILE', 'w'), indent=2)
 "
+
+    # Pretrain base policies
+    pretrain_base_policies
+
+    # Copy pretrained policies → temp working directories
+    echo "  Copying pretrained DiT Flow Policy A → temp"
+    mkdir -p "$PA_TEMP"
+    cp -r "$POLICY_A_SRC/checkpoints" "$PA_TEMP/checkpoints"
+    cp -r "$POLICY_A_SRC/lerobot_dataset" "$PA_TEMP/lerobot_dataset"
+
+    echo "  Copying pretrained DiT Flow Policy B → temp"
+    mkdir -p "$PB_TEMP"
+    cp -r "$POLICY_B_SRC/checkpoints" "$PB_TEMP/checkpoints"
+    cp -r "$POLICY_B_SRC/lerobot_dataset" "$PB_TEMP/lerobot_dataset"
 
     echo "✓ Experiment initialized"
 }
@@ -330,7 +327,6 @@ from pathlib import Path
 with open("$RECORD_FILE") as f:
     rec = json.load(f)
 
-# Find or create entry for this iteration
 entry = None
 for e in rec["iterations"]:
     if e["iteration"] == $iteration:
@@ -390,7 +386,6 @@ from pathlib import Path
 with open("$RECORD_FILE") as f:
     rec = json.load(f)
 
-# Find or create entry for this iteration
 entry = None
 for e in rec["iterations"]:
     if e["iteration"] == $iteration:
@@ -413,7 +408,6 @@ if sf.exists():
         "task_B_success_rate": s.get("task_B_success_rate", 0),
         "task_A_success_count": s.get("task_A_success_count", 0),
         "task_B_success_count": s.get("task_B_success_count", 0),
-        # Normalize field name from 10_eval_independent.py
         "total_task_A_episodes": s.get("task_A_total_episodes", s.get("total_task_A_episodes", 0)),
         "total_task_B_episodes": s.get("task_B_total_episodes", s.get("total_task_B_episodes", 0)),
         "total_elapsed_seconds": s.get("total_elapsed_seconds", 0),
@@ -438,7 +432,7 @@ PYEOF
 }
 
 # =============================================================================
-# Train One Policy (A or B) — DAgger: merge rollout data
+# Train One Policy (A or B) — DAgger: merge rollout data, train with DiT Flow
 # =============================================================================
 train_policy() {
     local NAME=$1        # "A" or "B"
@@ -458,7 +452,7 @@ train_policy() {
     rm -rf "$LAST"
     mkdir -p "$LAST"
 
-    # --- Prepare dataset + checkpoint ---
+    # --- Prepare dataset + checkpoint (reuse 7_finetune_with_rollout.py) ---
     local ROLLOUT_ARG=""
     if [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
         ROLLOUT_ARG="--rollout_data $ROLLOUT"
@@ -498,19 +492,18 @@ train_policy() {
         echo "  Symlink: last → $STEP_NAME"
     fi
 
-    # --- Train ---
+    # --- Train with DiT Flow (key difference from run_ablation.sh) ---
     local CUR_STEP TARGET
     CUR_STEP=$(get_step "$LAST")
     TARGET=$((CUR_STEP + STEPS_PER_ITER))
-    echo "  Training Policy $NAME: step $CUR_STEP → $TARGET ($NUM_TRAINING_GPUS GPUs)"
+    echo "  Training Policy $NAME (DiT Flow): step $CUR_STEP → $TARGET ($NUM_TRAINING_GPUS GPUs)"
 
-    # Pick a random free port to avoid EADDRINUSE on default 29500
     local MASTER_PORT
     MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
     echo "  Using master_port=$MASTER_PORT"
 
     CUDA_VISIBLE_DEVICES=$TRAINING_GPUS torchrun --nproc_per_node=$NUM_TRAINING_GPUS --master_port=$MASTER_PORT \
-        scripts/scripts_pick_place/4_train_diffusion.py \
+        scripts/scripts_pick_place/4_train_ditflow.py \
         --dataset dummy.npz \
         --lerobot_dataset_dir "$LAST/lerobot_dataset" \
         --out "$LAST" \
@@ -521,7 +514,7 @@ train_policy() {
         --skip_convert --resume \
         --include_obj_pose --include_gripper --wandb
 
-    echo "  ✓ Policy $NAME trained"
+    echo "  ✓ Policy $NAME trained (DiT Flow)"
 
     # --- Rotate: last → temp ---
     rm -rf "$TEMP"
@@ -543,11 +536,12 @@ RECORD_FILE="$EXP_DIR/record.json"
 
 echo ""
 echo "  Experiment: $EXP_DIR  (resume=$IS_RESUME)"
-echo "  Mode:       $MODE"
+echo "  Mode:       $MODE (DiT Flow)"
 echo "  Iterations: 0-$MAX_ITERATIONS (11 fair-test points, 10 training rounds)"
 echo "  Collection: $NUM_CYCLES A-B cycles/iter on GPU $COLLECT_GPU"
 echo "  Fair test:  $NUM_FAIR_TEST_EPISODES episodes/task on GPU $FAIR_TEST_GPU"
 echo "  Training:   $STEPS_PER_ITER steps/iter, GPUs=$TRAINING_GPUS ($NUM_TRAINING_GPUS)"
+echo "  Pretrain:   $PRETRAIN_STEPS steps (base DiT Flow policies)"
 echo ""
 
 # Tee all output to log file (append on resume), with timestamps
@@ -557,6 +551,16 @@ if [ "$IS_RESUME" = false ]; then
     init_experiment
 else
     print_header "Resuming Experiment $EXP_NUM ($MODE)"
+
+    # On resume, re-derive POLICY_A_SRC / POLICY_B_SRC for pretrain check
+    POLICY_A_SRC="runs/exp${EXP_NUM}_ditflow_pretrain_A"
+    POLICY_B_SRC="runs/exp${EXP_NUM}_ditflow_pretrain_B"
+
+    # If pretraining wasn't finished, complete it
+    if [ ! -f "$EXP_DIR/.done_pretrain_A" ] || [ ! -f "$EXP_DIR/.done_pretrain_B" ]; then
+        pretrain_base_policies
+    fi
+
     # Verify temp dirs exist (or recover from crash)
     for pair in "A:$PA_TEMP:$PA_LAST" "B:$PB_TEMP:$PB_LAST"; do
         IFS=: read -r label temp last <<< "$pair"
@@ -608,7 +612,6 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
         COLLECT_PID=""
         FAIR_TEST_PID=""
 
-        # Launch data collection (background, GPU 0) — skip for last iteration
         if [ "$NEED_COLLECT" = true ]; then
             echo "  [GPU $COLLECT_GPU] Starting data collection ($NUM_CYCLES A-B cycles)..."
             rm -f "$ROLLOUT_A" "$ROLLOUT_B" "$COLLECT_STATS"
@@ -630,7 +633,6 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
             echo "  [GPU $COLLECT_GPU] Collection PID: $COLLECT_PID"
         fi
 
-        # Launch fair test (background, GPU 1)
         if [ "$NEED_FAIR_TEST" = true ]; then
             echo "  [GPU $FAIR_TEST_GPU] Starting fair test ($NUM_FAIR_TEST_EPISODES episodes/task)..."
             rm -f "$FAIR_TEST_STATS"
@@ -650,7 +652,6 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
             echo "  [GPU $FAIR_TEST_GPU] Fair test PID: $FAIR_TEST_PID"
         fi
 
-        # Wait for both processes
         echo "  Waiting for parallel tasks to complete..."
         set +e
         COLLECT_RC=0
@@ -679,13 +680,11 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
         fi
         set -e
 
-        # Abort on failure
         if [ $COLLECT_RC -ne 0 ] || [ $FAIR_TEST_RC -ne 0 ]; then
             echo "ERROR: One or more parallel tasks failed. Aborting."
             exit 1
         fi
 
-        # Record results
         if [ "$NEED_COLLECT" = true ]; then
             append_collection_record $iter "$COLLECT_STATS" $STEP_A $STEP_B
 
@@ -720,7 +719,6 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
     # ---- Skip training on last iteration ----
     if [ "$IS_LAST_ITER" = true ]; then
         echo "  ✓ Iteration $iter complete (test only, no training)"
-        # Still generate plots for the final iteration
         echo "  Updating plots..."
         python scripts/scripts_pick_place/plot_success_rate.py \
             --record "$RECORD_FILE" \
@@ -734,9 +732,9 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
         continue
     fi
 
-    # ---- Phase 2: Train Policy A (DAgger) ----
+    # ---- Phase 2: Train Policy A (DAgger with DiT Flow) ----
     if ! phase_done $iter train_A; then
-        echo "--- Train Policy A ($STEPS_PER_ITER steps, DAgger) ---"
+        echo "--- Train Policy A (DiT Flow, $STEPS_PER_ITER steps, DAgger) ---"
         train_policy A "$PA_TEMP" "$PA_LAST" "$ROLLOUT_A"
         save_iter_checkpoint $iter A "$PA_TEMP"
         mark_done $iter train_A
@@ -744,9 +742,9 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
         echo "  [Train A] Already done — skipping"
     fi
 
-    # ---- Phase 3: Train Policy B (DAgger) ----
+    # ---- Phase 3: Train Policy B (DAgger with DiT Flow) ----
     if ! phase_done $iter train_B; then
-        echo "--- Train Policy B ($STEPS_PER_ITER steps, DAgger) ---"
+        echo "--- Train Policy B (DiT Flow, $STEPS_PER_ITER steps, DAgger) ---"
         train_policy B "$PB_TEMP" "$PB_LAST" "$ROLLOUT_B"
         save_iter_checkpoint $iter B "$PB_TEMP"
         mark_done $iter train_B
@@ -756,7 +754,7 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
 
     echo "  ✓ Iteration $iter complete"
 
-    # ---- Update plots after every iteration (crash-resilient) ----
+    # ---- Update plots after every iteration ----
     echo "  Updating plots..."
     python scripts/scripts_pick_place/plot_success_rate.py \
         --record "$RECORD_FILE" \
@@ -769,47 +767,10 @@ print(f\"  Fair test:  A={s['task_A_success_count']}/{s['task_A_total_episodes']
     echo "  ✓ Plots saved to $EXP_DIR/"
 done
 
-# =============================================================================
-# Done
-# =============================================================================
+# ========================== Done ==========================
 touch "$EXP_DIR/.complete"
-
-print_header "Generating Plot"
-python scripts/scripts_pick_place/plot_success_rate.py \
-    --record "$RECORD_FILE" \
-    --out "$EXP_DIR/fair_test_curve.png" \
-    --metrics_key fair_test_metrics
-
-print_header "Pipeline Complete!"
-echo "  Experiment: $EXP_DIR"
-echo "  Record:     $RECORD_FILE"
-echo "  Plot:       $EXP_DIR/fair_test_curve.png"
-echo "  Checkpoints:"
-echo "    Policy A: $(get_ckpt "$PA_TEMP")"
-echo "    Policy B: $(get_ckpt "$PB_TEMP")"
-echo ""
-
-python3 << PYSUMMARY
-import json
-with open("$RECORD_FILE") as f:
-    record = json.load(f)
-iters = record.get("iterations", [])
-if iters:
-    print("  Fair Test Results (independent reset, 11 data points):")
-    print("  Iter  |  Fair A  |  Fair B  |  Collect A  |  Collect B")
-    print("  ------|----------|----------|-------------|------------")
-    for it in iters:
-        ft = it.get("fair_test_metrics", {})
-        cm = it.get("collection_metrics", {})
-        fa = ft.get('task_A_success_rate', 0) * 100
-        fb = ft.get('task_B_success_rate', 0) * 100
-        ca_str = f"{cm['task_A_success_rate']*100:5.1f}%" if cm.get('task_A_success_rate') is not None else "   N/A"
-        cb_str = f"{cm['task_B_success_rate']*100:5.1f}%" if cm.get('task_B_success_rate') is not None else "   N/A"
-        print(f"  {it['iteration']:4d}  |  {fa:5.1f}%  |  {fb:5.1f}%  |    {ca_str}  |    {cb_str}")
-    first_a = iters[0].get("fair_test_metrics", {}).get("task_A_success_rate", 0) * 100
-    last_a  = iters[-1].get("fair_test_metrics", {}).get("task_A_success_rate", 0) * 100
-    first_b = iters[0].get("fair_test_metrics", {}).get("task_B_success_rate", 0) * 100
-    last_b  = iters[-1].get("fair_test_metrics", {}).get("task_B_success_rate", 0) * 100
-    print(f"\n  Fair Test A: {first_a:.1f}% → {last_a:.1f}%")
-    print(f"  Fair Test B: {first_b:.1f}% → {last_b:.1f}%")
-PYSUMMARY
+print_header "Experiment $EXP_NUM Complete!"
+echo "  Results: $EXP_DIR"
+echo "  Record:  $RECORD_FILE"
+echo "  Plots:   $EXP_DIR/fair_test_curve.png"
+echo "           $EXP_DIR/collection_curve.png"

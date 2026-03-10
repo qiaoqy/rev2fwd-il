@@ -148,7 +148,7 @@ def main() -> None:
 
         make_env_with_camera = _alt_mod.make_env_with_camera
         load_policy_config = _alt_mod.load_policy_config
-        load_diffusion_policy = _alt_mod.load_diffusion_policy
+        load_policy_auto = _alt_mod.load_policy_auto
         AlternatingTester = _alt_mod.AlternatingTester
         create_target_markers = _alt_mod.create_target_markers
         update_target_markers = _alt_mod.update_target_markers
@@ -185,14 +185,14 @@ def main() -> None:
         print(f"\n{'='*60}")
         print("Loading policies...")
         print(f"{'='*60}")
-        policy_A, preproc_A, postproc_A, _, n_act_A = load_diffusion_policy(
+        policy_A, preproc_A, postproc_A, _, n_act_A = load_policy_auto(
             args.policy_A, device,
             image_height=args.image_height, image_width=args.image_width,
             n_action_steps=args.n_action_steps,
         )
         policy_A.eval()
 
-        policy_B, preproc_B, postproc_B, _, n_act_B = load_diffusion_policy(
+        policy_B, preproc_B, postproc_B, _, n_act_B = load_policy_auto(
             args.policy_B, device,
             image_height=args.image_height, image_width=args.image_width,
             n_action_steps=args.n_action_steps,
