@@ -22,6 +22,9 @@ python scripts/2_inspect_data.py --dataset data/B_pick_place.npz \
 python scripts/2_inspect_data.py --dataset data/B_pick_place.npz \
     --enable_xyz_viz --episode 0
 
+python scripts/scripts_pick_place/2_inspect_data.py --dataset data/pick_place_isaac_lab_simulation/exp8/A_forward_300.npz \
+    --enable_xyz_viz --episode 0
+
 =============================================================================
 """
 

@@ -40,7 +40,7 @@ USAGE
 # Basic time reversal
 python scripts/scripts_task_inovo/2_time_reverse.py \
     --input data/inovo_data/0209_tower_boby \
-    --output data/inovo_data/tower_boby_A \
+    --output data/inovo_data/tower_boby_A_20260313 \
     --verify \
     --new_language "Pick up the purple disc from the sponge and place it on the pole."
 
@@ -218,11 +218,12 @@ def reverse_episode(
             action_src = frames[T - 2 - t]  # frame whose action goes T-2-t → T-1-t
             actions_new = np.zeros(7, dtype=np.float64)
             actions_new[:6] = -action_src["actions"][:6]  # Negate velocity
-            actions_new[6] = 1.0 - action_src["actions"][6]  # Invert gripper
+            
+            actions_new[6] = action_src["actions"][6]  # Invert gripper
         else:
             # Last reversed frame: no next observation to transition to
             actions_new = np.zeros(7, dtype=np.float64)
-            actions_new[6] = 1.0 - frames[0]["actions"][6]
+            actions_new[6] = frames[0]["actions"][6]
         new_frame["actions"] = actions_new
 
         # rel_actions: same treatment (they are identical to actions in this dataset)
@@ -230,10 +231,10 @@ def reverse_episode(
             rel_src = frames[T - 2 - t]
             rel_actions_new = np.zeros(7, dtype=np.float64)
             rel_actions_new[:6] = -rel_src["rel_actions"][:6]
-            rel_actions_new[6] = 1.0 - rel_src["rel_actions"][6]
+            rel_actions_new[6] = rel_src["rel_actions"][6]
         else:
             rel_actions_new = np.zeros(7, dtype=np.float64)
-            rel_actions_new[6] = 1.0 - frames[0]["rel_actions"][6]
+            rel_actions_new[6] = frames[0]["rel_actions"][6]
         new_frame["rel_actions"] = rel_actions_new
 
         # Force/torque: reverse frame order (negate is debatable, just reverse)

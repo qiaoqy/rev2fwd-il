@@ -180,6 +180,13 @@ def _parse_args() -> argparse.Namespace:
         default=[0.5, 0.0],
         help="Goal XY position (plate center). Default: 0.5 0.0.",
     )
+    parser.add_argument(
+        "--fixed_start_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional fixed table XY for all sampled starts/targets. If not set, uses random sampling.",
+    )
 
     # Action chunk settings
     parser.add_argument(
@@ -767,6 +774,7 @@ class AlternatingTester:
         n_action_steps_A: int,
         n_action_steps_B: int,
         goal_xy: Tuple[float, float] = (0.5, 0.0),
+        fixed_start_xy: Tuple[float, float] | None = None,
         height_threshold: float = 0.15,
         distance_threshold: float = 0.05,
         horizon: int = 400,
@@ -801,6 +809,7 @@ class AlternatingTester:
 
         # Task parameters
         self.goal_xy = np.array(goal_xy)
+        self.fixed_start_xy = tuple(fixed_start_xy) if fixed_start_xy is not None else None
         self.height_threshold = height_threshold
         self.distance_threshold = distance_threshold
         self.horizon = horizon
@@ -1259,6 +1268,9 @@ class AlternatingTester:
         Returns:
             Tuple (x, y) for the new place target.
         """
+        if self.fixed_start_xy is not None:
+            return (float(self.fixed_start_xy[0]), float(self.fixed_start_xy[1]))
+
         min_dist_from_goal = 0.1
         # Use same table bounds as task_spec.py for consistency with training data
         # task_spec: table_xy_min = (0.35, -0.25), table_xy_max = (0.65, 0.25)
@@ -1711,6 +1723,7 @@ def main() -> None:
             n_action_steps_A=n_action_steps_A,
             n_action_steps_B=n_action_steps_B,
             goal_xy=tuple(args.goal_xy),
+            fixed_start_xy=(tuple(args.fixed_start_xy) if args.fixed_start_xy is not None else None),
             height_threshold=args.height_threshold,
             distance_threshold=args.distance_threshold,
             horizon=args.horizon,

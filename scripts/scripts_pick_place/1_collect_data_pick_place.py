@@ -112,6 +112,13 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Random seed for reproducibility.",
     )
+    parser.add_argument(
+        "--fixed_start_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional fixed start XY for all sampled table starts. If not set, starts are random.",
+    )
     
     # -----------------------------------------------------------------
     # Output configuration
@@ -695,18 +702,29 @@ def rollout_expert_B_with_goal_actions(
     print("[DEBUG] rollout: Physics settled")
     
     # =========================================================================
-    # Step 3: Sample random place targets for each env
+    # Step 3: Sample place targets for each env (or use fixed start for ablation)
     # =========================================================================
-    # Sample place targets that are at least 0.1 away from the goal position
     min_dist_from_goal = 0.1
-    place_xys = []
-    for _ in range(num_envs):
-        while True:
-            xy = task_spec.sample_table_xy(rng)
-            dist = np.sqrt((xy[0] - task_spec.goal_xy[0])**2 + (xy[1] - task_spec.goal_xy[1])**2)
-            if dist >= min_dist_from_goal:
-                place_xys.append(xy)
-                break
+    fixed_start_xy = getattr(task_spec, "fixed_start_xy", None)
+    if fixed_start_xy is not None:
+        fx = float(fixed_start_xy[0])
+        fy = float(fixed_start_xy[1])
+        dist = np.sqrt((fx - task_spec.goal_xy[0])**2 + (fy - task_spec.goal_xy[1])**2)
+        if dist < min_dist_from_goal:
+            raise ValueError(
+                f"fixed_start_xy=({fx:.3f}, {fy:.3f}) violates min distance {min_dist_from_goal:.3f} "
+                f"from goal {task_spec.goal_xy}."
+            )
+        place_xys = [(fx, fy) for _ in range(num_envs)]
+    else:
+        place_xys = []
+        for _ in range(num_envs):
+            while True:
+                xy = task_spec.sample_table_xy(rng)
+                dist = np.sqrt((xy[0] - task_spec.goal_xy[0])**2 + (xy[1] - task_spec.goal_xy[1])**2)
+                if dist >= min_dist_from_goal:
+                    place_xys.append(xy)
+                    break
     place_poses_np = np.array([
         [xy[0], xy[1], 0.055, 1.0, 0.0, 0.0, 0.0] for xy in place_xys
     ], dtype=np.float32)
@@ -1029,6 +1047,9 @@ def main() -> None:
             success_radius=0.03,
             settle_steps=10,
         )
+        if args.fixed_start_xy is not None:
+            task_spec.fixed_start_xy = (float(args.fixed_start_xy[0]), float(args.fixed_start_xy[1]))
+            print(f"[DEBUG] Using fixed start XY: {task_spec.fixed_start_xy}")
         print("[DEBUG] Step 5: Task specification created")
         
         # =================================================================

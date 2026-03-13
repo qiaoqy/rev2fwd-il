@@ -61,7 +61,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--height_threshold", type=float, default=0.15)
     parser.add_argument("--distance_threshold", type=float, default=0.05)
     parser.add_argument("--goal_xy", type=float, nargs=2, default=[0.5, 0.0])
+    parser.add_argument(
+        "--fixed_start_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional fixed table XY for all sampled starts/targets.",
+    )
     parser.add_argument("--n_action_steps", type=int, default=None)
+    parser.add_argument("--tasks", type=str, default="AB",
+                        choices=["A", "B", "AB"],
+                        help="Which tasks to evaluate: A, B, or AB (default).")
 
     # Environment settings
     parser.add_argument("--task", type=str, default="Isaac-Lift-Cube-Franka-IK-Abs-v0")
@@ -163,6 +173,7 @@ def main() -> None:
             policy_B=policy_B, preprocessor_B=preproc_B, postprocessor_B=postproc_B,
             n_action_steps_A=n_act_A, n_action_steps_B=n_act_B,
             goal_xy=tuple(args.goal_xy),
+            fixed_start_xy=(tuple(args.fixed_start_xy) if args.fixed_start_xy is not None else None),
             height_threshold=args.height_threshold,
             distance_threshold=args.distance_threshold,
             horizon=args.horizon,
@@ -236,83 +247,91 @@ def main() -> None:
         # =================================================================
         # Phase 1: Evaluate Task A independently (N episodes)
         # =================================================================
-        print(f"\n{'='*60}")
-        print(f"Phase 1: Independent Task A Evaluation ({args.num_episodes} episodes)")
-        print(f"{'='*60}")
-
         results_A = []
         episodes_A_details = []
-        start_A = time.time()
+        elapsed_A = 0.0
+        n_success_A = 0
+        rate_A = 0.0
 
-        for ep_idx in range(args.num_episodes):
-            print(f"\n  [Task A] Episode {ep_idx + 1}/{args.num_episodes}")
-            rand_xy = _hard_reset_for_task_A()
-            print(f"    Object at random pos [{rand_xy[0]:.3f}, {rand_xy[1]:.3f}]")
+        if "A" in args.tasks:
+            print(f"\n{'='*60}")
+            print(f"Phase 1: Independent Task A Evaluation ({args.num_episodes} episodes)")
+            print(f"{'='*60}")
 
-            ep_A, success_A = tester.run_task_A()
-            results_A.append(success_A)
+            start_A = time.time()
 
-            detail = {
-                "episode_index": ep_idx,
-                "success": success_A,
-                "success_step": ep_A.get("success_step"),
-                "total_steps": len(ep_A.get("images", [])),
-            }
-            if "obj_pose" in ep_A and len(ep_A["obj_pose"]) > 0:
-                detail["initial_obj_position"] = ep_A["obj_pose"][0][:3].tolist()
-                detail["final_obj_position"] = ep_A["obj_pose"][-1][:3].tolist()
-            episodes_A_details.append(detail)
+            for ep_idx in range(args.num_episodes):
+                print(f"\n  [Task A] Episode {ep_idx + 1}/{args.num_episodes}")
+                rand_xy = _hard_reset_for_task_A()
+                print(f"    Object at random pos [{rand_xy[0]:.3f}, {rand_xy[1]:.3f}]")
 
-            status = "SUCCESS" if success_A else "FAILED"
-            rate = sum(results_A) / len(results_A) * 100
-            print(f"    {status}  (running: {sum(results_A)}/{len(results_A)} = {rate:.1f}%)")
+                ep_A, success_A = tester.run_task_A()
+                results_A.append(success_A)
 
-        elapsed_A = time.time() - start_A
-        n_success_A = sum(results_A)
-        rate_A = n_success_A / len(results_A) if results_A else 0.0
+                detail = {
+                    "episode_index": ep_idx,
+                    "success": success_A,
+                    "success_step": ep_A.get("success_step"),
+                    "total_steps": len(ep_A.get("images", [])),
+                }
+                if "obj_pose" in ep_A and len(ep_A["obj_pose"]) > 0:
+                    detail["initial_obj_position"] = ep_A["obj_pose"][0][:3].tolist()
+                    detail["final_obj_position"] = ep_A["obj_pose"][-1][:3].tolist()
+                episodes_A_details.append(detail)
 
-        print(f"\n  Task A Final: {n_success_A}/{len(results_A)} = {rate_A:.1%}  ({elapsed_A:.1f}s)")
+                status = "SUCCESS" if success_A else "FAILED"
+                rate = sum(results_A) / len(results_A) * 100
+                print(f"    {status}  (running: {sum(results_A)}/{len(results_A)} = {rate:.1f}%)")
+
+            elapsed_A = time.time() - start_A
+            n_success_A = sum(results_A)
+            rate_A = n_success_A / len(results_A) if results_A else 0.0
+            print(f"\n  Task A Final: {n_success_A}/{len(results_A)} = {rate_A:.1%}  ({elapsed_A:.1f}s)")
 
         # =================================================================
         # Phase 2: Evaluate Task B independently (N episodes)
         # =================================================================
-        print(f"\n{'='*60}")
-        print(f"Phase 2: Independent Task B Evaluation ({args.num_episodes} episodes)")
-        print(f"{'='*60}")
-
         results_B = []
         episodes_B_details = []
-        start_B = time.time()
+        elapsed_B = 0.0
+        n_success_B = 0
+        rate_B = 0.0
 
-        for ep_idx in range(args.num_episodes):
-            print(f"\n  [Task B] Episode {ep_idx + 1}/{args.num_episodes}")
-            _hard_reset_for_task_B()
-            print(f"    Object at goal [{goal_xy[0]:.3f}, {goal_xy[1]:.3f}], "
-                  f"target: [{tester.current_place_xy[0]:.3f}, {tester.current_place_xy[1]:.3f}]")
+        if "B" in args.tasks:
+            print(f"\n{'='*60}")
+            print(f"Phase 2: Independent Task B Evaluation ({args.num_episodes} episodes)")
+            print(f"{'='*60}")
 
-            ep_B, success_B = tester.run_task_B()
-            results_B.append(success_B)
+            start_B = time.time()
 
-            detail = {
-                "episode_index": ep_idx,
-                "success": success_B,
-                "success_step": ep_B.get("success_step"),
-                "total_steps": len(ep_B.get("images", [])),
-            }
-            if "obj_pose" in ep_B and len(ep_B["obj_pose"]) > 0:
-                detail["initial_obj_position"] = ep_B["obj_pose"][0][:3].tolist()
-                detail["final_obj_position"] = ep_B["obj_pose"][-1][:3].tolist()
-            episodes_B_details.append(detail)
+            for ep_idx in range(args.num_episodes):
+                print(f"\n  [Task B] Episode {ep_idx + 1}/{args.num_episodes}")
+                _hard_reset_for_task_B()
+                print(f"    Object at goal [{goal_xy[0]:.3f}, {goal_xy[1]:.3f}], "
+                      f"target: [{tester.current_place_xy[0]:.3f}, {tester.current_place_xy[1]:.3f}]")
 
-            status = "SUCCESS" if success_B else "FAILED"
-            rate = sum(results_B) / len(results_B) * 100
-            print(f"    {status}  (running: {sum(results_B)}/{len(results_B)} = {rate:.1f}%)")
+                ep_B, success_B = tester.run_task_B()
+                results_B.append(success_B)
 
-        elapsed_B = time.time() - start_B
-        n_success_B = sum(results_B)
-        rate_B = n_success_B / len(results_B) if results_B else 0.0
+                detail = {
+                    "episode_index": ep_idx,
+                    "success": success_B,
+                    "success_step": ep_B.get("success_step"),
+                    "total_steps": len(ep_B.get("images", [])),
+                }
+                if "obj_pose" in ep_B and len(ep_B["obj_pose"]) > 0:
+                    detail["initial_obj_position"] = ep_B["obj_pose"][0][:3].tolist()
+                    detail["final_obj_position"] = ep_B["obj_pose"][-1][:3].tolist()
+                episodes_B_details.append(detail)
 
-        print(f"\n  Task B Final: {n_success_B}/{len(results_B)} = {rate_B:.1%}  ({elapsed_B:.1f}s)")
+                status = "SUCCESS" if success_B else "FAILED"
+                rate = sum(results_B) / len(results_B) * 100
+                print(f"    {status}  (running: {sum(results_B)}/{len(results_B)} = {rate:.1f}%)")
+
+            elapsed_B = time.time() - start_B
+            n_success_B = sum(results_B)
+            rate_B = n_success_B / len(results_B) if results_B else 0.0
+            print(f"\n  Task B Final: {n_success_B}/{len(results_B)} = {rate_B:.1%}  ({elapsed_B:.1f}s)")
 
         # =================================================================
         # Summary
@@ -322,8 +341,14 @@ def main() -> None:
         print(f"\n{'='*60}")
         print("Independent Evaluation Results")
         print(f"{'='*60}")
-        print(f"  Task A: {n_success_A}/{len(results_A)} = {rate_A:.1%}")
-        print(f"  Task B: {n_success_B}/{len(results_B)} = {rate_B:.1%}")
+        if results_A:
+            print(f"  Task A: {n_success_A}/{len(results_A)} = {rate_A:.1%}")
+        else:
+            print(f"  Task A: skipped")
+        if results_B:
+            print(f"  Task B: {n_success_B}/{len(results_B)} = {rate_B:.1%}")
+        else:
+            print(f"  Task B: skipped")
         print(f"  Total time: {total_elapsed:.1f}s")
 
         # Compute average success steps

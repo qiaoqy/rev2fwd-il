@@ -14,18 +14,18 @@
 #             used for PP_A_circle / PP_B_circle (50,000 steps each)
 #
 #   Iteration 0-9 (3 phases each):
-#     Phase 1 — Parallel evaluation (two GPUs):
-#       GPU 1: Data collection — 50 A-B cycles (9_eval_with_recovery.py)
-#       GPU 4: Fair test — 100 episodes/task (10_eval_independent.py)
+#     Phase 1 — Parallel evaluation (4 GPUs):
+#       GPU 0: Data collection — 50 A-B cycles (9_eval_with_recovery.py)
+#       GPU 1,4,5: Fair test — ~33 episodes/task each, merged (10_eval_independent.py)
 #     Phase 2 — Train Policy A (GPU 0,1,4,5 joint, torchrun distributed)
 #     Phase 3 — Train Policy B (GPU 0,1,4,5 joint, torchrun distributed)
 #
 #   Iteration 10 (final):
-#     Fair test only — the 11th evaluation point
+#     Fair test on all 4 GPUs — the 11th evaluation point
 #
-# GPU allocation: 0,1,4,5 — avoids exp5 (GPUs 0,2) and exp6 (GPUs 0,5,6,7,8,9)
-#   - Collection: GPU 1 (avoids exp5/6 training GPUs)
-#   - Fair test:  GPU 4 (unused by exp5/6)
+# GPU allocation: 0,1,4,5
+#   - Collection: GPU 0 (1 GPU)
+#   - Fair test:  GPU 1,4,5 (3 GPUs parallel, sharded)
 #   - Training:   GPU 0,1,4,5 (4 GPUs)
 #
 # Auto-resume: re-run the same command to resume from where it left off.
@@ -37,7 +37,9 @@
 
 set -e
 
-eval "$(conda shell.bash hook)"
+# Use full path for conda (needed when running via nohup)
+__CONDA_PREFIX="/mnt/dongxu-fs1/data-ssd/qiyuanqiao/conda/miniconda3"
+source "$__CONDA_PREFIX/etc/profile.d/conda.sh"
 conda activate rev2fwd_il
 echo "Activated: $CONDA_DEFAULT_ENV"
 
@@ -63,11 +65,13 @@ DATA_B_SRC="runs/PP_B_circle/lerobot_dataset"
 GOAL_X=0.5
 GOAL_Y=0.0
 
-# GPUs — avoid exp5 (0,2) and exp6 (0,5,6,7,8,9)
-COLLECT_GPU=1               # GPU for data collection (avoids exp5/6 collision)
-FAIR_TEST_GPU=4             # GPU for fair testing
-TRAINING_GPUS="0,1,4,5"    # GPUs for distributed training
+# GPUs — 0,1,4,5 are all available
+COLLECT_GPU=0                  # GPU for data collection
+FAIR_TEST_GPUS=(1 4 5)         # GPUs for parallel fair testing (one env per GPU)
+NUM_FAIR_TEST_GPUS=${#FAIR_TEST_GPUS[@]}
+TRAINING_GPUS="0,1,4,5"        # GPUs for distributed training
 NUM_TRAINING_GPUS=4
+FAIR_TEST_GPU_LIST=$(printf "%s," "${FAIR_TEST_GPUS[@]}" | sed 's/,$//')
 
 # NCCL robustness (prevents hangs on multi-GPU training)
 export NCCL_P2P_DISABLE=1
@@ -279,7 +283,7 @@ json.dump({
     'data_B_source': '$DATA_B_SRC',
     'goal_xy': [$GOAL_X, $GOAL_Y],
     'collect_gpu': $COLLECT_GPU,
-    'fair_test_gpu': $FAIR_TEST_GPU,
+    'fair_test_gpus': [$FAIR_TEST_GPU_LIST],
     'training_gpus': '$TRAINING_GPUS',
 }, open('$EXP_DIR/config.json', 'w'), indent=2)
 "
@@ -539,7 +543,7 @@ echo "  Experiment: $EXP_DIR  (resume=$IS_RESUME)"
 echo "  Mode:       $MODE (DiT Flow)"
 echo "  Iterations: 0-$MAX_ITERATIONS (11 fair-test points, 10 training rounds)"
 echo "  Collection: $NUM_CYCLES A-B cycles/iter on GPU $COLLECT_GPU"
-echo "  Fair test:  $NUM_FAIR_TEST_EPISODES episodes/task on GPU $FAIR_TEST_GPU"
+echo "  Fair test:  $NUM_FAIR_TEST_EPISODES episodes/task on GPUs ${FAIR_TEST_GPUS[*]} ($NUM_FAIR_TEST_GPUS parallel)"
 echo "  Training:   $STEPS_PER_ITER steps/iter, GPUs=$TRAINING_GPUS ($NUM_TRAINING_GPUS)"
 echo "  Pretrain:   $PRETRAIN_STEPS steps (base DiT Flow policies)"
 echo ""
@@ -559,6 +563,20 @@ else
     # If pretraining wasn't finished, complete it
     if [ ! -f "$EXP_DIR/.done_pretrain_A" ] || [ ! -f "$EXP_DIR/.done_pretrain_B" ]; then
         pretrain_base_policies
+    fi
+
+    # If temp dirs don't exist yet (pretrain just finished on resume), copy from pretrain
+    if [ ! -d "$PA_TEMP" ] && [ ! -d "$PA_LAST" ]; then
+        echo "  Copying pretrained DiT Flow Policy A → temp"
+        mkdir -p "$PA_TEMP"
+        cp -r "$POLICY_A_SRC/checkpoints" "$PA_TEMP/checkpoints"
+        cp -r "$POLICY_A_SRC/lerobot_dataset" "$PA_TEMP/lerobot_dataset"
+    fi
+    if [ ! -d "$PB_TEMP" ] && [ ! -d "$PB_LAST" ]; then
+        echo "  Copying pretrained DiT Flow Policy B → temp"
+        mkdir -p "$PB_TEMP"
+        cp -r "$POLICY_B_SRC/checkpoints" "$PB_TEMP/checkpoints"
+        cp -r "$POLICY_B_SRC/lerobot_dataset" "$PB_TEMP/lerobot_dataset"
     fi
 
     # Verify temp dirs exist (or recover from crash)
@@ -610,8 +628,8 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
         echo "  Policy B (step $STEP_B): $CKPT_B"
 
         COLLECT_PID=""
-        FAIR_TEST_PID=""
 
+        # Launch data collection (background, 1 GPU) — skip for last iteration
         if [ "$NEED_COLLECT" = true ]; then
             echo "  [GPU $COLLECT_GPU] Starting data collection ($NUM_CYCLES A-B cycles)..."
             rm -f "$ROLLOUT_A" "$ROLLOUT_B" "$COLLECT_STATS"
@@ -633,25 +651,40 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
             echo "  [GPU $COLLECT_GPU] Collection PID: $COLLECT_PID"
         fi
 
+        # Launch parallel fair tests (one per GPU, sharded)
         if [ "$NEED_FAIR_TEST" = true ]; then
-            echo "  [GPU $FAIR_TEST_GPU] Starting fair test ($NUM_FAIR_TEST_EPISODES episodes/task)..."
+            EPISODES_PER_GPU=$((NUM_FAIR_TEST_EPISODES / NUM_FAIR_TEST_GPUS))
+            echo "  Starting parallel fair test: $NUM_FAIR_TEST_GPUS GPUs × $EPISODES_PER_GPU episodes = $((EPISODES_PER_GPU * NUM_FAIR_TEST_GPUS)) total"
             rm -f "$FAIR_TEST_STATS"
 
-            CUDA_VISIBLE_DEVICES=$FAIR_TEST_GPU python scripts/scripts_pick_place/10_eval_independent.py \
-                --policy_A "$CKPT_A" \
-                --policy_B "$CKPT_B" \
-                --out "$FAIR_TEST_STATS" \
-                --num_episodes $NUM_FAIR_TEST_EPISODES \
-                --horizon $HORIZON \
-                --distance_threshold $DISTANCE_THRESHOLD \
-                --n_action_steps $N_ACTION_STEPS \
-                --goal_xy $GOAL_X $GOAL_Y \
-                $HEADLESS \
-                > "$EXP_DIR/iter${iter}_fair_test.log" 2>&1 &
-            FAIR_TEST_PID=$!
-            echo "  [GPU $FAIR_TEST_GPU] Fair test PID: $FAIR_TEST_PID"
+            FAIR_TEST_PIDS=()
+            FAIR_TEST_SHARD_FILES=()
+            for shard_idx in $(seq 0 $((NUM_FAIR_TEST_GPUS - 1))); do
+                GPU_ID=${FAIR_TEST_GPUS[$shard_idx]}
+                SHARD_STATS="$EXP_DIR/iter${iter}_fair_test_shard${shard_idx}.stats.json"
+                SHARD_SEED=$((iter * 100 + shard_idx))
+                FAIR_TEST_SHARD_FILES+=("$SHARD_STATS")
+                rm -f "$SHARD_STATS"
+
+                echo "  [GPU $GPU_ID] Shard $shard_idx: $EPISODES_PER_GPU episodes, seed=$SHARD_SEED"
+                CUDA_VISIBLE_DEVICES=$GPU_ID python scripts/scripts_pick_place/10_eval_independent.py \
+                    --policy_A "$CKPT_A" \
+                    --policy_B "$CKPT_B" \
+                    --out "$SHARD_STATS" \
+                    --num_episodes $EPISODES_PER_GPU \
+                    --horizon $HORIZON \
+                    --distance_threshold $DISTANCE_THRESHOLD \
+                    --n_action_steps $N_ACTION_STEPS \
+                    --goal_xy $GOAL_X $GOAL_Y \
+                    --seed $SHARD_SEED \
+                    $HEADLESS \
+                    > "$EXP_DIR/iter${iter}_fair_test_shard${shard_idx}.log" 2>&1 &
+                FAIR_TEST_PIDS+=($!)
+                echo "  [GPU $GPU_ID] PID: ${FAIR_TEST_PIDS[-1]}"
+            done
         fi
 
+        # Wait for all processes
         echo "  Waiting for parallel tasks to complete..."
         set +e
         COLLECT_RC=0
@@ -668,18 +701,30 @@ for iter in $(seq 0 $MAX_ITERATIONS); do
             fi
         fi
 
-        if [ -n "$FAIR_TEST_PID" ]; then
-            wait $FAIR_TEST_PID
-            FAIR_TEST_RC=$?
+        if [ "$NEED_FAIR_TEST" = true ]; then
+            for pidx in $(seq 0 $((${#FAIR_TEST_PIDS[@]} - 1))); do
+                wait ${FAIR_TEST_PIDS[$pidx]}
+                rc=$?
+                if [ $rc -eq 0 ]; then
+                    echo "  ✓ Fair test shard $pidx finished successfully"
+                else
+                    echo "  ✗ Fair test shard $pidx FAILED (exit code $rc)"
+                    echo "    See: $EXP_DIR/iter${iter}_fair_test_shard${pidx}.log"
+                    FAIR_TEST_RC=$rc
+                fi
+            done
+
+            # Merge shard results
             if [ $FAIR_TEST_RC -eq 0 ]; then
-                echo "  ✓ Fair test finished successfully"
-            else
-                echo "  ✗ Fair test FAILED (exit code $FAIR_TEST_RC)"
-                echo "    See: $EXP_DIR/iter${iter}_fair_test.log"
+                echo "  Merging $NUM_FAIR_TEST_GPUS fair test shards..."
+                python scripts/scripts_pick_place/merge_fair_test_stats.py \
+                    --inputs ${FAIR_TEST_SHARD_FILES[*]} \
+                    --out "$FAIR_TEST_STATS"
             fi
         fi
         set -e
 
+        # Abort on failure
         if [ $COLLECT_RC -ne 0 ] || [ $FAIR_TEST_RC -ne 0 ]; then
             echo "ERROR: One or more parallel tasks failed. Aborting."
             exit 1

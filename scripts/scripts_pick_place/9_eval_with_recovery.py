@@ -105,6 +105,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_fabric", type=int, default=0, choices=[0, 1])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--goal_xy", type=float, nargs=2, default=[0.5, 0.0])
+    parser.add_argument(
+        "--fixed_start_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional fixed table XY for all sampled starts/targets.",
+    )
     parser.add_argument("--n_action_steps", type=int, default=None)
 
     # Video
@@ -208,6 +215,7 @@ def main() -> None:
             policy_B=policy_B, preprocessor_B=preproc_B, postprocessor_B=postproc_B,
             n_action_steps_A=n_act_A, n_action_steps_B=n_act_B,
             goal_xy=tuple(args.goal_xy),
+            fixed_start_xy=(tuple(args.fixed_start_xy) if args.fixed_start_xy is not None else None),
             height_threshold=args.height_threshold,
             distance_threshold=args.distance_threshold,
             horizon=args.horizon,

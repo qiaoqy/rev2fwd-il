@@ -319,6 +319,11 @@ def _parse_args() -> argparse.Namespace:
              "but creates a NEW wandb run. Use --steps to specify the target total step (e.g., 10100, 10200...).",
     )
     parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help="Finetune from existing checkpoint (load weights but reset step counter).",
+    )
+    parser.add_argument(
         "--overwrite",
         action=argparse.BooleanOptionalAction,
         default=True,
