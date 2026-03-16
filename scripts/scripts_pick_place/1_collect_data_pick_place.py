@@ -119,6 +119,48 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional fixed start XY for all sampled table starts. If not set, starts are random.",
     )
+    parser.add_argument(
+        "--taskB_target_mode",
+        type=str,
+        choices=["legacy", "red_region"],
+        default="legacy",
+        help="Task B target sampling mode. Default keeps legacy table sampling.",
+    )
+    parser.add_argument(
+        "--red_region_center_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional center of red rectangle region (cx cy).",
+    )
+    parser.add_argument(
+        "--red_region_size_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional red rectangle size (sx sy) in meters for target sampling.",
+    )
+    parser.add_argument(
+        "--red_marker_shape",
+        type=str,
+        choices=["circle", "rectangle"],
+        default="circle",
+        help="Red marker shape. Default keeps legacy circle marker.",
+    )
+    parser.add_argument(
+        "--red_marker_size_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional red marker size (sx sy) in meters. For circle, sx is interpreted as diameter.",
+    )
+    parser.add_argument(
+        "--fix_red_marker_pose",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="If 1, red marker stays at region center while target points can still be random.",
+    )
     
     # -----------------------------------------------------------------
     # Output configuration
@@ -214,7 +256,12 @@ def compute_camera_quat_from_lookat(eye: tuple, target: tuple, up: tuple = (0, 0
     return (qw, qx, qy, qz)
 
 
-def create_target_markers(num_envs: int, device: str):
+def create_target_markers(
+    num_envs: int,
+    device: str,
+    red_marker_shape: str = "circle",
+    red_marker_size_xy: tuple[float, float] | None = None,
+):
     """Create visualization markers for start and goal positions.
     
     Creates two sets of flat cylinder markers on the table surface:
@@ -238,19 +285,36 @@ def create_target_markers(num_envs: int, device: str):
     marker_height = 0.002  # 2mm height (flat disk)
     table_z = 0.0  # Table surface height
     marker_z = table_z + marker_height / 2 + 0.001  # Slightly above table
+
+    if red_marker_size_xy is not None:
+        red_size_x = float(red_marker_size_xy[0])
+        red_size_y = float(red_marker_size_xy[1])
+    else:
+        red_size_x = 2.0 * marker_radius
+        red_size_y = 2.0 * marker_radius
+
+    if red_marker_shape == "rectangle":
+        red_marker_prim = sim_utils.CuboidCfg(
+            size=(red_size_x, red_size_y, marker_height),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.0, 0.0),  # Red
+            ),
+        )
+    else:
+        red_marker_prim = sim_utils.CylinderCfg(
+            radius=max(red_size_x, red_size_y) / 2.0,
+            height=marker_height,
+            axis="Z",
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.0, 0.0),  # Red
+            ),
+        )
     
     # Red marker for start/place positions
     start_marker_cfg = VisualizationMarkersCfg(
         prim_path="/Visuals/StartMarkers",
         markers={
-            "start": sim_utils.CylinderCfg(
-                radius=marker_radius,
-                height=marker_height,
-                axis="Z",
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(1.0, 0.0, 0.0),  # Red
-                ),
-            ),
+            "start": red_marker_prim,
         },
     )
     start_markers = VisualizationMarkers(start_marker_cfg)
@@ -705,8 +769,21 @@ def rollout_expert_B_with_goal_actions(
     # Step 3: Sample place targets for each env (or use fixed start for ablation)
     # =========================================================================
     min_dist_from_goal = 0.1
+    target_mode = getattr(task_spec, "taskB_target_mode", "legacy")
     fixed_start_xy = getattr(task_spec, "fixed_start_xy", None)
-    if fixed_start_xy is not None:
+    red_center = getattr(task_spec, "red_region_center_xy", None)
+    red_size = getattr(task_spec, "red_region_size_xy", None)
+
+    if target_mode == "red_region" and red_center is not None and red_size is not None:
+        cx, cy = float(red_center[0]), float(red_center[1])
+        sx, sy = float(red_size[0]), float(red_size[1])
+        half_x = max(sx, 1e-6) * 0.5
+        half_y = max(sy, 1e-6) * 0.5
+        place_xys = [
+            (rng.uniform(cx - half_x, cx + half_x), rng.uniform(cy - half_y, cy + half_y))
+            for _ in range(num_envs)
+        ]
+    elif fixed_start_xy is not None:
         fx = float(fixed_start_xy[0])
         fy = float(fixed_start_xy[1])
         dist = np.sqrt((fx - task_spec.goal_xy[0])**2 + (fy - task_spec.goal_xy[1])**2)
@@ -747,14 +824,24 @@ def rollout_expert_B_with_goal_actions(
     # =========================================================================
     if markers is None:
         print("[DEBUG] rollout: Creating target markers (first time)...")
-        start_markers, goal_markers, marker_z = create_target_markers(num_envs, device)
+        start_markers, goal_markers, marker_z = create_target_markers(
+            num_envs,
+            device,
+            red_marker_shape=getattr(task_spec, "red_marker_shape", "circle"),
+            red_marker_size_xy=getattr(task_spec, "red_marker_size_xy", None),
+        )
         markers = (start_markers, goal_markers, marker_z)
     else:
         print("[DEBUG] rollout: Reusing existing markers...")
         start_markers, goal_markers, marker_z = markers
+
+    marker_xys = place_xys
+    if bool(getattr(task_spec, "fix_red_marker_pose", False)) and red_center is not None:
+        marker_xys = [(float(red_center[0]), float(red_center[1])) for _ in range(num_envs)]
+
     update_target_markers(
         start_markers, goal_markers,
-        start_xys=place_xys,
+        start_xys=marker_xys,
         goal_xy=task_spec.goal_xy,
         marker_z=marker_z,
         env=env,
@@ -1050,6 +1137,18 @@ def main() -> None:
         if args.fixed_start_xy is not None:
             task_spec.fixed_start_xy = (float(args.fixed_start_xy[0]), float(args.fixed_start_xy[1]))
             print(f"[DEBUG] Using fixed start XY: {task_spec.fixed_start_xy}")
+        task_spec.taskB_target_mode = args.taskB_target_mode
+        task_spec.red_region_center_xy = (
+            tuple(args.red_region_center_xy) if args.red_region_center_xy is not None else None
+        )
+        task_spec.red_region_size_xy = (
+            tuple(args.red_region_size_xy) if args.red_region_size_xy is not None else None
+        )
+        task_spec.red_marker_shape = args.red_marker_shape
+        task_spec.red_marker_size_xy = (
+            tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None
+        )
+        task_spec.fix_red_marker_pose = bool(args.fix_red_marker_pose)
         print("[DEBUG] Step 5: Task specification created")
         
         # =================================================================

@@ -112,6 +112,45 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional fixed table XY for all sampled starts/targets.",
     )
+    parser.add_argument(
+        "--red_marker_shape",
+        type=str,
+        choices=["circle", "rectangle"],
+        default="circle",
+        help="Red marker shape. Default keeps legacy circle marker.",
+    )
+    parser.add_argument(
+        "--red_marker_size_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional red marker size (sx sy) in meters.",
+    )
+    parser.add_argument(
+        "--fix_red_marker_pose",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="If 1, red marker stays at region center while target points can still be random.",
+    )
+    parser.add_argument(
+        "--taskA_source_mode",
+        type=str,
+        choices=["legacy", "green_region"],
+        default="legacy",
+        help="Task A source sampling mode.",
+    )
+    parser.add_argument(
+        "--taskB_target_mode",
+        type=str,
+        choices=["legacy", "red_region"],
+        default="legacy",
+        help="Task B target sampling mode.",
+    )
+    parser.add_argument("--red_region_center_xy", type=float, nargs=2, default=None)
+    parser.add_argument("--red_region_size_xy", type=float, nargs=2, default=None)
+    parser.add_argument("--green_region_center_xy", type=float, nargs=2, default=None)
+    parser.add_argument("--green_region_size_xy", type=float, nargs=2, default=None)
     parser.add_argument("--n_action_steps", type=int, default=None)
 
     # Video
@@ -216,6 +255,15 @@ def main() -> None:
             n_action_steps_A=n_act_A, n_action_steps_B=n_act_B,
             goal_xy=tuple(args.goal_xy),
             fixed_start_xy=(tuple(args.fixed_start_xy) if args.fixed_start_xy is not None else None),
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=(tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None),
+            fix_red_marker_pose=bool(args.fix_red_marker_pose),
+            taskA_source_mode=args.taskA_source_mode,
+            taskB_target_mode=args.taskB_target_mode,
+            red_region_center_xy=(tuple(args.red_region_center_xy) if args.red_region_center_xy is not None else None),
+            red_region_size_xy=(tuple(args.red_region_size_xy) if args.red_region_size_xy is not None else None),
+            green_region_center_xy=(tuple(args.green_region_center_xy) if args.green_region_center_xy is not None else None),
+            green_region_size_xy=(tuple(args.green_region_size_xy) if args.green_region_size_xy is not None else None),
             height_threshold=args.height_threshold,
             distance_threshold=args.distance_threshold,
             horizon=args.horizon,
@@ -245,19 +293,19 @@ def main() -> None:
 
         # Create markers
         place_markers, goal_markers, marker_z = create_target_markers(
-            num_envs=1, device=device,
+            num_envs=1,
+            device=device,
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=(tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None),
         )
         tester.place_markers = place_markers
         tester.goal_markers = goal_markers
         tester.marker_z = marker_z
 
         # Sample first place target (red marker)
-        first_place_xy = tester._sample_new_place_target()
+        first_place_xy = tester._sample_taskA_source_target()
         tester.current_place_xy = first_place_xy
-        update_target_markers(
-            place_markers, goal_markers,
-            first_place_xy, tuple(goal_xy), marker_z, env,
-        )
+        tester._update_place_marker(first_place_xy)
 
         def _hard_reset_for_task_A():
             """Hard reset: prepare environment for Task A.
@@ -267,12 +315,10 @@ def main() -> None:
             """
             env.reset()
             # Re-create markers after env reset
-            update_target_markers(
-                place_markers, goal_markers,
-                tester.current_place_xy, tuple(goal_xy), marker_z, env,
-            )
+            if tester.current_place_xy is not None:
+                tester._update_place_marker(tester.current_place_xy)
             # Sample random table position
-            rand_xy = tester._sample_new_place_target()
+            rand_xy = tester._sample_taskA_source_target()
             obj_pose = torch.tensor(
                 [rand_xy[0], rand_xy[1], 0.022, 1.0, 0.0, 0.0, 0.0],
                 dtype=torch.float32, device=device,
@@ -293,10 +339,8 @@ def main() -> None:
             position (Task B picks from goal).
             """
             env.reset()
-            update_target_markers(
-                place_markers, goal_markers,
-                tester.current_place_xy, tuple(goal_xy), marker_z, env,
-            )
+            if tester.current_place_xy is not None:
+                tester._update_place_marker(tester.current_place_xy)
             obj_pose = torch.tensor(
                 [goal_xy[0], goal_xy[1], 0.022, 1.0, 0.0, 0.0, 0.0],
                 dtype=torch.float32, device=device,

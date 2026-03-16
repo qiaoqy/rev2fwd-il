@@ -187,6 +187,69 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional fixed table XY for all sampled starts/targets. If not set, uses random sampling.",
     )
+    parser.add_argument(
+        "--red_marker_shape",
+        type=str,
+        choices=["circle", "rectangle"],
+        default="circle",
+        help="Red marker shape. Default keeps legacy circle marker.",
+    )
+    parser.add_argument(
+        "--red_marker_size_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional red marker size (sx sy) in meters. For circle, sx is interpreted as diameter.",
+    )
+    parser.add_argument(
+        "--fix_red_marker_pose",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="If 1, red marker stays at region center while target points can still be random.",
+    )
+    parser.add_argument(
+        "--taskA_source_mode",
+        type=str,
+        choices=["legacy", "green_region"],
+        default="legacy",
+        help="Task A source sampling mode. Default keeps legacy table sampling.",
+    )
+    parser.add_argument(
+        "--taskB_target_mode",
+        type=str,
+        choices=["legacy", "red_region"],
+        default="legacy",
+        help="Task B target sampling mode. Default keeps legacy table sampling.",
+    )
+    parser.add_argument(
+        "--red_region_center_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional center of red rectangle region (cx cy).",
+    )
+    parser.add_argument(
+        "--red_region_size_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional red rectangle size (sx sy) in meters for target sampling.",
+    )
+    parser.add_argument(
+        "--green_region_center_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional center of green source region (cx cy).",
+    )
+    parser.add_argument(
+        "--green_region_size_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Optional green source rectangle size (sx sy) in meters for Task A source sampling.",
+    )
 
     # Action chunk settings
     parser.add_argument(
@@ -325,7 +388,12 @@ def add_camera_to_env_cfg(env_cfg, image_width: int, image_height: int) -> None:
         env_cfg.sim.render.antialiasing_mode = "FXAA"
 
 
-def create_target_markers(num_envs: int, device: str):
+def create_target_markers(
+    num_envs: int,
+    device: str,
+    red_marker_shape: str = "circle",
+    red_marker_size_xy: Tuple[float, float] | None = None,
+):
     """Create visualization markers for place target and goal positions.
     
     Creates two sets of flat cylinder markers on the table surface:
@@ -350,18 +418,35 @@ def create_target_markers(num_envs: int, device: str):
     table_z = 0.0  # Table surface height
     marker_z = table_z + marker_height / 2 + 0.001  # Slightly above table
     
+    if red_marker_size_xy is not None:
+        red_size_x = float(red_marker_size_xy[0])
+        red_size_y = float(red_marker_size_xy[1])
+    else:
+        red_size_x = 2.0 * marker_radius
+        red_size_y = 2.0 * marker_radius
+
     # Red marker for place target positions (Task B target)
+    if red_marker_shape == "rectangle":
+        red_marker_prim = sim_utils.CuboidCfg(
+            size=(red_size_x, red_size_y, marker_height),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.0, 0.0),  # Red
+            ),
+        )
+    else:
+        red_marker_prim = sim_utils.CylinderCfg(
+            radius=max(red_size_x, red_size_y) / 2.0,
+            height=marker_height,
+            axis="Z",
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.0, 0.0),  # Red
+            ),
+        )
+
     place_marker_cfg = VisualizationMarkersCfg(
         prim_path="/Visuals/PlaceMarkers",
         markers={
-            "place": sim_utils.CylinderCfg(
-                radius=marker_radius,
-                height=marker_height,
-                axis="Z",
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(1.0, 0.0, 0.0),  # Red
-                ),
-            ),
+            "place": red_marker_prim,
         },
     )
     place_markers = VisualizationMarkers(place_marker_cfg)
@@ -775,6 +860,15 @@ class AlternatingTester:
         n_action_steps_B: int,
         goal_xy: Tuple[float, float] = (0.5, 0.0),
         fixed_start_xy: Tuple[float, float] | None = None,
+        red_marker_shape: str = "circle",
+        red_marker_size_xy: Tuple[float, float] | None = None,
+        fix_red_marker_pose: bool = False,
+        taskA_source_mode: str = "legacy",
+        taskB_target_mode: str = "legacy",
+        red_region_center_xy: Tuple[float, float] | None = None,
+        red_region_size_xy: Tuple[float, float] | None = None,
+        green_region_center_xy: Tuple[float, float] | None = None,
+        green_region_size_xy: Tuple[float, float] | None = None,
         height_threshold: float = 0.15,
         distance_threshold: float = 0.05,
         horizon: int = 400,
@@ -810,6 +904,21 @@ class AlternatingTester:
         # Task parameters
         self.goal_xy = np.array(goal_xy)
         self.fixed_start_xy = tuple(fixed_start_xy) if fixed_start_xy is not None else None
+        self.red_marker_shape = red_marker_shape
+        self.red_marker_size_xy = tuple(red_marker_size_xy) if red_marker_size_xy is not None else None
+        self.fix_red_marker_pose = bool(fix_red_marker_pose)
+        self.taskA_source_mode = taskA_source_mode
+        self.taskB_target_mode = taskB_target_mode
+        self.red_region_center_xy = (
+            tuple(red_region_center_xy) if red_region_center_xy is not None else None
+        )
+        self.red_region_size_xy = tuple(red_region_size_xy) if red_region_size_xy is not None else None
+        self.green_region_center_xy = (
+            tuple(green_region_center_xy) if green_region_center_xy is not None else None
+        )
+        self.green_region_size_xy = (
+            tuple(green_region_size_xy) if green_region_size_xy is not None else None
+        )
         self.height_threshold = height_threshold
         self.distance_threshold = distance_threshold
         self.horizon = horizon
@@ -1268,8 +1377,50 @@ class AlternatingTester:
         Returns:
             Tuple (x, y) for the new place target.
         """
-        if self.fixed_start_xy is not None:
+        return self._sample_xy_for_role("task_b_target")
+
+    def _sample_taskA_source_target(self) -> Tuple[float, float]:
+        """Sample source XY for Task A initialization."""
+        return self._sample_xy_for_role("task_a_source")
+
+    def _sample_xy_in_rectangle(
+        self,
+        center_xy: Tuple[float, float],
+        size_xy: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        """Uniformly sample XY inside an axis-aligned rectangle."""
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+        sx, sy = float(size_xy[0]), float(size_xy[1])
+        half_x = max(sx, 1e-6) * 0.5
+        half_y = max(sy, 1e-6) * 0.5
+        x = self.rng.uniform(cx - half_x, cx + half_x)
+        y = self.rng.uniform(cy - half_y, cy + half_y)
+        return (x, y)
+
+    def _sample_xy_for_role(self, role: str) -> Tuple[float, float]:
+        """Sample XY for a specific role while keeping legacy defaults intact."""
+        if (
+            self.fixed_start_xy is not None
+            and self.taskA_source_mode == "legacy"
+            and self.taskB_target_mode == "legacy"
+        ):
             return (float(self.fixed_start_xy[0]), float(self.fixed_start_xy[1]))
+
+        if (
+            role == "task_a_source"
+            and self.taskA_source_mode == "green_region"
+            and self.green_region_center_xy is not None
+            and self.green_region_size_xy is not None
+        ):
+            return self._sample_xy_in_rectangle(self.green_region_center_xy, self.green_region_size_xy)
+
+        if (
+            role == "task_b_target"
+            and self.taskB_target_mode == "red_region"
+            and self.red_region_center_xy is not None
+            and self.red_region_size_xy is not None
+        ):
+            return self._sample_xy_in_rectangle(self.red_region_center_xy, self.red_region_size_xy)
 
         min_dist_from_goal = 0.1
         # Use same table bounds as task_spec.py for consistency with training data
@@ -1292,15 +1443,21 @@ class AlternatingTester:
         """
         self.current_place_xy = place_xy
         if self.place_markers is not None:
+            marker_xy = place_xy
+            if self.fix_red_marker_pose and self.red_region_center_xy is not None:
+                marker_xy = (
+                    float(self.red_region_center_xy[0]),
+                    float(self.red_region_center_xy[1]),
+                )
             update_target_markers(
                 self.place_markers,
                 self.goal_markers,
-                place_xy,
+                marker_xy,
                 tuple(self.goal_xy),
                 self.marker_z,
                 self.env,
             )
-            print(f"    [Marker] Updated red place marker to: [{place_xy[0]:.3f}, {place_xy[1]:.3f}]")
+            print(f"    [Marker] Updated red place marker to: [{marker_xy[0]:.3f}, {marker_xy[1]:.3f}]")
 
     def _run_transition(self, n_frames: int, policy, preprocessor, postprocessor,
                          n_action_steps: int, include_obj_pose: bool, 
@@ -1436,19 +1593,28 @@ class AlternatingTester:
         # Create visualization markers
         print("Creating visualization markers...")
         self.place_markers, self.goal_markers, self.marker_z = create_target_markers(
-            num_envs=1, device=self.device
+            num_envs=1,
+            device=self.device,
+            red_marker_shape=self.red_marker_shape,
+            red_marker_size_xy=self.red_marker_size_xy,
         )
         
         # Sample initial place target (red marker) for Task B
         # This will be the first target position after Task A completes
-        first_place_xy = self._sample_new_place_target()
+        first_place_xy = self._sample_taskA_source_target()
         self.current_place_xy = first_place_xy
+        marker_xy = first_place_xy
+        if self.fix_red_marker_pose and self.red_region_center_xy is not None:
+            marker_xy = (
+                float(self.red_region_center_xy[0]),
+                float(self.red_region_center_xy[1]),
+            )
         
         # Initialize both markers using the unified function
         update_target_markers(
             self.place_markers,
             self.goal_markers,
-            first_place_xy,
+            marker_xy,
             tuple(self.goal_xy),
             self.marker_z,
             self.env,
@@ -1724,6 +1890,15 @@ def main() -> None:
             n_action_steps_B=n_action_steps_B,
             goal_xy=tuple(args.goal_xy),
             fixed_start_xy=(tuple(args.fixed_start_xy) if args.fixed_start_xy is not None else None),
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=(tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None),
+            fix_red_marker_pose=bool(args.fix_red_marker_pose),
+            taskA_source_mode=args.taskA_source_mode,
+            taskB_target_mode=args.taskB_target_mode,
+            red_region_center_xy=(tuple(args.red_region_center_xy) if args.red_region_center_xy is not None else None),
+            red_region_size_xy=(tuple(args.red_region_size_xy) if args.red_region_size_xy is not None else None),
+            green_region_center_xy=(tuple(args.green_region_center_xy) if args.green_region_center_xy is not None else None),
+            green_region_size_xy=(tuple(args.green_region_size_xy) if args.green_region_size_xy is not None else None),
             height_threshold=args.height_threshold,
             distance_threshold=args.distance_threshold,
             horizon=args.horizon,

@@ -16,7 +16,7 @@ Per-field reversal rules:
     robot_obs[0:6] (tcp pose)     ->  Reverse frame order
     robot_obs[6] (gripper width)  ->  Reverse frame order
     robot_obs[7:13] (joints)      ->  Reverse frame order
-    robot_obs[13] (gripper action)->  Reverse AND invert: 1 - original
+    robot_obs[13] (gripper action)->  Reverse frame order (keep original value)
     actions[0:6] (velocities)     ->  Negate AND reverse: -actions[T-1-t][0:6]
     actions[6] (gripper)          ->  Reverse AND invert: 1 - actions[T-1-t][6]
     force_torque                  ->  Reverse frame order
@@ -32,7 +32,7 @@ After reversal, verify:
 1. Position reconstruction: Integrating reversed velocities should trace
    the original trajectory backwards
 2. Boundary match: reversed[0].tcp_pos == original[-1].tcp_pos
-3. Gripper logic: If original closes, reversed opens
+3. Gripper logic: reversed[t].gripper == original[T-1-t].gripper
 
 =============================================================================
 USAGE
@@ -205,8 +205,6 @@ def reverse_episode(
 
         # Robot observation: reversed in time
         robot_obs_new = src["robot_obs"].copy()
-        # Invert gripper action: 0 -> 1, 1 -> 0
-        robot_obs_new[13] = 1.0 - src["robot_obs"][13]
         new_frame["robot_obs"] = robot_obs_new
 
         # Actions: the action at reversed timestep t should transition from
@@ -322,11 +320,11 @@ def verify_reversal(
     else:
         messages.append(f"OK: velocity integration max error = {error:.4f}m")
 
-    # 3. Gripper inversion check
+    # 3. Gripper consistency check (reversed value should equal original)
     orig_gripper = orig_first["robot_obs"][13]
     rev_last_gripper = rev_last["robot_obs"][13]
-    if abs(orig_gripper + rev_last_gripper - 1.0) > 0.01:
-        messages.append(f"WARNING: Gripper not properly inverted at boundary")
+    if abs(orig_gripper - rev_last_gripper) > 0.01:
+        messages.append(f"WARNING: Gripper mismatch at boundary: orig={orig_gripper:.3f}, rev={rev_last_gripper:.3f}")
         all_ok = False
 
     msg = "; ".join(messages)
