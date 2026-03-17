@@ -103,6 +103,29 @@ def _parse_args() -> argparse.Namespace:
         default="data/pick_place_isaac_lab_simulation/exp9/replay_taskB_from_iter0_ep0.npz",
         help="Output NPZ for Task B replay.",
     )
+    parser.add_argument(
+        "--red_marker_shape",
+        type=str,
+        choices=["circle", "rectangle"],
+        default="circle",
+        help="Red marker shape: 'circle' (Mode 1/2) or 'rectangle' (Mode 3).",
+    )
+    parser.add_argument(
+        "--red_marker_size_xy",
+        type=float,
+        nargs=2,
+        default=(0.12, 0.10),
+        help="Red rectangle marker size (sx, sy) in meters. Only used when red_marker_shape=rectangle. "
+             "Default: (0.12, 0.10).",
+    )
+    parser.add_argument(
+        "--red_marker_xy",
+        type=float,
+        nargs=2,
+        default=(0.45, 0.15),
+        help="Red marker center (x, y). For rectangle mode, this is the rectangle center. "
+             "Default: (0.45, 0.15) — same as collection script's --red_region_center_xy default.",
+    )
 
     from isaaclab.app import AppLauncher
 
@@ -403,6 +426,7 @@ def main() -> None:
 
     fixed_start_xy = (float(args.fixed_start_xy[0]), float(args.fixed_start_xy[1]))
     goal_xy = (float(args.goal_xy[0]), float(args.goal_xy[1]))
+    red_marker_xy = (float(args.red_marker_xy[0]), float(args.red_marker_xy[1]))
 
     try:
         set_seed(args.seed)
@@ -424,6 +448,8 @@ def main() -> None:
         markers = create_target_markers(
             num_envs=1,
             device=str(env.unwrapped.device),
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=args.red_marker_size_xy,
         )
 
         action_a = _load_first_episode_command(str(dataset_a), args.episode_idx, args.command_source)
@@ -434,6 +460,8 @@ def main() -> None:
         print(f"  command_source: {args.command_source}")
         print(f"  fixed_start_xy: {fixed_start_xy}")
         print(f"  goal_xy:        {goal_xy}")
+        print(f"  red_marker_xy:  {red_marker_xy}")
+        print(f"  red_marker_shape: {args.red_marker_shape}")
         print(f"  Task A action length: {action_a.shape[0]}")
         print(f"  Task B action length: {action_b.shape[0]}")
         print("=" * 60)
@@ -449,7 +477,7 @@ def main() -> None:
             settle_steps=10,
             markers=markers,
             update_markers_fn=update_target_markers,
-            red_xy=fixed_start_xy,
+            red_xy=red_marker_xy,
         )
         _save_single_episode(args.out_a, ep_a)
         print(
@@ -467,7 +495,7 @@ def main() -> None:
             settle_steps=10,
             markers=markers,
             update_markers_fn=update_target_markers,
-            red_xy=fixed_start_xy,
+            red_xy=red_marker_xy,
         )
         _save_single_episode(args.out_b, ep_b)
         print(

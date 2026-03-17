@@ -166,17 +166,17 @@ def _parse_args() -> argparse.Namespace:
         "--red_region_center_xy",
         type=float,
         nargs=2,
-        default=None,
+        default=(0.45, 0.15),
         help="[Mode 3] Center (cx, cy) of the red rectangle region. "
-             "Required when --taskB_target_mode=red_region.",
+             "Default: (0.45, 0.15).",
     )
     parser.add_argument(
         "--red_region_size_xy",
         type=float,
         nargs=2,
-        default=None,
+        default=(0.12, 0.10),
         help="[Mode 3] Size (sx, sy) in meters of the red rectangle region. "
-             "Required when --taskB_target_mode=red_region.",
+             "Default: (0.12, 0.10).",
     )
     parser.add_argument(
         "--red_marker_size_xy",
@@ -839,15 +839,24 @@ def rollout_expert_B_with_goal_actions(
     red_center = getattr(task_spec, "red_region_center_xy", None)
     red_size = getattr(task_spec, "red_region_size_xy", None)
 
+    # Cube half-size: DexCube default 0.05m * scale 0.8 = 0.04m edge, half = 0.02m
+    cube_half_size = 0.02
+
     if target_mode == "red_region" and red_center is not None and red_size is not None:
+        # Mode 3: Sample within rectangular red region, shrunk by cube_half_size
+        # so the cube body stays fully inside the rectangle.
         cx, cy = float(red_center[0]), float(red_center[1])
         sx, sy = float(red_size[0]), float(red_size[1])
-        half_x = max(sx, 1e-6) * 0.5
-        half_y = max(sy, 1e-6) * 0.5
+        sample_half_x = max(sx * 0.5 - cube_half_size, 0.0)
+        sample_half_y = max(sy * 0.5 - cube_half_size, 0.0)
         place_xys = [
-            (rng.uniform(cx - half_x, cx + half_x), rng.uniform(cy - half_y, cy + half_y))
+            (rng.uniform(cx - sample_half_x, cx + sample_half_x),
+             rng.uniform(cy - sample_half_y, cy + sample_half_y))
             for _ in range(num_envs)
         ]
+        print(f"[INFO] Mode 3 sampling: region=({sx},{sy}), cube_half={cube_half_size}, "
+              f"effective sample range x=[{cx-sample_half_x:.4f},{cx+sample_half_x:.4f}], "
+              f"y=[{cy-sample_half_y:.4f},{cy+sample_half_y:.4f}]")
     elif fixed_start_xy is not None:
         fx = float(fixed_start_xy[0])
         fy = float(fixed_start_xy[1])
