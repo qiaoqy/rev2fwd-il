@@ -127,11 +127,16 @@ class PickPlaceExpertB:
         self.above_obj_dxy[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-0.005, 0.005)
         self.above_place_dxy[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-0.005, 0.005)
 
-        # Store rest pose
+        # Store rest pose (keep XYZ position, but override orientation to gripper-down)
+        # The robot's default home has the gripper facing forward, which creates
+        # large unnecessary rotations when transitioning to/from the working pose.
+        # Using grasp_quat (gripper down) at rest eliminates this overhead.
         if self.rest_pose is None:
             self.rest_pose = ee_pose.clone()
+            self.rest_pose[:, 3:7] = self.grasp_quat
         else:
             self.rest_pose[env_ids] = ee_pose[env_ids].clone()
+            self.rest_pose[env_ids, 3:7] = self.grasp_quat
 
         # Create place pose
         if self.place_pose is None:

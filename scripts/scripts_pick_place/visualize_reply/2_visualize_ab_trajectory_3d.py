@@ -60,6 +60,12 @@ def _parse_args() -> argparse.Namespace:
         default="replay_iter0_ep0_3d",
         help="Optional tag for output folder name.",
     )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Base directory for output. If not set, defaults to data/pick_place_isaac_lab_simulation/exp9/.",
+    )
     return parser.parse_args()
 
 
@@ -228,6 +234,8 @@ def save_three_panel_figure(
     output_path: Path,
     episode_a: int,
     episode_b: int,
+    label_a: str = "Task A",
+    label_b: str = "Task B",
 ) -> None:
     """Save one canvas with 3 panels: A, B, and transparent overlay (A+B)."""
     fig = plt.figure(figsize=(18, 6))
@@ -238,28 +246,28 @@ def save_three_panel_figure(
     plot_3d_trajectory_on_axis(
         ax=ax1,
         xyz=xyz_a,
-        title=f"Task A 3D Trajectory (episode {episode_a})",
+        title=f"{label_a} (ep {episode_a})",
         color="tab:blue",
         marker_shape="^",
-        marker_label="A time markers",
+        marker_label=f"{label_a} markers",
         time_label_color="black",
         time_label_offset_mode="left_up",
     )
     plot_3d_trajectory_on_axis(
         ax=ax2,
         xyz=xyz_b,
-        title=f"Task B 3D Trajectory (episode {episode_b})",
+        title=f"{label_b} (ep {episode_b})",
         color="tab:orange",
         marker_shape="o",
-        marker_label="B time markers",
+        marker_label=f"{label_b} markers",
         time_label_color="red",
         time_label_offset_mode="right_down",
     )
     ax3.plot(
-        xyz_a[:, 0], xyz_a[:, 1], xyz_a[:, 2], color="tab:blue", linewidth=2.0, alpha=0.45, label="A"
+        xyz_a[:, 0], xyz_a[:, 1], xyz_a[:, 2], color="tab:blue", linewidth=2.0, alpha=0.45, label=label_a
     )
     ax3.plot(
-        xyz_b[:, 0], xyz_b[:, 1], xyz_b[:, 2], color="tab:orange", linewidth=2.0, alpha=0.45, label="B"
+        xyz_b[:, 0], xyz_b[:, 1], xyz_b[:, 2], color="tab:orange", linewidth=2.0, alpha=0.45, label=label_b
     )
     ax3.scatter(xyz_a[0, 0], xyz_a[0, 1], xyz_a[0, 2], color="tab:blue", s=30, alpha=0.8)
     ax3.scatter(xyz_b[0, 0], xyz_b[0, 1], xyz_b[0, 2], color="tab:orange", s=30, alpha=0.8)
@@ -276,7 +284,7 @@ def save_three_panel_figure(
         marker="^",
         s=62,
         alpha=0.95,
-        label="A time markers",
+        label=f"{label_a} markers",
     )
     annotate_time_markers(ax3, xyz_a, idx_a, text_color="black", offset_mode="left_up")
     ax3.scatter(
@@ -287,18 +295,18 @@ def save_three_panel_figure(
         marker="o",
         s=52,
         alpha=0.95,
-        label="B time markers",
+        label=f"{label_b} markers",
     )
     annotate_time_markers(ax3, xyz_b, idx_b, text_color="red", offset_mode="right_down")
-    ax3.set_title("3D Overlay (A and B)")
+    ax3.set_title(f"Overlay: {label_a} vs {label_b}")
     ax3.set_xlabel("X")
     ax3.set_ylabel("Y")
     ax3.set_zlabel("Z")
     ax3.legend(loc="best")
     set_axes_equal(ax3, np.vstack([xyz_a, xyz_b]))
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
+    fig.subplots_adjust(top=0.90, bottom=0.05, left=0.02, right=0.98, wspace=0.15)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -314,7 +322,11 @@ def main() -> None:
         raise FileNotFoundError(f"Task B dataset not found: {dataset_b}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("data") / "pick_place_isaac_lab_simulation" / "exp9" / f"viz_ab_3d_{args.name}_{timestamp}"
+    if args.out_dir is not None:
+        base_dir = Path(args.out_dir)
+    else:
+        base_dir = Path("data") / "pick_place_isaac_lab_simulation" / "exp9"
+    output_dir = base_dir / f"viz_ab_3d_{args.name}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Output directory: {output_dir}")
@@ -335,12 +347,17 @@ def main() -> None:
 
     combined_path = output_dir / "trajectory_A_B_overlay_3d.png"
 
+    label_a = dataset_a.stem
+    label_b = dataset_b.stem
+
     save_three_panel_figure(
         xyz_a=xyz_a,
         xyz_b=xyz_b,
         output_path=combined_path,
         episode_a=args.episode_a,
         episode_b=args.episode_b,
+        label_a=label_a,
+        label_b=label_b,
     )
 
     print("Saved figure:")

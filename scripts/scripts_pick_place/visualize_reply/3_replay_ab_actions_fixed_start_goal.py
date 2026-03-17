@@ -231,7 +231,7 @@ def _replay_single_episode(
     import numpy as np
     import torch
 
-    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w, teleport_object_to_pose
+    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w, teleport_object_to_pose, pre_position_gripper_down
 
     device = env.unwrapped.device
     num_envs = env.unwrapped.num_envs
@@ -243,6 +243,9 @@ def _replay_single_episode(
 
     obs_dict, _ = env.reset()
 
+    # Pre-position robot to gripper-down rest pose before replay
+    pre_position_gripper_down(env)
+
     # Set fixed object initial pose on table.
     start_pose = torch.zeros((1, 7), device=device)
     start_pose[0, 0] = float(object_start_xy[0])
@@ -251,9 +254,14 @@ def _replay_single_episode(
     start_pose[0, 3] = 1.0
     teleport_object_to_pose(env, start_pose, name="object")
 
-    zero_action = torch.zeros((1, env.action_space.shape[-1]), device=device)
+    # Settle physics — hold current ee_pose instead of zero action
+    # (zero action in IK-Abs mode commands the robot toward the origin, causing drift)
+    ee_hold = get_ee_pose_w(env)
+    hold_action = torch.zeros((1, env.action_space.shape[-1]), device=device)
+    hold_action[0, :7] = ee_hold[0, :7]
+    hold_action[0, 7] = 1.0  # gripper open
     for _ in range(10):
-        obs_dict, _, _, _, _ = env.step(zero_action)
+        obs_dict, _, _, _, _ = env.step(hold_action)
 
     # Update visualization markers (red = table position, green = goal position)
     if markers is not None and update_markers_fn is not None and red_xy is not None:
@@ -306,8 +314,13 @@ def _replay_single_episode(
 
         obs_dict, _, _, _, _ = env.step(act_env)
 
+    # Post-replay settle: let object come to rest for success measurement
+    post_settle_action = torch.zeros((1, env.action_space.shape[-1]), device=device)
+    ee_final = get_ee_pose_w(env)
+    post_settle_action[0, :7] = ee_final[0, :7]
+    post_settle_action[0, 7] = 1.0  # gripper open
     for _ in range(int(settle_steps)):
-        obs_dict, _, _, _, _ = env.step(zero_action)
+        obs_dict, _, _, _, _ = env.step(post_settle_action)
 
     final_obj_pose = get_object_pose_w(env)[0].cpu().numpy()
     dist = float(

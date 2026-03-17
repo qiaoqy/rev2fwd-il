@@ -140,7 +140,9 @@ def main() -> None:
         import importlib.util
         from rev2fwd_il.utils.seed import set_seed
         from rev2fwd_il.sim.scene_api import (
+            get_ee_pose_w,
             get_object_pose_w,
+            pre_position_gripper_down,
             teleport_object_to_pose,
         )
 
@@ -187,7 +189,7 @@ def main() -> None:
         )
 
         env.reset()
-        zero_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+        pre_position_gripper_down(env)
 
         # Create markers (once)
         place_markers, goal_markers, marker_z = create_target_markers(
@@ -255,6 +257,7 @@ def main() -> None:
             for ep_idx in range(args.num_episodes):
                 # Reset environment
                 env.reset()
+                pre_position_gripper_down(env)
                 update_target_markers(
                     place_markers, goal_markers,
                     tester.current_place_xy, tuple(goal_xy), marker_z, env,
@@ -270,8 +273,12 @@ def main() -> None:
                         dtype=torch.float32, device=device,
                     ).unsqueeze(0)
                     teleport_object_to_pose(env, obj_pose, name="object")
+                    ee_hold = get_ee_pose_w(env)
+                    hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+                    hold_action[:, :7] = ee_hold[:, :7]
+                    hold_action[:, 7] = 1.0
                     for _ in range(10):
-                        env.step(zero_action)
+                        env.step(hold_action)
                     tester.current_gripper_state = 1.0
                     policy.reset()
 
@@ -298,8 +305,12 @@ def main() -> None:
                         dtype=torch.float32, device=device,
                     ).unsqueeze(0)
                     teleport_object_to_pose(env, obj_pose, name="object")
+                    ee_hold = get_ee_pose_w(env)
+                    hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+                    hold_action[:, :7] = ee_hold[:, :7]
+                    hold_action[:, 7] = 1.0
                     for _ in range(10):
-                        env.step(zero_action)
+                        env.step(hold_action)
                     tester.current_gripper_state = 1.0
                     policy.reset()
 

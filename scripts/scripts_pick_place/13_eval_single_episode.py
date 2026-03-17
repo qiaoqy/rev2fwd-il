@@ -144,7 +144,7 @@ def main():
     try:
         import importlib.util
         from rev2fwd_il.utils.seed import set_seed
-        from rev2fwd_il.sim.scene_api import get_object_pose_w, teleport_object_to_pose
+        from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w, pre_position_gripper_down, teleport_object_to_pose
 
         _spec = importlib.util.spec_from_file_location(
             "test_alternating", str(Path(__file__).parent / "6_test_alternating.py"))
@@ -199,6 +199,7 @@ def main():
         )
 
         env.reset()
+        pre_position_gripper_down(env)
         pm, gm, mz = create_target_markers(num_envs=1, device=device)
         tester.place_markers = pm
         tester.goal_markers = gm
@@ -206,7 +207,6 @@ def main():
         first_place = tester._sample_new_place_target()
         tester.current_place_xy = first_place
         update_target_markers(pm, gm, first_place, tuple(goal_xy), mz, env)
-        zero_action = torch.zeros(1, env.action_space.shape[-1], device=device)
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -217,14 +217,19 @@ def main():
         for ep in range(args.num_episodes):
             # Hard reset for Task A: object at random position
             env.reset()
+            pre_position_gripper_down(env)
             rand_xy = tester._sample_new_place_target()
             update_target_markers(pm, gm, rand_xy, tuple(goal_xy), mz, env)
             obj_pose = torch.tensor(
                 [rand_xy[0], rand_xy[1], 0.022, 1, 0, 0, 0],
                 dtype=torch.float32, device=device).unsqueeze(0)
             teleport_object_to_pose(env, obj_pose, name="object")
+            ee_hold = get_ee_pose_w(env)
+            hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+            hold_action[:, :7] = ee_hold[:, :7]
+            hold_action[:, 7] = 1.0
             for _ in range(10):
-                env.step(zero_action)
+                env.step(hold_action)
             tester.current_gripper_state = 1.0
             pol_A.reset()
             tester.video_frames = []

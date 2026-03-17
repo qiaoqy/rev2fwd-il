@@ -181,8 +181,10 @@ def main() -> None:
         import importlib.util
         from rev2fwd_il.utils.seed import set_seed
         from rev2fwd_il.sim.scene_api import (
+            get_ee_pose_w,
             get_object_pose_w,
             teleport_object_to_pose,
+            pre_position_gripper_down,
         )
         # Re-use utilities from the existing alternating test script (6_test_alternating.py)
         _alt_spec = importlib.util.spec_from_file_location(
@@ -290,6 +292,8 @@ def main() -> None:
 
         # ---- initial environment setup ----
         env.reset()
+        # Pre-position robot to gripper-down rest pose
+        pre_position_gripper_down(env)
 
         # Create markers
         place_markers, goal_markers, marker_z = create_target_markers(
@@ -314,6 +318,8 @@ def main() -> None:
             position on the table (Task A picks from arbitrary table pos).
             """
             env.reset()
+            # Pre-position robot to gripper-down rest pose
+            pre_position_gripper_down(env)
             # Re-create markers after env reset
             if tester.current_place_xy is not None:
                 tester._update_place_marker(tester.current_place_xy)
@@ -324,10 +330,13 @@ def main() -> None:
                 dtype=torch.float32, device=device,
             ).unsqueeze(0)
             teleport_object_to_pose(env, obj_pose, name="object")
-            # Settle
-            zero_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+            # Settle — hold current ee_pose
+            ee_hold = get_ee_pose_w(env)
+            hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+            hold_action[0, :7] = ee_hold[0, :7]
+            hold_action[0, 7] = 1.0
             for _ in range(10):
-                env.step(zero_action)
+                env.step(hold_action)
             tester.current_gripper_state = 1.0
             policy_A.reset()
             print(f"    [Hard Reset] Robot reset, object at random pos [{rand_xy[0]:.3f}, {rand_xy[1]:.3f}] for Task A")
@@ -339,6 +348,8 @@ def main() -> None:
             position (Task B picks from goal).
             """
             env.reset()
+            # Pre-position robot to gripper-down rest pose
+            pre_position_gripper_down(env)
             if tester.current_place_xy is not None:
                 tester._update_place_marker(tester.current_place_xy)
             obj_pose = torch.tensor(
@@ -346,9 +357,12 @@ def main() -> None:
                 dtype=torch.float32, device=device,
             ).unsqueeze(0)
             teleport_object_to_pose(env, obj_pose, name="object")
-            zero_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+            ee_hold = get_ee_pose_w(env)
+            hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+            hold_action[0, :7] = ee_hold[0, :7]
+            hold_action[0, 7] = 1.0
             for _ in range(10):
-                env.step(zero_action)
+                env.step(hold_action)
             tester.current_gripper_state = 1.0
             policy_B.reset()
             print(f"    [Hard Reset] Robot reset, object at goal [{goal_xy[0]:.3f}, {goal_xy[1]:.3f}] for Task B")
@@ -359,9 +373,12 @@ def main() -> None:
             dtype=torch.float32, device=device,
         ).unsqueeze(0)
         teleport_object_to_pose(env, init_pose, name="object")
-        zero_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+        ee_hold = get_ee_pose_w(env)
+        hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+        hold_action[0, :7] = ee_hold[0, :7]
+        hold_action[0, 7] = 1.0
         for _ in range(10):
-            env.step(zero_action)
+            env.step(hold_action)
 
         # ---- main loop ----
         results_A = []  # list of bools

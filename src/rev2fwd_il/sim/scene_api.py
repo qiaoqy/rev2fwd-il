@@ -134,3 +134,40 @@ def teleport_object_to_pose(
 
     # Reset the object internal state
     obj.reset(env_ids)
+
+
+# Gripper-down quaternion (wxyz): 180° rotation around X axis
+GRIPPER_DOWN_QUAT = torch.tensor([0.0, 1.0, 0.0, 0.0])
+
+
+def pre_position_gripper_down(
+    env: gym.Env,
+    steps: int = 80,
+    settle_steps: int = 10,
+) -> None:
+    """Move the robot from its default home pose to a gripper-down rest pose.
+
+    After ``env.reset()``, the Franka arm is in its default home with the
+    gripper facing forward.  This function commands the arm to the same XYZ
+    position but with gripper pointing downward (``grasp_quat = [0,1,0,0]``)
+    and waits until the PD controller converges.
+
+    Args:
+        env: Gymnasium environment (Isaac Lab).
+        steps: Number of control steps to converge on the gripper-down pose.
+        settle_steps: Extra steps at the target pose to ensure zero velocity.
+    """
+    device = env.unwrapped.device
+    num_envs = env.unwrapped.num_envs
+
+    ee_pose = get_ee_pose_w(env)  # (num_envs, 7)
+    target_action = torch.zeros(num_envs, env.action_space.shape[-1], device=device)
+    target_action[:, :3] = ee_pose[:, :3]
+    target_action[:, 3:7] = GRIPPER_DOWN_QUAT.to(device)
+    target_action[:, 7] = 1.0  # gripper open
+
+    for _ in range(steps):
+        env.step(target_action)
+
+    for _ in range(settle_steps):
+        env.step(target_action)

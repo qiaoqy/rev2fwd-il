@@ -235,7 +235,9 @@ def main() -> None:
         import importlib.util
         from rev2fwd_il.utils.seed import set_seed
         from rev2fwd_il.sim.scene_api import (
+            get_ee_pose_w,
             get_object_pose_w,
+            pre_position_gripper_down,
             teleport_object_to_pose,
         )
 
@@ -314,6 +316,7 @@ def main() -> None:
 
         # Initial env reset + markers
         env.reset()
+        pre_position_gripper_down(env)
         place_markers, goal_markers, marker_z = create_target_markers(
             num_envs=1, device=device,
         )
@@ -327,8 +330,6 @@ def main() -> None:
             place_markers, goal_markers,
             first_place_xy, tuple(goal_xy), marker_z, env,
         )
-
-        zero_action = torch.zeros(1, env.action_space.shape[-1], device=device)
 
         # =================================================================
         # Output paths
@@ -352,6 +353,7 @@ def main() -> None:
         for ep_idx in range(args.num_episodes):
             # ---- Hard reset for Task B ----
             env.reset()
+            pre_position_gripper_down(env)
             new_place_xy = tester._sample_new_place_target()
             tester.current_place_xy = new_place_xy
             update_target_markers(
@@ -364,8 +366,12 @@ def main() -> None:
                 dtype=torch.float32, device=device,
             ).unsqueeze(0)
             teleport_object_to_pose(env, obj_pose, name="object")
+            ee_hold = get_ee_pose_w(env)
+            hold_action = torch.zeros(1, env.action_space.shape[-1], device=device)
+            hold_action[:, :7] = ee_hold[:, :7]
+            hold_action[:, 7] = 1.0
             for _ in range(10):
-                env.step(zero_action)
+                env.step(hold_action)
             tester.current_gripper_state = 1.0
             policy_B.reset()
 

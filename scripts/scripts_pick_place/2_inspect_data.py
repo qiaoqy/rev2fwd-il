@@ -72,6 +72,12 @@ def _parse_args() -> argparse.Namespace:
         help="Custom name for output folder. If not provided, uses timestamp.",
     )
     parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Base directory for output. If not set, defaults to data/.",
+    )
+    parser.add_argument(
         "--fps",
         type=int,
         default=30,
@@ -353,10 +359,14 @@ def main() -> None:
     
     # Create output directory with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.name:
-        output_dir = Path("data") / f"inspect_{args.name}_{timestamp}"
+    if args.out_dir is not None:
+        base_dir = Path(args.out_dir)
     else:
-        output_dir = Path("data") / f"inspect_{timestamp}"
+        base_dir = Path("data")
+    if args.name:
+        output_dir = base_dir / f"inspect_{args.name}_{timestamp}"
+    else:
+        output_dir = base_dir / f"inspect_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"Output directory: {output_dir}")

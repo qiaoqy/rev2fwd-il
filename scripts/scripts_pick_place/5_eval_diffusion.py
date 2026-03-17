@@ -785,7 +785,7 @@ def run_episode(
         Dictionary with episode statistics.
     """
 
-    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w, teleport_object_to_pose
+    from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w, teleport_object_to_pose, pre_position_gripper_down
 
     table_camera = env.unwrapped.scene.sensors["table_cam"]
     wrist_camera = env.unwrapped.scene.sensors.get("wrist_cam", None) if has_wrist else None
@@ -798,6 +798,9 @@ def run_episode(
 
     # Reset environment
     obs_dict, _ = env.reset()
+
+    # Pre-position robot to gripper-down rest pose
+    pre_position_gripper_down(env)
     
     # If overfit mode, teleport object to saved initial pose
     if overfit_env_init is not None:

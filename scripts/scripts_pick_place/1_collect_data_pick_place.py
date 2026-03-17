@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Step 1: Collect reverse rollouts from Expert B with goal-based actions.
+"""Step 1: Collect reverse rollouts from Expert B with next-frame ee_pose actions.
 
 This script collects reverse trajectory data using an FSM-based expert policy.
 The expert performs Task B (goal -> table): picks cube from goal position and
 places it at a random table position.
+
+Action is recorded as next-frame ee_pose (ee_pose[t+1]) + gripper command,
+so that replaying action[t] drives the robot to the exact next recorded pose.
 
 =============================================================================
 OUTPUT DATA FORMAT (NPZ file)
@@ -14,7 +17,7 @@ For each episode, the following arrays are saved:
     - wrist_images:  (T, H, W, 3)  RGB images from wrist camera (uint8)
     - ee_pose:       (T, 7)   End-effector pose [x, y, z, qw, qx, qy, qz]
     - obj_pose:      (T, 7)   Object (cube) pose
-    - action:        (T, 8)   Goal action [ee_pose, gripper]
+    - action:        (T, 8)   Next-frame ee_pose + gripper [x,y,z,qw,qx,qy,qz, gripper]
     - gripper:       (T,)     Gripper action (+1=open, -1=close)
     - fsm_state:     (T,)     FSM state at each timestep (int)
     - place_pose:    (7,)     Target place position (random table position)
@@ -22,15 +25,42 @@ For each episode, the following arrays are saved:
     - success:       bool     Whether cube ended up near target position
 
 =============================================================================
-USAGE EXAMPLES
+MARKER MODES (three mutually exclusive modes)
 =============================================================================
-# Basic usage (headless mode, 100 episodes)
-python scripts/scripts_pick_place/1_collect_data_pick_place.py --headless --num_episodes 100
+Green circle marker is always fixed at goal position (0.5, 0.0).
+Red marker type and position depend on the chosen mode:
 
-# Production run (500 episodes with parallel envs)
-CUDA_VISIBLE_DEVICES=9 python scripts/scripts_pick_place/1_collect_data_pick_place.py \
-    --headless --num_episodes 200 --num_envs 20 \
-    --out data/B_circle_200.npz
+Mode 1: Random red circle (DEFAULT)
+  Red circle marker placed at a randomly sampled table position each episode.
+  Expert picks cube from green goal, places it at the red circle position.
+
+  python scripts/scripts_pick_place/1_collect_data_pick_place.py \
+      --num_episodes 100 --headless
+
+Mode 2: Fixed red circle (like exp9)
+  Red circle marker fixed at a specified position (e.g., 0.45, 0.15).
+  Expert picks from green goal, places at the fixed red circle position.
+  Use --fixed_start_xy to set the red circle position.
+
+  python scripts/scripts_pick_place/1_collect_data_pick_place.py \
+      --fixed_start_xy 0.45 0.15 \
+      --num_episodes 20 --headless
+
+Mode 3: Red rectangle region (like exp10)
+  Red rectangle marker placed at region center (replaces red circle).
+  Expert picks from green goal, places at random position within rectangle.
+  --red_marker_shape and --red_marker_size_xy are auto-set from region params.
+  Use --fix_red_marker_pose 1 to keep rectangle marker at region center.
+
+  python scripts/scripts_pick_place/1_collect_data_pick_place.py \
+      --taskB_target_mode red_region \
+      --red_region_center_xy 0.5 0.0 \
+      --red_region_size_xy 0.12 0.10 \
+      --fix_red_marker_pose 1 \
+      --num_episodes 20 --headless
+
+NOTE: --fixed_start_xy (Mode 2) and --taskB_target_mode red_region (Mode 3)
+are mutually exclusive. Do not use them together.
 
 =============================================================================
 """
@@ -112,54 +142,58 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Random seed for reproducibility.",
     )
+    # -----------------------------------------------------------------
+    # Marker mode selection (see docstring for three modes)
+    # -----------------------------------------------------------------
     parser.add_argument(
         "--fixed_start_xy",
         type=float,
         nargs=2,
         default=None,
-        help="Optional fixed start XY for all sampled table starts. If not set, starts are random.",
+        help="[Mode 2] Fixed (x, y) for the red circle marker and place target. "
+             "Mutually exclusive with --taskB_target_mode red_region.",
     )
     parser.add_argument(
         "--taskB_target_mode",
         type=str,
         choices=["legacy", "red_region"],
         default="legacy",
-        help="Task B target sampling mode. Default keeps legacy table sampling.",
+        help="[Mode 3] Set to 'red_region' to use rectangular red marker and "
+             "sample targets within it. Requires --red_region_center_xy and "
+             "--red_region_size_xy. Mutually exclusive with --fixed_start_xy.",
     )
     parser.add_argument(
         "--red_region_center_xy",
         type=float,
         nargs=2,
         default=None,
-        help="Optional center of red rectangle region (cx cy).",
+        help="[Mode 3] Center (cx, cy) of the red rectangle region. "
+             "Required when --taskB_target_mode=red_region.",
     )
     parser.add_argument(
         "--red_region_size_xy",
         type=float,
         nargs=2,
         default=None,
-        help="Optional red rectangle size (sx sy) in meters for target sampling.",
-    )
-    parser.add_argument(
-        "--red_marker_shape",
-        type=str,
-        choices=["circle", "rectangle"],
-        default="circle",
-        help="Red marker shape. Default keeps legacy circle marker.",
+        help="[Mode 3] Size (sx, sy) in meters of the red rectangle region. "
+             "Required when --taskB_target_mode=red_region.",
     )
     parser.add_argument(
         "--red_marker_size_xy",
         type=float,
         nargs=2,
         default=None,
-        help="Optional red marker size (sx sy) in meters. For circle, sx is interpreted as diameter.",
+        help="[Mode 3 only] Red rectangle marker display size (sx, sy) in meters. "
+             "Auto-defaults to --red_region_size_xy if not specified. "
+             "Ignored in Mode 1/2 (circle markers always match green circle size).",
     )
     parser.add_argument(
         "--fix_red_marker_pose",
         type=int,
         choices=[0, 1],
         default=0,
-        help="If 1, red marker stays at region center while target points can still be random.",
+        help="[Mode 3] If 1, red rectangle marker stays at region center while "
+             "place targets are randomly sampled within the region.",
     )
     
     # -----------------------------------------------------------------
@@ -264,36 +298,34 @@ def create_target_markers(
 ):
     """Create visualization markers for start and goal positions.
     
-    Creates two sets of flat cylinder markers on the table surface:
-    - Red markers: Start/place positions (where cube should be placed)
-    - Green markers: Goal positions (fixed at plate center)
-    
-    These are visual-only markers with no physics interaction.
+    Creates two sets of flat markers on the table surface:
+    - Red marker: Start/place position. Circle (same size as green) in Mode 1/2,
+      or rectangle (sized by red_marker_size_xy) in Mode 3.
+    - Green marker: Goal position (fixed at plate center), always a circle.
     
     Args:
         num_envs: Number of parallel environments.
         device: Torch device string.
+        red_marker_shape: 'circle' (Mode 1/2) or 'rectangle' (Mode 3).
+        red_marker_size_xy: Rectangle size (sx, sy) in meters. Only used when
+            red_marker_shape='rectangle'. Ignored for circles.
         
     Returns:
-        Tuple of (start_markers, goal_markers) VisualizationMarkers objects.
+        Tuple of (start_markers, goal_markers, marker_z).
     """
     import isaaclab.sim as sim_utils
     from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
     
-    # Marker parameters
-    marker_radius = 0.05  # 5cm radius
+    # Marker parameters (shared by red circle and green circle)
+    marker_radius = 0.05  # 5cm radius — same for red and green circles
     marker_height = 0.002  # 2mm height (flat disk)
     table_z = 0.0  # Table surface height
     marker_z = table_z + marker_height / 2 + 0.001  # Slightly above table
 
-    if red_marker_size_xy is not None:
-        red_size_x = float(red_marker_size_xy[0])
-        red_size_y = float(red_marker_size_xy[1])
-    else:
-        red_size_x = 2.0 * marker_radius
-        red_size_y = 2.0 * marker_radius
-
     if red_marker_shape == "rectangle":
+        # Mode 3: red rectangle marker — size from red_marker_size_xy
+        red_size_x = float(red_marker_size_xy[0]) if red_marker_size_xy else 2.0 * marker_radius
+        red_size_y = float(red_marker_size_xy[1]) if red_marker_size_xy else 2.0 * marker_radius
         red_marker_prim = sim_utils.CuboidCfg(
             size=(red_size_x, red_size_y, marker_height),
             visual_material=sim_utils.PreviewSurfaceCfg(
@@ -301,8 +333,9 @@ def create_target_markers(
             ),
         )
     else:
+        # Mode 1/2: red circle marker — same radius as green circle
         red_marker_prim = sim_utils.CylinderCfg(
-            radius=max(red_size_x, red_size_y) / 2.0,
+            radius=marker_radius,
             height=marker_height,
             axis="Z",
             visual_material=sim_utils.PreviewSurfaceCfg(
@@ -693,10 +726,12 @@ def rollout_expert_B_with_goal_actions(
     settle_steps: int = 30,
     markers: tuple = None,
 ):
-    """Run parallel reverse rollouts with Expert B and record goal-based actions.
+    """Run parallel reverse rollouts with Expert B and record next-frame ee_pose actions.
     
     The key difference from rollout_expert_B_with_images is that we record
-    the FSM's goal position as the action, not the smooth interpolated output.
+    the next-frame ee_pose as the action, so action[t] = ee_pose[t+1].
+    This ensures that replaying action[t] drives the robot to the exact
+    next recorded pose, enabling accurate trajectory replay and time reversal.
     
     Args:
         env: Isaac Lab gymnasium environment with camera sensor.
@@ -758,11 +793,15 @@ def rollout_expert_B_with_goal_actions(
     teleport_object_to_pose(env, goal_pose, name="object")
     print("[DEBUG] rollout: Cube teleported")
     
-    # Let physics settle after teleport
-    print("[DEBUG] rollout: Settling physics (10 steps)...")
-    zero_action = torch.zeros(num_envs, env.action_space.shape[-1], device=device)
+    # Let physics settle after teleport — hold current ee_pose instead of zero action
+    # (zero action in IK-Abs mode commands the robot toward the origin, causing drift)
+    print("[DEBUG] rollout: Settling physics (10 steps, hold ee_pose)...")
+    ee_hold = get_ee_pose_w(env)
+    hold_action = torch.zeros(num_envs, env.action_space.shape[-1], device=device)
+    hold_action[:, :7] = ee_hold[:, :7]
+    hold_action[:, 7] = 1.0  # gripper open
     for _ in range(10):
-        env.step(zero_action)
+        env.step(hold_action)
     print("[DEBUG] rollout: Physics settled")
     
     # =========================================================================
@@ -818,6 +857,29 @@ def rollout_expert_B_with_goal_actions(
     for i, xy in enumerate(place_xys):
         expert.place_pose[i, 0] = xy[0]
         expert.place_pose[i, 1] = xy[1]
+    
+    # =========================================================================
+    # Step 4.1: Pre-position robot to rest pose (gripper-down) before recording
+    # =========================================================================
+    # After env.reset(), Franka is in its default home with gripper facing forward.
+    # Command the robot to the rest_pose (same XYZ, gripper-down) and wait for it
+    # to arrive, so that data recording starts with the robot already settled in
+    # the correct orientation — no large rotational transient at trajectory start.
+    print("[DEBUG] rollout: Pre-positioning robot to gripper-down rest pose...")
+    prepos_action = torch.zeros(num_envs, env.action_space.shape[-1], device=device)
+    prepos_action[:, :7] = expert.rest_pose[:, :7]
+    prepos_action[:, 7] = 1.0  # gripper open
+    prepos_steps = 80  # enough steps for PD controller to converge on new orientation
+    for step_i in range(prepos_steps):
+        obs_dict, _, _, _, _ = env.step(prepos_action)
+        if (step_i + 1) % 20 == 0:
+            cur_ee = get_ee_pose_w(env)
+            pos_err = torch.norm(cur_ee[:, :3] - expert.rest_pose[:, :3], dim=-1).max().item()
+            print(f"[DEBUG] rollout: Pre-position step {step_i+1}/{prepos_steps}, max pos error: {pos_err:.4f}")
+    # Hold at rest pose for 10 extra steps to ensure zero velocity before recording
+    for _ in range(10):
+        obs_dict, _, _, _, _ = env.step(prepos_action)
+    print("[DEBUG] rollout: Pre-positioning done (robot at rest, zero velocity)")
     
     # =========================================================================
     # Step 4.5: Create (if needed) and update visual markers for start/goal positions
@@ -892,18 +954,18 @@ def rollout_expert_B_with_goal_actions(
             wrist_rgb = wrist_rgb[..., :3]
         
         # =====================================================================
-        # KEY DIFFERENCE: Get FSM goal as action (not smooth interpolated action)
+        # Record action as next-frame ee_pose (not FSM waypoint)
         # =====================================================================
-        # Get the FSM's goal position for current state (without state transition)
+        # Get the FSM's gripper command for current state
         goal_action = get_fsm_goal_action(expert, object_pose)
         
-        # Record data for each env
+        # Record observation data for each env (action will be filled after env.step)
         obs_np = obs_vec.cpu().numpy()
         ee_pose_np = ee_pose.cpu().numpy()
         obj_pose_np = object_pose.cpu().numpy()
         table_images_np = table_rgb.cpu().numpy().astype(np.uint8)
         wrist_images_np = wrist_rgb.cpu().numpy().astype(np.uint8)
-        goal_action_np = goal_action.cpu().numpy()
+        gripper_np = goal_action.cpu().numpy()[:, 7]  # gripper from FSM
         fsm_states_np = expert.state.cpu().numpy()
         
         for i in range(num_envs):
@@ -912,8 +974,7 @@ def rollout_expert_B_with_goal_actions(
             wrist_image_lists[i].append(wrist_images_np[i])
             ee_pose_lists[i].append(ee_pose_np[i])
             obj_pose_lists[i].append(obj_pose_np[i])
-            action_lists[i].append(goal_action_np[i])
-            gripper_lists[i].append(goal_action_np[i, 7])
+            gripper_lists[i].append(gripper_np[i])
             fsm_state_lists[i].append(fsm_states_np[i])
         
         # Compute expert action (this also updates FSM state)
@@ -921,6 +982,16 @@ def rollout_expert_B_with_goal_actions(
         
         # Step environment
         obs_dict, reward, terminated, truncated, info = env.step(action)
+        
+        # Record next-frame ee_pose as action[t]
+        # action[t] = ee_pose[t+1], so replaying action[t] drives the robot to the correct next pose
+        next_ee_pose = get_ee_pose_w(env)
+        next_ee_pose_np = next_ee_pose.cpu().numpy()
+        for i in range(num_envs):
+            act = np.zeros(8, dtype=np.float32)
+            act[:7] = next_ee_pose_np[i]
+            act[7] = gripper_np[i]
+            action_lists[i].append(act)
         
         # Check which envs just finished
         just_done = expert.is_done() & ~expert_completed
@@ -957,15 +1028,12 @@ def rollout_expert_B_with_goal_actions(
         if wrist_rgb.shape[-1] > 3:
             wrist_rgb = wrist_rgb[..., :3]
         
-        # Get goal action for settle phase (should be rest pose)
-        goal_action = get_fsm_goal_action(expert, object_pose)
-        
+        # Record observation data (action will be filled after env.step)
         obs_np = obs_vec.cpu().numpy()
         ee_pose_np = ee_pose.cpu().numpy()
         obj_pose_np = object_pose.cpu().numpy()
         table_images_np = table_rgb.cpu().numpy().astype(np.uint8)
         wrist_images_np = wrist_rgb.cpu().numpy().astype(np.uint8)
-        goal_action_np = goal_action.cpu().numpy()
         fsm_states_np = expert.state.cpu().numpy()
         
         for i in range(num_envs):
@@ -975,7 +1043,6 @@ def rollout_expert_B_with_goal_actions(
                 wrist_image_lists[i].append(wrist_images_np[i])
                 ee_pose_lists[i].append(ee_pose_np[i])
                 obj_pose_lists[i].append(obj_pose_np[i])
-                action_lists[i].append(goal_action_np[i])
                 gripper_lists[i].append(1.0)  # Open gripper during settle
                 fsm_state_lists[i].append(fsm_states_np[i])
         
@@ -985,6 +1052,16 @@ def rollout_expert_B_with_goal_actions(
         rest_action[:, 7] = 1.0  # Open gripper
         
         obs_dict, _, _, _, _ = env.step(rest_action)
+        
+        # Record next-frame ee_pose as action[t]
+        next_ee_pose = get_ee_pose_w(env)
+        next_ee_pose_np = next_ee_pose.cpu().numpy()
+        for i in range(num_envs):
+            if expert_completed[i]:
+                act = np.zeros(8, dtype=np.float32)
+                act[:7] = next_ee_pose_np[i]
+                act[7] = 1.0  # Open gripper during settle
+                action_lists[i].append(act)
     
     print("[DEBUG] rollout: Settle steps finished")
     
@@ -1144,11 +1221,46 @@ def main() -> None:
         task_spec.red_region_size_xy = (
             tuple(args.red_region_size_xy) if args.red_region_size_xy is not None else None
         )
-        task_spec.red_marker_shape = args.red_marker_shape
+        task_spec.red_marker_shape = "circle"  # default; overridden to "rectangle" in Mode 3
         task_spec.red_marker_size_xy = (
             tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None
         )
         task_spec.fix_red_marker_pose = bool(args.fix_red_marker_pose)
+
+        # -----------------------------------------------------------------
+        # Mode validation and auto-defaults
+        # -----------------------------------------------------------------
+        if args.taskB_target_mode == "red_region":
+            # Mode 3: Rectangle region
+            if args.red_region_center_xy is None or args.red_region_size_xy is None:
+                raise ValueError(
+                    "Mode 3 (red_region): both --red_region_center_xy and "
+                    "--red_region_size_xy are required."
+                )
+            if args.fixed_start_xy is not None:
+                raise ValueError(
+                    "Cannot combine --fixed_start_xy (Mode 2) with "
+                    "--taskB_target_mode red_region (Mode 3). Choose one mode."
+                )
+            # Rectangle region always uses rectangle marker shape
+            task_spec.red_marker_shape = "rectangle"
+            # Default marker size to match region size
+            if task_spec.red_marker_size_xy is None:
+                task_spec.red_marker_size_xy = task_spec.red_region_size_xy
+            print(
+                f"[INFO] Mode 3 (rectangle region): "
+                f"center={task_spec.red_region_center_xy}, "
+                f"size={task_spec.red_region_size_xy}, "
+                f"marker_size={task_spec.red_marker_size_xy}, "
+                f"fix_marker_pose={task_spec.fix_red_marker_pose}"
+            )
+        elif args.fixed_start_xy is not None:
+            # Mode 2: Fixed red circle
+            print(f"[INFO] Mode 2 (fixed red circle): start_xy={task_spec.fixed_start_xy}")
+        else:
+            # Mode 1: Random red circle (default)
+            print("[INFO] Mode 1 (random red circle): default mode")
+
         print("[DEBUG] Step 5: Task specification created")
         
         # =================================================================

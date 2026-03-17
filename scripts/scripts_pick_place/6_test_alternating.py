@@ -1582,13 +1582,15 @@ class AlternatingTester:
 
     def run_alternating_test(self, max_cycles: int) -> dict:
         """Run alternating A→B→A→B... test loop."""
-        from rev2fwd_il.sim.scene_api import get_object_pose_w, teleport_object_to_pose
+        from rev2fwd_il.sim.scene_api import get_object_pose_w, teleport_object_to_pose, get_ee_pose_w, pre_position_gripper_down
 
         consecutive_success = 0
 
         # First, reset environment and place object at random position
         print("Resetting environment for alternating test...")
         self.env.reset()
+        # Pre-position robot to gripper-down rest pose
+        pre_position_gripper_down(self.env)
         
         # Create visualization markers
         print("Creating visualization markers...")
@@ -1632,10 +1634,13 @@ class AlternatingTester:
         ).unsqueeze(0)
         teleport_object_to_pose(self.env, init_pose, name="object")
 
-        # Settle
-        zero_action = torch.zeros(1, self.env.action_space.shape[-1], device=self.device)
+        # Settle — hold current ee_pose
+        ee_hold = get_ee_pose_w(self.env)
+        hold_action = torch.zeros(1, self.env.action_space.shape[-1], device=self.device)
+        hold_action[0, :7] = ee_hold[0, :7]
+        hold_action[0, 7] = 1.0
         for _ in range(10):
-            self.env.step(zero_action)
+            self.env.step(hold_action)
 
         obj_pose = get_object_pose_w(self.env)[0].cpu().numpy()
         print(f"Initial object position: [{obj_pose[0]:.3f}, {obj_pose[1]:.3f}, {obj_pose[2]:.3f}]")
