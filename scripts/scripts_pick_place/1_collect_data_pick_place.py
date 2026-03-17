@@ -611,39 +611,45 @@ def get_fsm_goal_action(expert, object_pose) -> "torch.Tensor":
     obj_xy = object_pose[:, :2]
     obj_z = object_pose[:, 2]
     
-    # Above object position
-    above_obj_pos = torch.zeros(num_envs, 3, device=device)
-    if hasattr(expert, 'above_obj_dxy') and expert.above_obj_dxy is not None:
-        above_obj_pos[:, :2] = obj_xy + expert.above_obj_dxy
-    else:
-        above_obj_pos[:, :2] = obj_xy
-        
-    if hasattr(expert, 'episode_hover_z') and expert.episode_hover_z is not None:
-        above_obj_pos[:, 2] = expert.episode_hover_z
-    else:
-        above_obj_pos[:, 2] = expert.hover_z
+    # Approach object position (high, rough XY)
+    approach_obj_pos = torch.zeros(num_envs, 3, device=device)
+    approach_obj_pos[:, :2] = obj_xy + expert.approach_obj_dxy
+    approach_obj_pos[:, 2] = expert.episode_hover_z + expert.approach_obj_extra_z
     
-    # At object position (for grasping)
+    # Above object position (standard hover + small extra Z)
+    above_obj_pos = torch.zeros(num_envs, 3, device=device)
+    above_obj_pos[:, :2] = obj_xy + expert.above_obj_dxy
+    above_obj_pos[:, 2] = expert.episode_hover_z + expert.above_obj_extra_z
+    
+    # Align-to-object position (fine, slightly lower)
+    align_obj_pos = torch.zeros(num_envs, 3, device=device)
+    align_obj_pos[:, :2] = obj_xy + expert.align_obj_dxy
+    align_obj_pos[:, 2] = expert.episode_hover_z + expert.align_obj_dz
+    
+    # At object position (for grasping) — NO randomness
     at_obj_pos = torch.zeros(num_envs, 3, device=device)
     at_obj_pos[:, :2] = obj_xy
     at_obj_pos[:, 2] = obj_z + expert.grasp_z_offset
     
-    # Above place position
-    above_place_pos = torch.zeros(num_envs, 3, device=device)
-    if hasattr(expert, 'above_place_dxy') and expert.above_place_dxy is not None:
-        above_place_pos[:, :2] = expert.place_pose[:, :2] + expert.above_place_dxy
-    else:
-        above_place_pos[:, :2] = expert.place_pose[:, :2]
-        
-    if hasattr(expert, 'episode_hover_z') and expert.episode_hover_z is not None:
-        above_place_pos[:, 2] = expert.episode_hover_z
-    else:
-        above_place_pos[:, 2] = expert.hover_z
+    # Approach place position (high, moderate XY)
+    approach_place_pos = torch.zeros(num_envs, 3, device=device)
+    approach_place_pos[:, :2] = expert.place_pose[:, :2] + expert.approach_place_dxy
+    approach_place_pos[:, 2] = expert.episode_hover_z + expert.approach_place_extra_z
     
-    # At place position
+    # Above place position (standard hover + small extra Z)
+    above_place_pos = torch.zeros(num_envs, 3, device=device)
+    above_place_pos[:, :2] = expert.place_pose[:, :2] + expert.above_place_dxy
+    above_place_pos[:, 2] = expert.episode_hover_z + expert.above_place_extra_z
+    
+    # Align-to-place position (fine, slightly lower)
+    align_place_pos = torch.zeros(num_envs, 3, device=device)
+    align_place_pos[:, :2] = expert.place_pose[:, :2] + expert.align_place_dxy
+    align_place_pos[:, 2] = expert.episode_hover_z + expert.align_place_dz
+    
+    # At place position — NO randomness
     at_place_pos = expert.place_pose[:, :3].clone()
     
-    # Release position (lower than place position)
+    # Release position — NO randomness
     release_pos = expert.place_pose[:, :3].clone()
     release_pos[:, 2] = expert.place_pose[:, 2] + expert.release_z_offset
     
@@ -658,9 +664,19 @@ def get_fsm_goal_action(expert, object_pose) -> "torch.Tensor":
             goal_action[mask, :3] = expert.rest_pose[mask, :3]
             goal_action[mask, 3:7] = expert.rest_pose[mask, 3:7]
             goal_action[mask, 7] = GRIPPER_OPEN
+        
+        elif state_val == ExpertState.APPROACH_OBJ:
+            goal_action[mask, :3] = approach_obj_pos[mask]
+            goal_action[mask, 3:7] = expert.grasp_quat
+            goal_action[mask, 7] = GRIPPER_OPEN
             
         elif state_val == ExpertState.GO_ABOVE_OBJ:
             goal_action[mask, :3] = above_obj_pos[mask]
+            goal_action[mask, 3:7] = expert.grasp_quat
+            goal_action[mask, 7] = GRIPPER_OPEN
+        
+        elif state_val == ExpertState.ALIGN_TO_OBJ:
+            goal_action[mask, :3] = align_obj_pos[mask]
             goal_action[mask, 3:7] = expert.grasp_quat
             goal_action[mask, 7] = GRIPPER_OPEN
             
@@ -678,9 +694,19 @@ def get_fsm_goal_action(expert, object_pose) -> "torch.Tensor":
             goal_action[mask, :3] = above_obj_pos[mask]
             goal_action[mask, 3:7] = expert.grasp_quat
             goal_action[mask, 7] = GRIPPER_CLOSE
+        
+        elif state_val == ExpertState.APPROACH_PLACE:
+            goal_action[mask, :3] = approach_place_pos[mask]
+            goal_action[mask, 3:7] = expert.grasp_quat
+            goal_action[mask, 7] = GRIPPER_CLOSE
             
         elif state_val == ExpertState.GO_ABOVE_PLACE:
             goal_action[mask, :3] = above_place_pos[mask]
+            goal_action[mask, 3:7] = expert.grasp_quat
+            goal_action[mask, 7] = GRIPPER_CLOSE
+        
+        elif state_val == ExpertState.ALIGN_TO_PLACE:
+            goal_action[mask, :3] = align_place_pos[mask]
             goal_action[mask, 3:7] = expert.grasp_quat
             goal_action[mask, 7] = GRIPPER_CLOSE
             
