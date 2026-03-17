@@ -136,9 +136,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--taskA_source_mode",
         type=str,
-        choices=["legacy", "green_region"],
+        choices=["legacy", "green_region", "red_region"],
         default="legacy",
-        help="Task A source sampling mode.",
+        help="Task A source sampling mode. 'red_region' samples from the red rectangle region.",
     )
     parser.add_argument(
         "--taskB_target_mode",

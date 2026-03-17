@@ -211,9 +211,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--taskA_source_mode",
         type=str,
-        choices=["legacy", "green_region"],
+        choices=["legacy", "green_region", "red_region"],
         default="legacy",
-        help="Task A source sampling mode. Default keeps legacy table sampling.",
+        help="Task A source sampling mode. 'red_region' samples from the red rectangle region.",
     )
     parser.add_argument(
         "--taskB_target_mode",
@@ -1336,13 +1336,24 @@ class AlternatingTester:
 
         return is_z_low and is_at_goal and is_gripper_open
 
+    def _is_xy_inside_region(
+        self, xy: np.ndarray, center_xy: Tuple[float, float], size_xy: Tuple[float, float]
+    ) -> bool:
+        """Check whether *xy* falls inside an axis-aligned rectangle."""
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+        sx, sy = float(size_xy[0]), float(size_xy[1])
+        half_x, half_y = sx * 0.5, sy * 0.5
+        return bool(abs(xy[0] - cx) <= half_x and abs(xy[1] - cy) <= half_y)
+
     def check_task_B_success(self) -> bool:
         """Check if Task B succeeded (object placed at target position).
         
         Success criteria:
-        - Object XY position is near the target place position (red marker)
         - Object Z height < 0.15m (approaching or on table)
         - Gripper is open (object has been released)
+        - If taskB_target_mode == 'red_region': object XY is inside the red
+          rectangular sampling region (not just near the sampled point).
+        - Otherwise: object XY is within distance_threshold of current_place_xy.
         """
         from rev2fwd_il.sim.scene_api import get_object_pose_w
 
@@ -1353,8 +1364,16 @@ class AlternatingTester:
         # Object Z should be low (approaching table or on table)
         is_z_low = obj_z < 0.15
 
-        # Check if object is near the target place position (red marker)
-        if self.current_place_xy is not None:
+        # Region-based check when red_region mode is active
+        if (
+            self.taskB_target_mode == "red_region"
+            and self.red_region_center_xy is not None
+            and self.red_region_size_xy is not None
+        ):
+            is_at_target = self._is_xy_inside_region(
+                obj_xy, self.red_region_center_xy, self.red_region_size_xy
+            )
+        elif self.current_place_xy is not None:
             target_xy = np.array(self.current_place_xy)
             dist_to_target = np.linalg.norm(obj_xy - target_xy)
             is_at_target = dist_to_target < self.distance_threshold
@@ -1413,6 +1432,14 @@ class AlternatingTester:
             and self.green_region_size_xy is not None
         ):
             return self._sample_xy_in_rectangle(self.green_region_center_xy, self.green_region_size_xy)
+
+        if (
+            role == "task_a_source"
+            and self.taskA_source_mode == "red_region"
+            and self.red_region_center_xy is not None
+            and self.red_region_size_xy is not None
+        ):
+            return self._sample_xy_in_rectangle(self.red_region_center_xy, self.red_region_size_xy)
 
         if (
             role == "task_b_target"
