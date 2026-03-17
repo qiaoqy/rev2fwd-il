@@ -40,10 +40,19 @@ USAGE
 # Basic time reversal
 python scripts/scripts_task_inovo/2_time_reverse.py \
     --input data/inovo_data/0209_tower_boby \
-    --output data/inovo_data/tower_boby_A_20260313 \
+    --output data/inovo_data/0209_tower_boby_reversed \
     --verify \
     --new_language "Pick up the purple disc from the sponge and place it on the pole."
 
+cp -a /mnt/dongxu-fs1/data-hdd/geyuan/datasets/TCL/0209_tower_boby_hard /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/inovo_data/
+rsync -a --info=progress2 /mnt/dongxu-fs1/data-hdd/geyuan/datasets/TCL/0209_tower_boby_hard/ /mnt/dongxu-fs1/data-ssd/qiyuanqiao/workspace/rev2fwd-il/data/inovo_data/0209_tower_boby_hard
+
+python scripts/scripts_task_inovo/2_time_reverse.py \
+    --input data/inovo_data/0209_tower_boby_hard \
+    --output data/inovo_data/0209_tower_boby_hard_reversed \
+    --verify \
+    --new_language "Pick up the purple disc from the pole and place it on the sponge."
+    
 # With verbose output
 python scripts/scripts_task_inovo/2_time_reverse.py \
     --input data/inovo_data/0209_tower_boby \
