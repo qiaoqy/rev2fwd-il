@@ -752,7 +752,17 @@ def train_with_xyz_visualization(
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
         effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        logging.info(f"Effective batch size: {cfg.batch_size} (per-GPU) x {num_processes} (GPUs) = {effective_bs} (total)")
+        expected_epochs = cfg.steps * effective_bs / max(dataset.num_frames, 1)
+        steps_per_epoch = max(dataset.num_frames, 1) / max(effective_bs, 1)
+        logging.info(f"Expected epochs at {cfg.steps} steps: {expected_epochs:.1f}")
+        logging.info(f"Steps per epoch: {steps_per_epoch:.1f}")
+        if step > 0:
+            current_epochs = step * effective_bs / max(dataset.num_frames, 1)
+            remaining_steps = cfg.steps - step
+            remaining_epochs = remaining_steps * effective_bs / max(dataset.num_frames, 1)
+            logging.info(f"Resuming from step {step} (epoch {current_epochs:.1f}), "
+                         f"{remaining_steps} steps ({remaining_epochs:.1f} epochs) remaining")
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
         logging.info(f"XYZ visualization save frequency: {viz_save_freq} steps")
@@ -1098,10 +1108,21 @@ def train_with_xyz_visualization(
 
         if is_log_step:
             logging.info(train_tracker)
+            # Log epoch progress with multi-GPU context
+            _eff_bs = cfg.batch_size * accelerator.num_processes
+            _cur_epoch = step * _eff_bs / max(dataset.num_frames, 1)
+            _target_epoch = cfg.steps * _eff_bs / max(dataset.num_frames, 1)
+            logging.info(
+                f"  \u2514\u2500 epoch {_cur_epoch:.2f}/{_target_epoch:.1f} "
+                f"| step {step}/{cfg.steps} "
+                f"| {accelerator.num_processes} GPUs, eff_batch={_eff_bs}"
+            )
             # 保存loss等信息到文件
             log_file = Path(cfg.output_dir) / "training_log.txt"
             with open(log_file, "a") as f:
-                f.write(f"Step {step}: {train_tracker}\n")
+                f.write(f"Step {step}: {train_tracker} "
+                        f"| epoch {_cur_epoch:.2f}/{_target_epoch:.1f} "
+                        f"| {accelerator.num_processes} GPUs\n")
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:

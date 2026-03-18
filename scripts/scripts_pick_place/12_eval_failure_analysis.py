@@ -79,6 +79,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--render_success_videos", action="store_true",
                         help="Also render success episodes (default: failures only).")
 
+    # Region parameters (mode 3)
+    parser.add_argument("--taskB_target_mode", type=str, default="legacy",
+                        choices=["legacy", "red_region"])
+    parser.add_argument("--red_region_center_xy", type=float, nargs=2, default=None)
+    parser.add_argument("--red_region_size_xy", type=float, nargs=2, default=None)
+    parser.add_argument("--red_marker_shape", type=str, default="circle",
+                        choices=["circle", "rectangle"])
+    parser.add_argument("--red_marker_size_xy", type=float, nargs=2, default=None)
+    parser.add_argument("--fix_red_marker_pose", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--taskA_source_mode", type=str, default="legacy",
+                        choices=["legacy", "green_region", "red_region"])
+
     from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(parser)
 
@@ -132,13 +144,15 @@ def render_episode_video(
     distance_threshold: float,
     goal_xy: tuple[float, float],
     fps: int = 30,
+    region_center_xy: tuple[float, float] | None = None,
+    region_size_xy: tuple[float, float] | None = None,
 ) -> None:
     """Render a single episode as an annotated MP4 video.
 
     Annotations include:
     - Episode number, step counter, total steps
     - Target XY (red marker position)
-    - Object XY position, distance to target
+    - Object XY position, distance to target / region check
     - Gripper state (open/closed)
     - Success/failure status + progress bar
     """
@@ -170,19 +184,26 @@ def render_episode_video(
 
         lines = [
             f"Ep {ep_index} | Step {t+1}/{T}",
-            f"Target: ({target_xy[0]:.3f}, {target_xy[1]:.3f})",
             f"ObjXY: ({obj_xy[0]:.3f}, {obj_xy[1]:.3f})  Z:{obj_z:.3f}",
-            f"Dist: {dist_to_target:.4f}  Thr: {distance_threshold}",
-            f"Gripper: {gripper_str} ({gripper:.2f})",
         ]
 
-        # Color-code distance
-        if dist_to_target < distance_threshold:
-            dist_color = (0, 255, 0)  # green
-        elif dist_to_target < distance_threshold * 2:
-            dist_color = (0, 255, 255)  # yellow
+        # Show region-based info if available; otherwise distance
+        if region_center_xy is not None and region_size_xy is not None:
+            rcx, rcy = region_center_xy
+            rsx, rsy = region_size_xy
+            dx = abs(float(obj_xy[0]) - rcx) - rsx * 0.5
+            dy = abs(float(obj_xy[1]) - rcy) - rsy * 0.5
+            in_x = dx <= 0
+            in_y = dy <= 0
+            in_region = in_x and in_y and obj_z < 0.15
+            lines.append(f"Region: cx{rcx:.2f} cy{rcy:.2f} "
+                         f"sx{rsx:.2f} sy{rsy:.2f}")
+            lines.append(f"dX:{dx:+.3f}{'OK' if in_x else ''} "
+                         f"dY:{dy:+.3f}{'OK' if in_y else ''}")
         else:
-            dist_color = (255, 255, 255)  # white
+            lines.append(f"Dist: {dist_to_target:.4f}  Thr: {distance_threshold}")
+
+        lines.append(f"Gripper: {gripper_str} ({gripper:.2f})")
 
         if success and success_step is not None and t + 1 >= success_step:
             lines.append("STATUS: SUCCESS")
@@ -300,6 +321,13 @@ def main() -> None:
             policy_B=policy_B, preprocessor_B=preproc_B, postprocessor_B=postproc_B,
             n_action_steps_A=n_act_B, n_action_steps_B=n_act_B,
             goal_xy=tuple(args.goal_xy),
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=(tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None),
+            fix_red_marker_pose=bool(args.fix_red_marker_pose),
+            taskA_source_mode=getattr(args, 'taskA_source_mode', 'legacy'),
+            taskB_target_mode=args.taskB_target_mode,
+            red_region_center_xy=(tuple(args.red_region_center_xy) if args.red_region_center_xy is not None else None),
+            red_region_size_xy=(tuple(args.red_region_size_xy) if args.red_region_size_xy is not None else None),
             height_threshold=args.height_threshold,
             distance_threshold=args.distance_threshold,
             horizon=args.horizon,
@@ -311,6 +339,21 @@ def main() -> None:
             include_gripper_B=config_B["include_gripper"],
         )
 
+        # Adjust success check region for cube physical size.
+        # Cube edge = 0.04m (DexCube 0.05 * scale 0.8), half = 0.02m.
+        # For the cube BODY to be fully inside the red rectangle, the cube
+        # CENTER must lie within the rectangle shrunk by cube_half_size on
+        # each side.  Visual marker keeps the original size.
+        CUBE_HALF_SIZE = 0.02
+        if args.red_region_size_xy is not None:
+            orig_sx, orig_sy = args.red_region_size_xy
+            success_sx = orig_sx - 2 * CUBE_HALF_SIZE
+            success_sy = orig_sy - 2 * CUBE_HALF_SIZE
+            tester.red_region_size_xy = (success_sx, success_sy)
+            print(f"  [Success region] original marker ({orig_sx}, {orig_sy}) "
+                  f"→ shrunk by cube_half={CUBE_HALF_SIZE} → "
+                  f"check region ({success_sx}, {success_sy})")
+
         goal_xy = np.array(args.goal_xy)
         rng = np.random.default_rng(args.seed)
 
@@ -319,6 +362,8 @@ def main() -> None:
         pre_position_gripper_down(env)
         place_markers, goal_markers, marker_z = create_target_markers(
             num_envs=1, device=device,
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=(tuple(args.red_marker_size_xy) if args.red_marker_size_xy is not None else None),
         )
         tester.place_markers = place_markers
         tester.goal_markers = goal_markers
@@ -326,9 +371,13 @@ def main() -> None:
 
         first_place_xy = tester._sample_new_place_target()
         tester.current_place_xy = first_place_xy
+        # When fix_red_marker_pose=1, marker stays at region center
+        marker_xy = first_place_xy
+        if args.fix_red_marker_pose and args.red_region_center_xy is not None:
+            marker_xy = tuple(args.red_region_center_xy)
         update_target_markers(
             place_markers, goal_markers,
-            first_place_xy, tuple(goal_xy), marker_z, env,
+            marker_xy, tuple(goal_xy), marker_z, env,
         )
 
         # =================================================================
@@ -356,9 +405,13 @@ def main() -> None:
             pre_position_gripper_down(env)
             new_place_xy = tester._sample_new_place_target()
             tester.current_place_xy = new_place_xy
+            # When fix_red_marker_pose=1, marker stays at region center
+            marker_xy = new_place_xy
+            if args.fix_red_marker_pose and args.red_region_center_xy is not None:
+                marker_xy = tuple(args.red_region_center_xy)
             update_target_markers(
                 place_markers, goal_markers,
-                new_place_xy, tuple(goal_xy), marker_z, env,
+                marker_xy, tuple(goal_xy), marker_z, env,
             )
             # Object starts at goal position (Task B picks from goal)
             obj_pose = torch.tensor(
@@ -439,6 +492,9 @@ def main() -> None:
                     distance_threshold=args.distance_threshold,
                     goal_xy=tuple(args.goal_xy),
                     fps=args.video_fps,
+                    region_center_xy=(tuple(args.red_region_center_xy)
+                                      if args.red_region_center_xy is not None else None),
+                    region_size_xy=tester.red_region_size_xy,
                 )
 
         elapsed = time.time() - start_time

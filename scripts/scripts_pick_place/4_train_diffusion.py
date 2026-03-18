@@ -787,6 +787,7 @@ def train_with_lerobot_api(
     
     # Check if running in distributed mode
     is_main_process = True
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         is_main_process = (local_rank == 0)
@@ -1005,7 +1006,10 @@ def train_with_lerobot_api(
     print(f"  LeRobot dataset: {lerobot_dataset_dir}")
     print(f"  Output: {checkpoint_dir}")
     print(f"  Steps: {args.steps}")
-    print(f"  Batch size: {args.batch_size}")
+    print(f"  Batch size (per-GPU): {args.batch_size}")
+    print(f"  World size (num GPUs): {world_size}")
+    effective_bs = args.batch_size * world_size
+    print(f"  Effective batch size: {args.batch_size} x {world_size} = {effective_bs}")
     print(f"  Learning rate: {args.lr}")
     print(f"  Image shape: ({image_height}, {image_width})")
     print(f"  Has wrist camera: {has_wrist}")

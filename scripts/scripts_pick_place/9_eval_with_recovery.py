@@ -94,7 +94,7 @@ def _parse_args() -> argparse.Namespace:
                         help="Maximum steps per task attempt.")
     parser.add_argument("--height_threshold", type=float, default=0.15,
                         help="Minimum object z-position threshold.")
-    parser.add_argument("--distance_threshold", type=float, default=0.05,
+    parser.add_argument("--distance_threshold", type=float, default=0.03,
                         help="Maximum distance from target for success.")
 
     # Environment settings

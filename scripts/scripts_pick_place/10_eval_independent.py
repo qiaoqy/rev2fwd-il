@@ -59,7 +59,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=400,
                         help="Maximum steps per episode.")
     parser.add_argument("--height_threshold", type=float, default=0.15)
-    parser.add_argument("--distance_threshold", type=float, default=0.05)
+    parser.add_argument("--distance_threshold", type=float, default=0.03)
     parser.add_argument("--goal_xy", type=float, nargs=2, default=[0.5, 0.0])
     parser.add_argument(
         "--fixed_start_xy",

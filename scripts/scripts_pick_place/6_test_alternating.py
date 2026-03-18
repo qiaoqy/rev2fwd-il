@@ -137,8 +137,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--distance_threshold",
         type=float,
-        default=0.05,
-        help="Maximum distance from target for success. Default: 0.05m.",
+        default=0.03,
+        help="Maximum distance from target for success. Default: 0.03m.",
     )
 
     # Environment settings
@@ -1229,10 +1229,10 @@ class AlternatingTester:
                 success = True
                 success_step = t + 1
                 print(f"    [{task_name}] ✓ SUCCESS at step {t+1}")
-                # Success! Execute 20 more frames and record them.
-                # Record 20 additional frames after success
-                print(f"    [{task_name}] Recording 20 additional frames after success...")
-                for extra_t in range(20):
+                # Success! Execute 50 more frames and record them
+                # (includes arm returning toward home position).
+                print(f"    [{task_name}] Recording 50 additional frames after success...")
+                for extra_t in range(50):
                     # Get observation
                     table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
                     
@@ -1339,10 +1339,17 @@ class AlternatingTester:
     def _is_xy_inside_region(
         self, xy: np.ndarray, center_xy: Tuple[float, float], size_xy: Tuple[float, float]
     ) -> bool:
-        """Check whether *xy* falls inside an axis-aligned rectangle."""
+        """Check whether *xy* (cube center) falls inside the region shrunk by cube_half_size.
+
+        The region is shrunk by cube_half_size=0.02 on each side so that the
+        cube body stays fully inside the rectangle, consistent with the
+        sampling logic in 1_collect_data_pick_place.py.
+        """
+        cube_half_size = 0.02  # DexCube 0.05 * scale 0.8 = 0.04 edge, half = 0.02
         cx, cy = float(center_xy[0]), float(center_xy[1])
         sx, sy = float(size_xy[0]), float(size_xy[1])
-        half_x, half_y = sx * 0.5, sy * 0.5
+        half_x = max(sx * 0.5 - cube_half_size, 0.0)
+        half_y = max(sy * 0.5 - cube_half_size, 0.0)
         return bool(abs(xy[0] - cx) <= half_x and abs(xy[1] - cy) <= half_y)
 
     def check_task_B_success(self) -> bool:
@@ -1407,11 +1414,16 @@ class AlternatingTester:
         center_xy: Tuple[float, float],
         size_xy: Tuple[float, float],
     ) -> Tuple[float, float]:
-        """Uniformly sample XY inside an axis-aligned rectangle."""
+        """Uniformly sample XY inside rectangle shrunk by cube_half_size.
+
+        Matches the sampling in 1_collect_data_pick_place.py so that the
+        cube body stays fully within the visual region boundary.
+        """
+        cube_half_size = 0.02  # DexCube 0.05 * scale 0.8 = 0.04 edge, half = 0.02
         cx, cy = float(center_xy[0]), float(center_xy[1])
         sx, sy = float(size_xy[0]), float(size_xy[1])
-        half_x = max(sx, 1e-6) * 0.5
-        half_y = max(sy, 1e-6) * 0.5
+        half_x = max(sx * 0.5 - cube_half_size, 0.0)
+        half_y = max(sy * 0.5 - cube_half_size, 0.0)
         x = self.rng.uniform(cx - half_x, cx + half_x)
         y = self.rng.uniform(cy - half_y, cy + half_y)
         return (x, y)
