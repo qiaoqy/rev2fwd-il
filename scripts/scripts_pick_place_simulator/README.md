@@ -566,16 +566,17 @@ Phase 2: 初始训练 (并行)
   ├── GPU_A: 训练 Policy A (4_train.py, 使用反转后的 Task A 数据)
   └── GPU_B: 训练 Policy B (4_train.py, 使用原始 Task B 数据)
 
-Phase 3: 迭代改进 (N 轮)
-  ├── Step 1: Cyclic 评估 + 数据收集 (6_eval_cyclic.py)
+Phase 3: 迭代改进 (N 轮, 每轮 3 个评估并行)
+  ├── Step 1 (并行, 3 GPU):
+  │   ├── GPU_1: Cyclic 评估 + 数据收集 (6_eval_cyclic.py)
+  │   ├── GPU_2: Fair test Task A (7_eval_fair.py --task A)
+  │   └── GPU_3: Fair test Task B (7_eval_fair.py --task B)
   ├── Step 2: 数据聚合 (5_finetune.py --prepare_only)
   ├── Step 3: 恢复训练 A (4_train.py --resume)
   ├── Step 4: 恢复训练 B (4_train.py --resume)
-  └── Step 5: 记录指标, 旋转 checkpoint 目录
+  └── Step 5: 记录指标 (cyclic + fair test), 旋转 checkpoint 目录
 
-Phase 4: 公平测试
-  ├── GPU_A: Fair test Task A (7_eval_fair.py --task A)
-  └── GPU_B: Fair test Task B (7_eval_fair.py --task B)
+Phase 4: (已合并到 Phase 3 的每轮评估中)
 
 Phase 5: 失效分析 (按需手动执行)
   └── 8_eval_failure_analysis.py --task A/B
@@ -655,9 +656,11 @@ data/pick_place_isaac_lab_simulation/expXX/
 ├── iter1_collect_A.npz                # 第1轮收集的 Task A rollout
 ├── iter1_collect_B.npz
 ├── iter1_collect_A.stats.json
-├── fair_test_A.stats.json
-├── fair_test_B.stats.json
-├── record.json                        # 迭代指标记录
+├── iter1_fair_A.stats.json            # 第1轮 Fair test A 结果
+├── iter1_fair_B.stats.json            # 第1轮 Fair test B 结果
+├── fair_test_A.stats.json             # 最新 Fair test A (从最后一轮复制)
+├── fair_test_B.stats.json             # 最新 Fair test B (从最后一轮复制)
+├── record.json                        # 迭代指标记录 (含 cyclic + fair test)
 ├── collection_curve.png               # 成功率曲线图
 ├── logs/
 │   ├── pipeline.log
@@ -666,6 +669,8 @@ data/pick_place_isaac_lab_simulation/expXX/
 │   ├── train_A.log
 │   ├── train_B.log
 │   ├── iter1_collect.log
+│   ├── iter1_fair_A.log               # 第1轮 Fair test A 日志
+│   ├── iter1_fair_B.log               # 第1轮 Fair test B 日志
 │   ├── iter1_train_A.log
 │   ├── fair_test_A.log
 │   └── fair_test_B.log

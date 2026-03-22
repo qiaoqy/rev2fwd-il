@@ -7,8 +7,6 @@ episodes.  Only produces a statistics JSON (no rollout NPZ).
 Mode 3 only (red rectangle region).
 
 Usage:
-    conda activate rev2fwd_il
-
     # Task A
     CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place_simulator/7_eval_fair.py \\
         --policy weights/PP_A/checkpoints/checkpoints/last/pretrained_model \\
@@ -48,9 +46,9 @@ def _parse_args() -> argparse.Namespace:
                         help="Output statistics JSON path.")
 
     parser.add_argument("--num_episodes", type=int, default=50)
-    parser.add_argument("--horizon", type=int, default=1500)
+    parser.add_argument("--horizon", type=int, default=1200)
     parser.add_argument("--distance_threshold", type=float, default=0.03)
-    parser.add_argument("--n_action_steps", type=int, default=8)
+    parser.add_argument("--n_action_steps", type=int, default=16)
 
     # Region (Mode 3)
     parser.add_argument("--goal_xy", type=float, nargs=2, default=[0.5, -0.2])

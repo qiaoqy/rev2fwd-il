@@ -8,7 +8,6 @@ next task.  Successful rollout episodes are saved for later finetune.
 Mode 3 only (red rectangle region).  DDIM policies assumed.
 
 Usage:
-    conda activate rev2fwd_il
     CUDA_VISIBLE_DEVICES=0 python scripts/scripts_pick_place_simulator/6_eval_cyclic.py \\
         --policy_A weights/PP_A/checkpoints/checkpoints/last/pretrained_model \\
         --policy_B weights/PP_B/checkpoints/checkpoints/last/pretrained_model \\
@@ -47,11 +46,11 @@ def _parse_args() -> argparse.Namespace:
 
     # Test parameters
     parser.add_argument("--num_cycles", type=int, default=50)
-    parser.add_argument("--horizon", type=int, default=1500,
-                        help="Max steps per task (default: 1500).")
+    parser.add_argument("--horizon", type=int, default=1200,
+                        help="Max steps per task (default: 1200).")
     parser.add_argument("--distance_threshold", type=float, default=0.03)
-    parser.add_argument("--n_action_steps", type=int, default=8,
-                        help="Inference action steps (default: 8, see README §1.4).")
+    parser.add_argument("--n_action_steps", type=int, default=16,
+                        help="Inference action steps (default: 16).")
 
     # Region (Mode 3 fixed defaults)
     parser.add_argument("--goal_xy", type=float, nargs=2, default=[0.5, -0.2])

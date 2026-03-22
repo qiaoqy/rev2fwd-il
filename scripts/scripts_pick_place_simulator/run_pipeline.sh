@@ -15,7 +15,6 @@
 #   通过 .done_{phase} 标记文件跟踪进度。崩溃后直接重新运行即可恢复。
 #
 # 使用示例:
-#   conda activate rev2fwd_il
 #   CUDA_VISIBLE_DEVICES=0,1 bash scripts/scripts_pick_place_simulator/run_pipeline.sh
 #
 # =============================================================================
@@ -50,7 +49,7 @@ NUM_COLLECT_EPISODES=100
 BATCH_SIZE=${BATCH_SIZE:-128}
 LR=${LR:-1e-4}
 TRAIN_N_ACTION_STEPS=16
-EVAL_N_ACTION_STEPS=8
+EVAL_N_ACTION_STEPS=16
 TARGET_EPOCHS=500
 STEPS_PER_ITER=5000
 
@@ -61,12 +60,18 @@ NUM_INFERENCE_STEPS=10
 # --- Iteration ---
 ITER_ROUNDS=10
 NUM_CYCLES=50
-HORIZON=1500
+HORIZON=1200
 
 # --- GPU ---
 TRAIN_GPUS="${CUDA_VISIBLE_DEVICES:-0,1}"
 NUM_TRAIN_GPUS=$(echo "$TRAIN_GPUS" | tr ',' '\n' | wc -l)
 COLLECT_GPU=${COLLECT_GPU:-0}
+
+# Parse individual GPUs for parallel evaluation (use GPUs [1],[2],[3] from the list)
+IFS=',' read -ra _GPU_LIST <<< "$TRAIN_GPUS"
+EVAL_GPU_1="${_GPU_LIST[1]:-$COLLECT_GPU}"
+EVAL_GPU_2="${_GPU_LIST[2]:-$COLLECT_GPU}"
+EVAL_GPU_3="${_GPU_LIST[3]:-$COLLECT_GPU}"
 
 # --- NCCL robustness ---
 export NCCL_P2P_DISABLE=1
@@ -159,6 +164,8 @@ append_record() {
     local stats_file=$2
     local step_A=$3
     local step_B=$4
+    local fair_A_file=${5:-}
+    local fair_B_file=${6:-}
 
     python3 << PYEOF
 import json
@@ -171,6 +178,7 @@ entry = {
     "iteration": $iteration,
     "checkpoint_info": {"policy_A_step": $step_A, "policy_B_step": $step_B},
     "performance_metrics": {},
+    "fair_test_metrics": {},
 }
 
 sf = Path("$stats_file")
@@ -191,6 +199,23 @@ else:
         total_task_A_episodes=0, total_task_B_episodes=0,
     )
 
+# Fair test metrics
+fm = entry["fair_test_metrics"]
+fa = Path("$fair_A_file") if "$fair_A_file" else None
+fb = Path("$fair_B_file") if "$fair_B_file" else None
+if fa and fa.exists():
+    with open(fa) as f:
+        d = json.load(f)
+    fm["fair_A_success_rate"] = d.get("success_rate", 0)
+    fm["fair_A_num_success"] = d.get("num_success", 0)
+    fm["fair_A_num_total"] = d.get("num_total", 0)
+if fb and fb.exists():
+    with open(fb) as f:
+        d = json.load(f)
+    fm["fair_B_success_rate"] = d.get("success_rate", 0)
+    fm["fair_B_num_success"] = d.get("num_success", 0)
+    fm["fair_B_num_total"] = d.get("num_total", 0)
+
 # Replace existing entry for this iteration (idempotent on re-run)
 rec["iterations"] = [i for i in rec["iterations"] if i["iteration"] != $iteration]
 rec["iterations"].append(entry)
@@ -199,8 +224,13 @@ rec["iterations"].sort(key=lambda x: x["iteration"])
 with open("$RECORD_FILE", "w") as f:
     json.dump(rec, f, indent=2)
 
-m = entry["performance_metrics"]
-print(f"  Recorded iter $iteration: A={m['task_A_success_rate']*100:.1f}%  B={m['task_B_success_rate']*100:.1f}%")
+pm = entry["performance_metrics"]
+fm = entry.get("fair_test_metrics", {})
+cyclic_str = f"cyclic A={pm['task_A_success_rate']*100:.1f}% B={pm['task_B_success_rate']*100:.1f}%"
+fair_str = ""
+if fm:
+    fair_str = f"  fair A={fm.get('fair_A_success_rate',0)*100:.1f}% B={fm.get('fair_B_success_rate',0)*100:.1f}%"
+print(f"  Recorded iter $iteration: {cyclic_str}{fair_str}")
 PYEOF
 }
 
@@ -283,6 +313,8 @@ run_resume_train() {
         --batch_size $BATCH_SIZE \
         --lr $LR \
         --n_action_steps $TRAIN_N_ACTION_STEPS \
+        --noise_scheduler_type $NOISE_SCHEDULER_TYPE \
+        --num_inference_steps $NUM_INFERENCE_STEPS \
         --save_freq $EXTRA_STEPS \
         --skip_convert --resume --wandb \
         --wandb_project "$WANDB_PROJECT" \
@@ -528,42 +560,116 @@ for iter in $(seq 1 $ITER_ROUNDS); do
     ROLLOUT_B="${BASE_DIR}/iter${iter}_collect_B.npz"
     STATS="${ROLLOUT_A%.npz}.stats.json"
 
-    # --- Step 3.1: Cyclic evaluation + data collection ---
+    # --- Step 3.1: Parallel evaluation (cyclic + fair A + fair B) ---
+    FAIR_A_ITER="${BASE_DIR}/iter${iter}_fair_A.stats.json"
+    FAIR_B_ITER="${BASE_DIR}/iter${iter}_fair_B.stats.json"
+
     if ! phase_done "iter${iter}_eval"; then
-        log "Cyclic evaluation ($NUM_CYCLES cycles)..."
         CKPT_A=$(get_ckpt "$PA_TEMP")
         CKPT_B=$(get_ckpt "$PB_TEMP")
         STEP_A=$(get_step "$PA_TEMP")
         STEP_B=$(get_step "$PB_TEMP")
         log "Policy A (step $STEP_A): $CKPT_A"
         log "Policy B (step $STEP_B): $CKPT_B"
+        log "Launching 3 parallel evals on GPUs $EVAL_GPU_1, $EVAL_GPU_2, $EVAL_GPU_3..."
 
-        CUDA_VISIBLE_DEVICES=$COLLECT_GPU python "${SCRIPT_DIR}/6_eval_cyclic.py" \
-            --policy_A "$CKPT_A" \
-            --policy_B "$CKPT_B" \
-            --out_A "$ROLLOUT_A" \
-            --out_B "$ROLLOUT_B" \
-            --num_cycles $NUM_CYCLES \
-            --horizon $HORIZON \
-            --distance_threshold $DISTANCE_THRESHOLD \
-            --n_action_steps $EVAL_N_ACTION_STEPS \
-            --goal_xy $GOAL_X $GOAL_Y \
-            --red_region_center_xy $RED_REGION_CENTER_X $RED_REGION_CENTER_Y \
-            --red_region_size_xy $RED_REGION_SIZE_X $RED_REGION_SIZE_Y \
-            $HEADLESS \
-            2>&1 | tee "${LOG_DIR}/iter${iter}_collect.log"
+        # --- Cyclic eval on EVAL_GPU_1 ---
+        (
+            CUDA_VISIBLE_DEVICES=$EVAL_GPU_1 python "${SCRIPT_DIR}/6_eval_cyclic.py" \
+                --policy_A "$CKPT_A" \
+                --policy_B "$CKPT_B" \
+                --out_A "$ROLLOUT_A" \
+                --out_B "$ROLLOUT_B" \
+                --num_cycles $NUM_CYCLES \
+                --horizon $HORIZON \
+                --distance_threshold $DISTANCE_THRESHOLD \
+                --n_action_steps $EVAL_N_ACTION_STEPS \
+                --goal_xy $GOAL_X $GOAL_Y \
+                --red_region_center_xy $RED_REGION_CENTER_X $RED_REGION_CENTER_Y \
+                --red_region_size_xy $RED_REGION_SIZE_X $RED_REGION_SIZE_Y \
+                $HEADLESS \
+                2>&1 | tee "${LOG_DIR}/iter${iter}_collect.log"
+        ) &
+        CYCLIC_PID=$!
 
-        append_record $iter "$STATS" $STEP_A $STEP_B
+        # --- Fair test A on EVAL_GPU_2 ---
+        (
+            CUDA_VISIBLE_DEVICES=$EVAL_GPU_2 python "${SCRIPT_DIR}/7_eval_fair.py" \
+                --policy "$CKPT_A" \
+                --task A \
+                --num_episodes 50 \
+                --horizon $HORIZON \
+                --distance_threshold $DISTANCE_THRESHOLD \
+                --n_action_steps $EVAL_N_ACTION_STEPS \
+                --goal_xy $GOAL_X $GOAL_Y \
+                --red_region_center_xy $RED_REGION_CENTER_X $RED_REGION_CENTER_Y \
+                --red_region_size_xy $RED_REGION_SIZE_X $RED_REGION_SIZE_Y \
+                --out "$FAIR_A_ITER" \
+                $HEADLESS \
+                2>&1 | tee "${LOG_DIR}/iter${iter}_fair_A.log"
+        ) &
+        FAIR_A_PID=$!
 
+        # --- Fair test B on EVAL_GPU_3 ---
+        (
+            CUDA_VISIBLE_DEVICES=$EVAL_GPU_3 python "${SCRIPT_DIR}/7_eval_fair.py" \
+                --policy "$CKPT_B" \
+                --task B \
+                --num_episodes 50 \
+                --horizon $HORIZON \
+                --distance_threshold $DISTANCE_THRESHOLD \
+                --n_action_steps $EVAL_N_ACTION_STEPS \
+                --goal_xy $GOAL_X $GOAL_Y \
+                --red_region_center_xy $RED_REGION_CENTER_X $RED_REGION_CENTER_Y \
+                --red_region_size_xy $RED_REGION_SIZE_X $RED_REGION_SIZE_Y \
+                --out "$FAIR_B_ITER" \
+                $HEADLESS \
+                2>&1 | tee "${LOG_DIR}/iter${iter}_fair_B.log"
+        ) &
+        FAIR_B_PID=$!
+
+        # --- Wait for all three ---
+        EVAL_FAILED=0
+        if ! wait $CYCLIC_PID; then
+            log "ERROR: Cyclic eval failed!"; EVAL_FAILED=1
+        fi
+        if ! wait $FAIR_A_PID; then
+            log "ERROR: Fair test A failed!"; EVAL_FAILED=1
+        fi
+        if ! wait $FAIR_B_PID; then
+            log "ERROR: Fair test B failed!"; EVAL_FAILED=1
+        fi
+        if [ $EVAL_FAILED -ne 0 ]; then
+            log "FATAL: One or more eval processes failed at iteration $iter"
+            exit 1
+        fi
+
+        # Record metrics (cyclic + fair test)
+        append_record $iter "$STATS" $STEP_A $STEP_B "$FAIR_A_ITER" "$FAIR_B_ITER"
+
+        # Print summary
         if [ -f "$STATS" ]; then
             python3 -c "
 import json
 with open('$STATS') as f:
     s = json.load(f)['summary']
-print(f'  A: {s[\"task_A_success_count\"]}/{s[\"total_task_A_episodes\"]} = {s[\"task_A_success_rate\"]*100:.1f}%')
-print(f'  B: {s[\"task_B_success_count\"]}/{s[\"total_task_B_episodes\"]} = {s[\"task_B_success_rate\"]*100:.1f}%')
+print(f'  Cyclic: A={s[\"task_A_success_count\"]}/{s[\"total_task_A_episodes\"]}={s[\"task_A_success_rate\"]*100:.1f}%  B={s[\"task_B_success_count\"]}/{s[\"total_task_B_episodes\"]}={s[\"task_B_success_rate\"]*100:.1f}%')
 "
         fi
+        for ff in "$FAIR_A_ITER" "$FAIR_B_ITER"; do
+            if [ -f "$ff" ]; then
+                python3 -c "
+import json
+with open('$ff') as fh:
+    d = json.load(fh)
+print(f'  Fair {d[\"task\"]}: {d[\"num_success\"]}/{d[\"num_total\"]}={d[\"success_rate\"]*100:.1f}%')
+"
+            fi
+        done
+
+        # Copy latest fair test results for compatibility
+        [ -f "$FAIR_A_ITER" ] && cp "$FAIR_A_ITER" "${BASE_DIR}/fair_test_A.stats.json"
+        [ -f "$FAIR_B_ITER" ] && cp "$FAIR_B_ITER" "${BASE_DIR}/fair_test_B.stats.json"
 
         mark_done "iter${iter}_eval"
     else
@@ -595,57 +701,10 @@ done
 
 log "Phase 3 complete."
 
-# =============================================================================
-# Phase 4: Fair Test
-# =============================================================================
-print_header "Phase 4: Fair Test"
-
+# Print final fair test results
+print_header "Final Fair Test Results"
 FAIR_A="${BASE_DIR}/fair_test_A.stats.json"
 FAIR_B="${BASE_DIR}/fair_test_B.stats.json"
-
-if ! phase_done phase4_fair_A; then
-    log "Fair test: Task A (50 episodes)..."
-    CKPT_A=$(get_ckpt "$PA_TEMP")
-    CUDA_VISIBLE_DEVICES=$COLLECT_GPU python "${SCRIPT_DIR}/7_eval_fair.py" \
-        --policy "$CKPT_A" \
-        --task A \
-        --num_episodes 50 \
-        --horizon $HORIZON \
-        --distance_threshold $DISTANCE_THRESHOLD \
-        --n_action_steps $EVAL_N_ACTION_STEPS \
-        --goal_xy $GOAL_X $GOAL_Y \
-        --red_region_center_xy $RED_REGION_CENTER_X $RED_REGION_CENTER_Y \
-        --red_region_size_xy $RED_REGION_SIZE_X $RED_REGION_SIZE_Y \
-        --out "$FAIR_A" \
-        $HEADLESS \
-        2>&1 | tee "${LOG_DIR}/fair_test_A.log"
-    mark_done phase4_fair_A
-else
-    log "[Skip] Fair test A already done"
-fi
-
-if ! phase_done phase4_fair_B; then
-    log "Fair test: Task B (50 episodes)..."
-    CKPT_B=$(get_ckpt "$PB_TEMP")
-    CUDA_VISIBLE_DEVICES=$COLLECT_GPU python "${SCRIPT_DIR}/7_eval_fair.py" \
-        --policy "$CKPT_B" \
-        --task B \
-        --num_episodes 50 \
-        --horizon $HORIZON \
-        --distance_threshold $DISTANCE_THRESHOLD \
-        --n_action_steps $EVAL_N_ACTION_STEPS \
-        --goal_xy $GOAL_X $GOAL_Y \
-        --red_region_center_xy $RED_REGION_CENTER_X $RED_REGION_CENTER_Y \
-        --red_region_size_xy $RED_REGION_SIZE_X $RED_REGION_SIZE_Y \
-        --out "$FAIR_B" \
-        $HEADLESS \
-        2>&1 | tee "${LOG_DIR}/fair_test_B.log"
-    mark_done phase4_fair_B
-else
-    log "[Skip] Fair test B already done"
-fi
-
-# Print fair test results
 for f in "$FAIR_A" "$FAIR_B"; do
     if [ -f "$f" ]; then
         python3 -c "
@@ -656,8 +715,6 @@ print(f'  Task {d[\"task\"]}: {d[\"num_success\"]}/{d[\"num_total\"]} = {d[\"suc
 "
     fi
 done
-
-log "Phase 4 complete."
 
 # =============================================================================
 # Done
@@ -690,9 +747,14 @@ if rf.exists():
         rec = json.load(f)
     iters = rec.get("iterations", [])
     if iters:
-        print("  Iter  |  Task A  |  Task B")
-        print("  ------|----------|--------")
+        print("  Iter  | Cyclic A | Cyclic B | Fair A   | Fair B")
+        print("  ------|----------|----------|----------|--------")
         for it in iters:
             m = it["performance_metrics"]
-            print(f"  {it['iteration']:4d}  |  {m['task_A_success_rate']*100:5.1f}%  |  {m['task_B_success_rate']*100:5.1f}%")
+            fm = it.get("fair_test_metrics", {})
+            ca = f"{m['task_A_success_rate']*100:5.1f}%" if m.get('task_A_success_rate') else "  N/A"
+            cb = f"{m['task_B_success_rate']*100:5.1f}%" if m.get('task_B_success_rate') else "  N/A"
+            fa = f"{fm['fair_A_success_rate']*100:5.1f}%" if fm.get('fair_A_success_rate') is not None else "  N/A"
+            fb = f"{fm['fair_B_success_rate']*100:5.1f}%" if fm.get('fair_B_success_rate') is not None else "  N/A"
+            print(f"  {it['iteration']:4d}  | {ca:>8s} | {cb:>8s} | {fa:>8s} | {fb:>6s}")
 PYSUMMARY
