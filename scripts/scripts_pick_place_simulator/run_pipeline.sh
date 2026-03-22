@@ -189,14 +189,14 @@ if sf.exists():
     pm = entry["performance_metrics"]
     for k in ("task_A_success_rate", "task_B_success_rate",
               "task_A_success_count", "task_B_success_count",
-              "total_task_A_episodes", "total_task_B_episodes",
+              "total_cycles",
               "total_elapsed_seconds"):
         pm[k] = s.get(k, 0)
 else:
     entry["performance_metrics"] = dict(
         task_A_success_rate=0, task_B_success_rate=0,
         task_A_success_count=0, task_B_success_count=0,
-        total_task_A_episodes=0, total_task_B_episodes=0,
+        total_cycles=0,
     )
 
 # Fair test metrics
@@ -659,7 +659,7 @@ for iter in $(seq 1 $ITER_ROUNDS); do
 import json
 with open('$STATS') as f:
     s = json.load(f)['summary']
-print(f'  Cyclic: A={s[\"task_A_success_count\"]}/{s[\"total_task_A_episodes\"]}={s[\"task_A_success_rate\"]*100:.1f}%  B={s[\"task_B_success_count\"]}/{s[\"total_task_B_episodes\"]}={s[\"task_B_success_rate\"]*100:.1f}%')
+print(f'  Cyclic: A={s[\"task_A_success_count\"]}/{s[\"total_cycles\"]}={s[\"task_A_success_rate\"]*100:.1f}%  B={s[\"task_B_success_count\"]}/{s[\"total_cycles\"]}={s[\"task_B_success_rate\"]*100:.1f}%')
 "
         fi
         for ff in "$FAIR_A_ITER" "$FAIR_B_ITER"; do
