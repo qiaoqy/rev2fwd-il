@@ -123,6 +123,227 @@
 
 ---
 
+## 关键公式详解
+
+> 本节对文档中涉及的所有核心数学公式进行逐一推导和直觉解释。
+> 建议结合上方术语表和后续的伪代码一起阅读。
+
+### F1. Diffusion Policy 训练目标（Score Matching / 噪声预测）
+
+BC 预训练阶段，Diffusion Policy 的训练目标是**让去噪网络学会预测"加了多少噪声"**。
+
+**前向加噪过程**: 给专家动作 $a_0$ 加上不同程度的噪声：
+
+$$x_t = \sqrt{\bar{\alpha}_t}\, a_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+
+- $a_0$: 示范数据中的真实动作（16 步 action chunk, 形状 $16 \times 8$）
+- $t$: 噪声时间步（$t=0$ 表示干净, $t=T$ 表示纯噪声）
+- $\bar{\alpha}_t$: 噪声调度参数, $\bar{\alpha}_t = \prod_{i=1}^{t} \alpha_i$, 随 $t$ 增大而减小
+- 直觉: $t$ 越大, $\sqrt{\bar{\alpha}_t}$ 越小 → 原始信号被压缩越多, $\sqrt{1 - \bar{\alpha}_t}$ 越大 → 噪声成分越大
+
+**训练 Loss (简单版本)**:
+
+$$\mathcal{L}_{BC} = \mathbb{E}_{t, \epsilon, a_0} \left[ \left\| \epsilon_\theta(x_t, t, s) - \epsilon \right\|^2 \right]$$
+
+- $\epsilon_\theta$: 去噪网络（我们要训练的 U-Net），输入带噪动作 $x_t$、时间步 $t$、观测 $s$
+- $\epsilon$: 真正加进去的噪声（ground truth）
+- 直觉: **让网络猜 "我加了什么噪声"，猜得越准越好**
+- 从 score matching 角度: $\epsilon_\theta \approx -\sqrt{1-\bar{\alpha}_t} \nabla_{x_t} \log p(x_t|s)$，即学习数据分布的梯度场
+
+### F2. DDIM 去噪采样公式（推理时用）
+
+训练好之后，推理时从纯噪声 $x_T \sim \mathcal{N}(0,I)$ 出发，逐步去噪得到干净动作 $x_0$。
+
+**DDIM 单步更新** (从 $x_t$ 到 $x_{t-1}$):
+
+$$x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \underbrace{\left( \frac{x_t - \sqrt{1-\bar{\alpha}_t}\, \epsilon_\theta(x_t, t, s)}{\sqrt{\bar{\alpha}_t}} \right)}_{\text{predicted } x_0} + \sqrt{1 - \bar{\alpha}_{t-1}} \cdot \underbrace{\epsilon_\theta(x_t, t, s)}_{\text{predicted noise direction}}$$
+
+拆解三步理解:
+
+1. **估计干净动作 $\hat{x}_0$**: 先用网络预测噪声 $\epsilon_\theta$，然后"减掉"噪声得到对 $x_0$ 的估计:
+$$\hat{x}_0 = \frac{x_t - \sqrt{1-\bar{\alpha}_t}\, \epsilon_\theta}{\sqrt{\bar{\alpha}_t}}$$
+> 直觉: "如果噪声是这些，那原来的干净数据应该长这样"
+
+2. **重新加噪到 $t$$-1$ 级别**: 把 $\hat{x}_0$ 和噪声方向按 $t-1$ 对应的比例混合，得到 $x_{t-1}$
+> 直觉: "不一步跳到干净，而是只去掉一点点噪声，稳步推进"
+
+3. **DDIM 是确定性的**: 没有额外随机噪声项（区别于 DDPM），同一初始噪声 → 同一动作输出
+
+本项目用 $K=10$ 步 DDIM，即在 $[T, \ldots, 1]$ 中均匀选 10 个时间步做去噪。
+
+### F3. Bellman 方程与 TD Target（方案 A 的 Critic 训练）
+
+Q-network 的训练目标：让 $Q(s,a)$ 逼近 **真实的累积折扣回报**。
+
+**Bellman 最优方程**:
+
+$$Q^*(s, a) = \mathbb{E}\left[ r + \gamma \max_{a'} Q^*(s', a') \right]$$
+
+> 直觉: "在状态 $s$ 做动作 $a$ 的总价值 = 立刻拿到的 reward $r$ + 未来所有 reward 的折扣总和"
+
+**实际训练用的 TD Target (TD3 风格, Clipped Double-Q)**:
+
+$$y = r + \gamma \cdot \min\left( \bar{Q}_{\phi_1}(s', a'), \; \bar{Q}_{\phi_2}(s', a') \right)$$
+
+其中:
+- $a' = \pi_\theta(s') + \text{clip}(\epsilon, -c, c), \quad \epsilon \sim \mathcal{N}(0, \sigma^2)$
+  → 下一步动作由 policy 生成 + clipped 噪声（Target Policy Smoothing）
+- $\bar{Q}_{\phi_1}, \bar{Q}_{\phi_2}$: 两个**目标 Q 网络**（EMA 慢更新版本）
+- $\min(\cdot, \cdot)$: 取两个 Q 的较小值
+
+> **为什么取 min?** Q 网络天生倾向于**过度乐观**（高估 Q 值），因为 max 操作会放大估计误差。
+> 取两个独立 Q 网络的较小者 → 相当于对乐观估计做了保守修正。这是 TD3 (Twin Delayed DDPG) 的核心贡献。
+
+**Critic Loss**:
+
+$$\mathcal{L}_{critic} = \frac{1}{N}\sum_{i=1}^{N} \left[ \left( Q_{\phi_1}(s_i, a_i) - y_i \right)^2 + \left( Q_{\phi_2}(s_i, a_i) - y_i \right)^2 \right]$$
+
+> 直觉: 让两个 Q 网络的预测都尽量接近 TD target $y$。
+
+### F4. Actor Loss — Critic-Guided Diffusion（方案 A 的 Actor 更新）
+
+用 Q 网络的梯度来引导 Diffusion Policy 生成更好的动作:
+
+$$\mathcal{L}_{actor} = -\underbrace{\frac{1}{N}\sum_{i=1}^{N} Q_{\phi_1}(s_i, \pi_\theta(s_i))}_{\text{RL 项: 最大化 Q 值}} + \lambda \underbrace{\mathcal{L}_{BC}(\theta)}_{\text{BC 正则化: 防遗忘}}$$
+
+- **RL 项** ($-Q$): 让 policy 生成的动作被 Q 网络打更高的分。负号是因为我们做梯度**下降**来**最大化** Q。
+  > 梯度流向: $Q_\phi$ 的梯度 → 经过动作 $a = \pi_\theta(s)$ → 反向传播到 policy 参数 $\theta$
+  > 关键: 整个 DDIM 去噪链必须保持可微分 (differentiable)
+
+- **BC 正则化** ($\lambda \mathcal{L}_{BC}$): 在示范数据上计算扩散训练 loss（§F1 的公式），防止 policy 偏离预训练太远
+  > $\lambda$ 退火策略: $\lambda: 2.0 \to 0.1$，初期以 BC 为主, 后期逐渐释放 RL 控制
+
+### F5. EMA 目标网络更新
+
+$$\bar{Q}_\phi \leftarrow \tau \cdot Q_\phi + (1 - \tau) \cdot \bar{Q}_\phi$$
+
+- $\tau = 0.005$ (非常小)
+- 每次只把主网络的 0.5% "混入"目标网络
+- 效果: 目标网络**非常缓慢**地追踪主网络，提供稳定的 TD target
+
+> 直觉: 如果直接用主 Q 网络算 TD target，会出现"自己给自己打分"的循环 → 训练不稳定。
+> 目标网络相当于一个"滞后版本的考官"，评判标准变化很慢，让训练更平稳。
+
+### F6. PPO Clipped Surrogate Loss（方案 B 核心）
+
+PPO 的核心: 限制每次策略更新的幅度，防止灾难性崩溃。
+
+**概率比 (importance ratio)**:
+
+$$r_t(\theta) = \frac{\pi_\theta(\text{action}_t \mid \text{state}_t)}{\pi_{\theta_{old}}(\text{action}_t \mid \text{state}_t)}$$
+
+- $r_t \approx 1$: 新旧策略对这个动作的概率差不多 → 更新幅度小
+- $r_t \gg 1$ 或 $r_t \ll 1$: 新旧策略差异很大 → 需要裁剪
+
+**Clipped Surrogate Loss**:
+
+$$\mathcal{L}_{clip} = -\mathbb{E}_t \left[ \min\left( r_t(\theta) \hat{A}_t, \;\; \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t \right) \right]$$
+
+- $\hat{A}_t$: advantage 估计（动作比平均好多少），详见 §F7
+- $\epsilon = 0.2$: 裁剪范围, 即 $r_t$ 被限制在 $[0.8, 1.2]$
+
+> **直觉解释 (分两种情况)**:
+> - **$\hat{A}_t > 0$ (好动作)**: 我们想增加这个动作的概率 (增大 $r_t$)，
+>   但 clip 限制 $r_t \leq 1.2$ → 最多增加 20% 的概率，防止过度集中
+> - **$\hat{A}_t < 0$ (坏动作)**: 我们想减少这个动作的概率 (减小 $r_t$)，
+>   但 clip 限制 $r_t \geq 0.8$ → 最多减少 20% 的概率，防止过度回避
+>
+> 为什么取 min? 因为 clip 只在"更新有利于目标函数"时起作用。
+> 如果 unclipped 已经比 clipped 差了，就用 unclipped (不额外帮倒忙)。
+
+**在去噪 MDP 中的应用**: 这里的 state = $(x_k, s)$ (噪声动作 + 环境观测),
+action = $\epsilon_k$ (去噪网络的输出), 概率比通过高斯 log-prob 计算:
+
+$$r_k(\theta) = \exp\left( \log \pi_\theta(\epsilon_k | x_k, k, s) - \log \pi_{\theta_{old}}(\epsilon_k | x_k, k, s) \right)$$
+
+### F7. GAE — 广义优势估计（方案 B 用于计算 Advantage）
+
+**Advantage** 衡量"这个动作比平均水平好多少":
+
+$$A(s, a) = Q(s, a) - V(s)$$
+
+> 直觉: $Q$ 是"做了这个动作能拿多少分", $V$ 是"平均能拿多少分"。
+> $A > 0$: 好于平均; $A < 0$: 差于平均。
+
+**TD 残差 (单步 advantage 估计)**:
+
+$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$$
+
+> 直觉: "实际拿到的 $r_t$ + 未来估值" vs "之前对当前状态的估值"。$\delta_t > 0$ 说明情况比预期好。
+
+**GAE (多步平滑版)**:
+
+$$\hat{A}_t^{GAE} = \sum_{l=0}^{T-t} (\gamma \lambda)^l \delta_{t+l}$$
+
+展开:
+$$\hat{A}_t = \delta_t + \gamma\lambda\, \delta_{t+1} + (\gamma\lambda)^2 \delta_{t+2} + \cdots$$
+
+- $\lambda = 0.95$: GAE 的平滑参数
+  - $\lambda = 0$: 只看 1 步 ($\hat{A}_t = \delta_t$), 偏差大(bias)但方差小(variance)
+  - $\lambda = 1$: 看到 episode 结束 (Monte Carlo return), 无偏但方差大
+  - $\lambda = 0.95$: 折中，主要看近处几步但也考虑远处
+
+**在去噪 MDP 中**: $t$ 是去噪步数 $(k = K, K-1, \ldots, 1, 0)$，只有 $k=0$ 有 reward。
+GAE 把最终的环境 reward 通过 $(\gamma\lambda)^k$ 衰减回传给前面的每一步去噪决策，
+让早期去噪步也知道"我这一步去噪做得好不好会影响最终结果"。
+
+### F8. PPO 总 Loss（方案 B 完整训练目标）
+
+$$\mathcal{L}_{total} = \underbrace{\mathcal{L}_{clip}}_{\text{policy 更新}} + c_1 \underbrace{\mathcal{L}_{value}}_{\text{Value 网络}} - c_2 \underbrace{\mathcal{H}[\pi_\theta]}_{\text{熵正则化}} + \beta \underbrace{\mathcal{L}_{KL}}_{\text{BC 正则化}}$$
+
+各项含义:
+
+| 项 | 公式 | 作用 |
+|----|------|------|
+| $\mathcal{L}_{clip}$ | 见 §F6 | 核心: 优化 policy, 限制更新幅度 |
+| $\mathcal{L}_{value}$ | $\frac{1}{N}\sum_i (V_\psi(s_i) - R_i)^2$ | 让 Value 网络的预测接近真实回报 |
+| $\mathcal{H}[\pi_\theta]$ | $-\mathbb{E}[\log \pi_\theta]$ | 熵奖励: 鼓励 policy 保持一定随机性, 避免过早收敛到次优解 |
+| $\mathcal{L}_{KL}$ | $\|\epsilon_\theta^{new} - \epsilon_\theta^{ref}\|^2$ | 约束去噪输出不偏离 BC 预训练太远 |
+
+系数: $c_1 = 0.5$, $c_2 = 0.01$, $\beta: 1.0 \to 0.01$ (退火)
+
+### F9. KL 正则化 / BC 正则化
+
+两种方案都使用 BC 正则化，但具体形式不同:
+
+**方案 A (显式 BC Loss)**:
+
+$$\mathcal{L}_{actor} = -Q_{\phi}(s, \pi_\theta(s)) + \lambda \cdot \mathbb{E}_{(s,a)\sim D_{demo}} \left[ \| \epsilon_\theta(x_t, t, s) - \epsilon \|^2 \right]$$
+
+> 在示范数据上保持扩散训练 loss，让 policy 不忘记"专家是怎么做的"
+
+**方案 B (MSE KL Penalty)**:
+
+$$\mathcal{L}_{KL} = \mathbb{E}_{x_k, k, s} \left[ \| \epsilon_\theta(x_k, k, s) - \epsilon_{ref}(x_k, k, s) \|^2 \right]$$
+
+> 对于相同输入，比较当前网络和冻结预训练网络的输出差异。差异越大，惩罚越重。
+>
+> 与真正的 KL 散度 $D_{KL}(\pi_\theta \| \pi_{ref})$ 的关系:
+> 如果去噪网络的输出分布是高斯的（均值为 $\epsilon_\theta$, 方差固定），
+> 则 MSE $\propto$ KL 散度。这是一种计算上更简单的近似。
+
+**退火策略的直觉**:
+```
+训练阶段:     初期 ────────────────→ 后期
+BC 权重 λ/β:   大 (2.0/1.0)          小 (0.1/0.01)
+训练行为:     紧贴 BC 预训练         释放 RL 优化
+类比:         学车时握着方向盘       慢慢放手让学员自己开
+```
+
+### F10. 折扣累积回报（Return）
+
+在 RL 中，我们真正要最大化的目标:
+
+$$G_t = \sum_{k=0}^{\infty} \gamma^k r_{t+k} = r_t + \gamma r_{t+1} + \gamma^2 r_{t+2} + \cdots$$
+
+- $\gamma = 0.99$: 很关注长期
+- $\gamma^{100} = 0.99^{100} \approx 0.366$: 100 步后的 reward 仍有 36.6% 的权重
+- $\gamma^{500} = 0.99^{500} \approx 0.0066$: 500 步后几乎忽略
+
+> 实际 pick-place episode 约 100-300 步，所以 $\gamma=0.99$ 意味着整个 episode 的 reward 都很重要。
+
+---
+
 ## 0. 背景分析
 
 ### 整体流程总览
