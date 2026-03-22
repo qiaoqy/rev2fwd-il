@@ -134,8 +134,8 @@ def reverse_episode(ep: dict) -> dict:
 
 # ── region helpers ───────────────────────────────────────────────────────
 def _is_xy_inside_region(xy, center_xy, size_xy) -> bool:
-    """Check whether cube center falls inside the region shrunk by cube_half_size."""
-    cube_half_size = 0.02  # DexCube 0.05 * scale 0.8 = 0.04 edge, half = 0.02
+    """Check whether cube center falls inside the region (no shrink)."""
+    cube_half_size = 0.0  # No shrink — full region acceptance
     cx, cy = float(center_xy[0]), float(center_xy[1])
     sx, sy = float(size_xy[0]), float(size_xy[1])
     half_x = max(sx * 0.5 - cube_half_size, 0.0)

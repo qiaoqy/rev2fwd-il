@@ -1339,13 +1339,12 @@ class AlternatingTester:
     def _is_xy_inside_region(
         self, xy: np.ndarray, center_xy: Tuple[float, float], size_xy: Tuple[float, float]
     ) -> bool:
-        """Check whether *xy* (cube center) falls inside the region shrunk by cube_half_size.
+        """Check whether *xy* (cube center) falls inside the region.
 
-        The region is shrunk by cube_half_size=0.02 on each side so that the
-        cube body stays fully inside the rectangle, consistent with the
-        sampling logic in 1_collect_data_pick_place.py.
+        cube_half_size = 0.02 so the region is shrunk to keep the cube body
+        fully inside the rectangle.
         """
-        cube_half_size = 0.02  # DexCube 0.05 * scale 0.8 = 0.04 edge, half = 0.02
+        cube_half_size = 0.02
         cx, cy = float(center_xy[0]), float(center_xy[1])
         sx, sy = float(size_xy[0]), float(size_xy[1])
         half_x = max(sx * 0.5 - cube_half_size, 0.0)
@@ -1414,12 +1413,12 @@ class AlternatingTester:
         center_xy: Tuple[float, float],
         size_xy: Tuple[float, float],
     ) -> Tuple[float, float]:
-        """Uniformly sample XY inside rectangle shrunk by cube_half_size.
+        """Uniformly sample XY inside rectangle.
 
-        Matches the sampling in 1_collect_data_pick_place.py so that the
-        cube body stays fully within the visual region boundary.
+        cube_half_size = 0.02 so the region is shrunk to keep the cube body
+        fully inside the rectangle.
         """
-        cube_half_size = 0.02  # DexCube 0.05 * scale 0.8 = 0.04 edge, half = 0.02
+        cube_half_size = 0.02
         cx, cy = float(center_xy[0]), float(center_xy[1])
         sx, sy = float(size_xy[0]), float(size_xy[1])
         half_x = max(sx * 0.5 - cube_half_size, 0.0)

@@ -944,6 +944,15 @@ def rollout_expert_B_with_goal_actions(
         env=env,
     )
     print("[DEBUG] rollout: Target markers created and positioned")
+
+    # Step a few frames so the renderer captures the newly created/updated markers
+    # into the camera buffers before we start recording.
+    marker_settle_action = torch.zeros(num_envs, env.action_space.shape[-1], device=device)
+    marker_settle_action[:, :7] = get_ee_pose_w(env)[:, :7]
+    marker_settle_action[:, 7] = 1.0  # gripper open
+    for _ in range(3):
+        obs_dict, _, _, _, _ = env.step(marker_settle_action)
+    print("[DEBUG] rollout: Camera buffers refreshed with marker visuals")
     
     # =========================================================================
     # Step 5: Initialize per-env recording buffers

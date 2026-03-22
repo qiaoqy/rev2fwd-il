@@ -967,6 +967,7 @@ def train_with_lerobot_api(
         # - steps: target step count (e.g., 10100, 10200, ...)
         train_cfg.resume = True  # Load training state to continue from checkpoint step
         train_cfg.steps = args.steps  # Target total step (e.g., 10100)
+        train_cfg.save_freq = args.save_freq  # Use save_freq from command line
         train_cfg.wandb = wandb_cfg  # New wandb run (not resuming)
         train_cfg.checkpoint_path = latest_checkpoint
         train_cfg.policy.pretrained_path = latest_checkpoint / "pretrained_model"

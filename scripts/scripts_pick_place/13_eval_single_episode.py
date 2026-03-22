@@ -126,6 +126,15 @@ def _parse_args():
     p.add_argument("--image_height", type=int, default=128)
     p.add_argument("--disable_fabric", type=int, default=0, choices=[0, 1])
     p.add_argument("--seed", type=int, default=42)
+    # Red region / marker args
+    p.add_argument("--taskA_source_mode", type=str, default="legacy",
+                   choices=["legacy", "green_region", "red_region"])
+    p.add_argument("--red_region_center_xy", type=float, nargs=2, default=None)
+    p.add_argument("--red_region_size_xy", type=float, nargs=2, default=None)
+    p.add_argument("--red_marker_shape", type=str, default="circle",
+                   choices=["circle", "rectangle"])
+    p.add_argument("--red_marker_size_xy", type=float, nargs=2, default=None)
+    p.add_argument("--fix_red_marker_pose", type=int, default=0, choices=[0, 1])
 
     from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(p)
@@ -196,17 +205,30 @@ def main():
             include_obj_pose_B=cfg_A["include_obj_pose"],
             include_gripper_A=cfg_A["include_gripper"],
             include_gripper_B=cfg_A["include_gripper"],
+            taskA_source_mode=args.taskA_source_mode,
+            red_region_center_xy=args.red_region_center_xy,
+            red_region_size_xy=args.red_region_size_xy,
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=args.red_marker_size_xy,
+            fix_red_marker_pose=bool(args.fix_red_marker_pose),
         )
 
         env.reset()
         pre_position_gripper_down(env)
-        pm, gm, mz = create_target_markers(num_envs=1, device=device)
+        pm, gm, mz = create_target_markers(
+            num_envs=1, device=device,
+            red_marker_shape=args.red_marker_shape,
+            red_marker_size_xy=args.red_marker_size_xy,
+        )
         tester.place_markers = pm
         tester.goal_markers = gm
         tester.marker_z = mz
-        first_place = tester._sample_new_place_target()
+        first_place = tester._sample_taskA_source_target()
         tester.current_place_xy = first_place
-        update_target_markers(pm, gm, first_place, tuple(goal_xy), mz, env)
+        marker_xy = first_place
+        if args.fix_red_marker_pose and args.red_region_center_xy is not None:
+            marker_xy = tuple(args.red_region_center_xy)
+        update_target_markers(pm, gm, marker_xy, tuple(goal_xy), mz, env)
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -218,8 +240,11 @@ def main():
             # Hard reset for Task A: object at random position
             env.reset()
             pre_position_gripper_down(env)
-            rand_xy = tester._sample_new_place_target()
-            update_target_markers(pm, gm, rand_xy, tuple(goal_xy), mz, env)
+            rand_xy = tester._sample_taskA_source_target()
+            marker_xy_ep = rand_xy
+            if args.fix_red_marker_pose and args.red_region_center_xy is not None:
+                marker_xy_ep = tuple(args.red_region_center_xy)
+            update_target_markers(pm, gm, marker_xy_ep, tuple(goal_xy), mz, env)
             obj_pose = torch.tensor(
                 [rand_xy[0], rand_xy[1], 0.022, 1, 0, 0, 0],
                 dtype=torch.float32, device=device).unsqueeze(0)

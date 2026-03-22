@@ -1083,7 +1083,7 @@ def train_with_xyz_visualization(
         
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
-        is_viz_saving_step = step % viz_save_freq == 0 or step == cfg.steps
+        is_viz_saving_step = (viz_save_freq > 0 and step % viz_save_freq == 0) or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
         is_val_step = val_dataloader is not None and val_freq > 0 and step % val_freq == 0
 

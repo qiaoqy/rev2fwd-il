@@ -628,14 +628,30 @@ def main() -> None:
         
         # Step 3: Copy checkpoint to expected location for --resume
         checkpoint_src = Path(args.checkpoint)
-        expected_checkpoint_dir = output_dir / "checkpoints" / "checkpoints" / "last"
-        expected_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoints_parent = output_dir / "checkpoints" / "checkpoints"
+        checkpoints_parent.mkdir(parents=True, exist_ok=True)
         
         # Determine the source checkpoint root (parent of pretrained_model)
         if checkpoint_src.name == "pretrained_model":
             checkpoint_root = checkpoint_src.parent
         else:
             checkpoint_root = checkpoint_src
+        
+        # Read source step number from training_state
+        src_step = 0
+        src_training_state = checkpoint_root / "training_state"
+        if src_training_state.exists():
+            training_step_file = src_training_state / "training_step.json"
+            if training_step_file.exists():
+                import json as _json
+                with open(training_step_file, "r") as f:
+                    data = _json.load(f)
+                    src_step = data.get("step", 0)
+        
+        # Create step-numbered directory (e.g., 041534) and a 'last' symlink
+        step_dir_name = f"{src_step:06d}"
+        expected_checkpoint_dir = checkpoints_parent / step_dir_name
+        expected_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Copy pretrained_model directory
         target_pretrained = expected_checkpoint_dir / "pretrained_model"
@@ -662,6 +678,16 @@ def main() -> None:
             print(f"  Copied training_state successfully.")
         else:
             print(f"  Warning: training_state not found at {src_training_state}")
+        
+        # Create 'last' symlink pointing to the step directory
+        last_symlink = checkpoints_parent / "last"
+        if last_symlink.exists() or last_symlink.is_symlink():
+            if last_symlink.is_symlink():
+                last_symlink.unlink()
+            else:
+                shutil.rmtree(last_symlink)
+        last_symlink.symlink_to(step_dir_name)
+        print(f"  Created symlink: last -> {step_dir_name}")
         
         print(f"\n{'='*60}")
         print("Data Preparation Complete!")
