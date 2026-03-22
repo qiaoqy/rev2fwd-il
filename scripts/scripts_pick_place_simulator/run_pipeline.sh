@@ -575,7 +575,7 @@ for iter in $(seq 1 $ITER_ROUNDS); do
 
         # --- Cyclic eval on EVAL_GPU_1 ---
         (
-            CUDA_VISIBLE_DEVICES=$EVAL_GPU_1 python "${SCRIPT_DIR}/6_eval_cyclic.py" \
+            CUDA_VISIBLE_DEVICES=$EVAL_GPU_1 python -u "${SCRIPT_DIR}/6_eval_cyclic.py" \
                 --policy_A "$CKPT_A" \
                 --policy_B "$CKPT_B" \
                 --out_A "$ROLLOUT_A" \
@@ -592,9 +592,12 @@ for iter in $(seq 1 $ITER_ROUNDS); do
         ) &
         CYCLIC_PID=$!
 
+        # Stagger launches to avoid GPU/Vulkan contention during Isaac Lab init
+        sleep 60
+
         # --- Fair test A on EVAL_GPU_2 ---
         (
-            CUDA_VISIBLE_DEVICES=$EVAL_GPU_2 python "${SCRIPT_DIR}/7_eval_fair.py" \
+            CUDA_VISIBLE_DEVICES=$EVAL_GPU_2 python -u "${SCRIPT_DIR}/7_eval_fair.py" \
                 --policy "$CKPT_A" \
                 --task A \
                 --num_episodes 50 \
@@ -610,9 +613,12 @@ for iter in $(seq 1 $ITER_ROUNDS); do
         ) &
         FAIR_A_PID=$!
 
+        # Stagger launches to avoid GPU/Vulkan contention during Isaac Lab init
+        sleep 60
+
         # --- Fair test B on EVAL_GPU_3 ---
         (
-            CUDA_VISIBLE_DEVICES=$EVAL_GPU_3 python "${SCRIPT_DIR}/7_eval_fair.py" \
+            CUDA_VISIBLE_DEVICES=$EVAL_GPU_3 python -u "${SCRIPT_DIR}/7_eval_fair.py" \
                 --policy "$CKPT_B" \
                 --task B \
                 --num_episodes 50 \
