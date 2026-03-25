@@ -743,6 +743,39 @@ def convert_npz_to_lerobot_format(
     return image_shape[0], image_shape[1], has_wrist, overfit_env_init
 
 
+def _update_state_shape_in_config(cfg: dict, new_state_dim: int) -> dict:
+    """Recursively update observation.state shape references in processor config."""
+    if isinstance(cfg, dict):
+        for k, v in cfg.items():
+            if k == "features" and isinstance(v, dict):
+                if "observation.state" in v and "shape" in v["observation.state"]:
+                    v["observation.state"]["shape"] = [new_state_dim]
+            cfg[k] = _update_state_shape_in_config(v, new_state_dim)
+    elif isinstance(cfg, list):
+        cfg = [_update_state_shape_in_config(item, new_state_dim) for item in cfg]
+    return cfg
+
+
+def _pad_state_stats(st: dict, extra_dims: int) -> dict:
+    """Pad observation.state.* normalizer tensors with extra dimensions for the indicator."""
+    import torch
+    padded = {}
+    for k, v in st.items():
+        if k.startswith("observation.state.") and v.dim() == 1 and v.shape[0] > 1:
+            suffix = k.split(".")[-1]
+            # Choose pad values based on stat type
+            pad_vals = {
+                "min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.5,
+                "q01": 0.0, "q10": 0.0, "q50": 0.5, "q90": 1.0, "q99": 1.0,
+            }
+            pad_val = pad_vals.get(suffix, 0.0)
+            pad = torch.full((extra_dims,), pad_val, dtype=v.dtype)
+            padded[k] = torch.cat([v, pad])
+        else:
+            padded[k] = v
+    return padded
+
+
 def train_with_lerobot_api(
     args: argparse.Namespace,
     lerobot_dataset_dir: Path,
@@ -755,6 +788,8 @@ def train_with_lerobot_api(
     train_episodes: list[int] | None = None,
     val_episodes: list[int] | None = None,
     state_slice_end: int | None = None,
+    state_dim_override: int | None = None,
+    pretrained_for_recap: str | None = None,
 ) -> dict:
     """Train using LeRobot's Python API.
     
@@ -771,6 +806,9 @@ def train_with_lerobot_api(
         val_episodes: List of episode indices for validation (None = no validation).
         state_slice_end: If set, slice observation.state to [:state_slice_end]. 
                          Useful for training with subset of state without re-converting data.
+        state_dim_override: If set, override the computed state dimension.
+        pretrained_for_recap: If set, path to a pretrained model (state_dim=15) that
+                              will be migrated to the new state_dim (zero-pad expansion).
         
     Returns:
         Dictionary with training results.
@@ -821,11 +859,14 @@ def train_with_lerobot_api(
     #   - state_dim=8:  ee_pose(7) + gripper(1)
     #   - state_dim=14: ee_pose(7) + obj_pose(7)
     #   - state_dim=15: ee_pose(7) + obj_pose(7) + gripper(1)
-    state_dim = 7  # base: ee_pose (7)
-    if include_obj_pose:
-        state_dim += 7
-    if include_gripper:
-        state_dim += 1
+    if state_dim_override is not None:
+        state_dim = state_dim_override
+    else:
+        state_dim = 7  # base: ee_pose (7)
+        if include_obj_pose:
+            state_dim += 7
+        if include_gripper:
+            state_dim += 1
     
     # Configure input/output features for the policy
     input_features = {
@@ -868,6 +909,59 @@ def train_with_lerobot_api(
         push_to_hub=False,
         optimizer_lr=args.lr,
     )
+    
+    # --- RECAP checkpoint migration (state_dim expansion) ---
+    if pretrained_for_recap is not None:
+        from safetensors.torch import load_file as _sf_load, save_file as _sf_save
+        from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy as _DP_cls
+        import sys as _sys
+        _recap_utils_path = str(Path(__file__).resolve().parent.parent / "scripts_recap_rl")
+        if _recap_utils_path not in _sys.path:
+            _sys.path.insert(0, _recap_utils_path)
+        from utils import migrate_checkpoint_for_recap as _migrate_ckpt
+
+        _migrated_dir = out_dir / "_recap_pretrained"
+        _src_pretrained = Path(pretrained_for_recap)
+        if is_main_process:
+            if not (_migrated_dir / "model.safetensors").exists():
+                print(f"  [RECAP] Migrating checkpoint: {pretrained_for_recap} → state_dim={state_dim}")
+                _new_policy = _DP_cls(policy_cfg)
+                _old_sd = _sf_load(str(_src_pretrained / "model.safetensors"))
+                _migrated_sd = _migrate_ckpt(_old_sd, _new_policy)
+                _new_policy.load_state_dict(_migrated_sd, strict=False)
+                _migrated_dir.mkdir(parents=True, exist_ok=True)
+                _new_policy.save_pretrained(str(_migrated_dir))
+                print(f"  [RECAP] Migrated checkpoint saved to: {_migrated_dir}")
+                del _new_policy
+
+                # Copy and adapt processor files from original pretrained checkpoint
+                # The LeRobot training pipeline expects processor configs alongside the model
+                _extra_dims = state_dim - 15  # number of new dims (indicator)
+                for _fname in _src_pretrained.iterdir():
+                    if _fname.name in ("model.safetensors", "config.json"):
+                        continue  # already saved by save_pretrained
+                    _dst = _migrated_dir / _fname.name
+                    if _fname.suffix == ".json":
+                        with open(_fname) as _f:
+                            _cfg = json.load(_f)
+                        # Update observation.state shape references
+                        _updated = _update_state_shape_in_config(_cfg, state_dim)
+                        with open(_dst, "w") as _f:
+                            json.dump(_updated, _f, indent=2)
+                    elif _fname.suffix == ".safetensors":
+                        _st = _sf_load(str(_fname))
+                        _st = _pad_state_stats(_st, _extra_dims)
+                        _sf_save(_st, str(_dst))
+                    else:
+                        shutil.copy2(str(_fname), str(_dst))
+                print(f"  [RECAP] Processor files adapted for state_dim={state_dim}")
+            else:
+                print(f"  [RECAP] Migrated checkpoint already exists: {_migrated_dir}")
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        policy_cfg.pretrained_path = _migrated_dir
     
     # =========================================================================
     # DEBUG: Print normalization settings for training

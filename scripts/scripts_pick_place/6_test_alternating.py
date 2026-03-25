@@ -1344,7 +1344,8 @@ class AlternatingTester:
         cube_half_size = 0.02 so the region is shrunk to keep the cube body
         fully inside the rectangle.
         """
-        cube_half_size = 0.02
+        # cube_half_size = 0.02
+        cube_half_size = 0.0
         cx, cy = float(center_xy[0]), float(center_xy[1])
         sx, sy = float(size_xy[0]), float(size_xy[1])
         half_x = max(sx * 0.5 - cube_half_size, 0.0)

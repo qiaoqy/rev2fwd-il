@@ -40,15 +40,39 @@ def load_episodes(path: str) -> list[dict]:
 
 
 def reverse_episode(ep: dict) -> dict:
-    """Reverse an episode in time."""
-    T = len(ep["obs"])
+    """Reverse an episode in time.
 
-    obs_rev = ep["obs"][::-1].copy()
+    Handles both the original collection format (with obs, gripper, fsm_state)
+    and the rollout format (which only has images, ee_pose, obj_pose, action).
+    For rollout data, gripper is extracted from action[:, 7] and obs/fsm_state
+    are synthesised as zeros.
+    """
+    T = len(ep["images"])
+
+    # Handle fields that may be absent in rollout data
+    has_obs = "obs" in ep
+    has_gripper = "gripper" in ep
+    has_fsm_state = "fsm_state" in ep
+
+    if has_obs:
+        obs_rev = ep["obs"][::-1].copy()
+    else:
+        obs_rev = np.zeros((T, 36), dtype=np.float32)
+
     images_rev = ep["images"][::-1].copy()
     ee_rev = ep["ee_pose"][::-1].copy()
     obj_rev = ep["obj_pose"][::-1].copy()
-    gripper_rev = ep["gripper"][::-1].copy()
-    fsm_state_rev = ep["fsm_state"][::-1].copy()
+
+    if has_gripper:
+        gripper_rev = ep["gripper"][::-1].copy()
+    else:
+        # Extract gripper from action[:, 7]
+        gripper_rev = ep["action"][:, 7][::-1].copy()
+
+    if has_fsm_state:
+        fsm_state_rev = ep["fsm_state"][::-1].copy()
+    else:
+        fsm_state_rev = np.zeros(T, dtype=np.int32)
 
     has_wrist = "wrist_images" in ep
     if has_wrist:
@@ -69,10 +93,13 @@ def reverse_episode(ep: dict) -> dict:
         "action": new_actions[:-1].astype(np.float32),
         "gripper": gripper_rev[:-1].astype(np.float32),
         "fsm_state": fsm_state_rev[:-1].astype(np.int32),
-        "place_pose": ep["place_pose"].copy(),
-        "goal_pose": ep["goal_pose"].copy(),
         "success": ep["success"],
     }
+    # Copy metadata fields if present
+    if "place_pose" in ep:
+        result["place_pose"] = ep["place_pose"].copy() if hasattr(ep["place_pose"], 'copy') else ep["place_pose"]
+    if "goal_pose" in ep:
+        result["goal_pose"] = ep["goal_pose"].copy() if hasattr(ep["goal_pose"], 'copy') else ep["goal_pose"]
     if has_wrist:
         result["wrist_images"] = wrist_rev[:-1]
     return result
@@ -107,9 +134,9 @@ def main() -> None:
     for ep_idx, ep in enumerate(episodes):
         fwd = reverse_episode(ep)
         forward_episodes.append(fwd)
-        total_steps += len(fwd["obs"])
+        total_steps += len(fwd["images"])
         if (ep_idx + 1) % 20 == 0 or ep_idx == 0:
-            T = len(fwd["obs"])
+            T = len(fwd["images"])
             close_ratio = np.mean(fwd["gripper"] < 0)
             print(f"Episode {ep_idx + 1:4d} | Length: {T:4d} | CLOSE ratio: {100 * close_ratio:.1f}%")
 
@@ -132,7 +159,8 @@ def main() -> None:
     print(f"Avg episode length:    {avg_len:.1f}")
     if forward_episodes:
         ep0 = forward_episodes[0]
-        print(f"Observation dim:       {ep0['obs'].shape[1]}")
+        if "obs" in ep0 and ep0["obs"].ndim == 2:
+            print(f"Observation dim:       {ep0['obs'].shape[1]}")
         print(f"Table image shape:     {ep0['images'].shape[1:]}")
         if "wrist_images" in ep0:
             print(f"Wrist image shape:     {ep0['wrist_images'].shape[1:]}")

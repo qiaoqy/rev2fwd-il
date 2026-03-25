@@ -119,8 +119,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bc_weight_end", type=float, default=0.1)
 
     # Exploration
-    p.add_argument("--warmup_steps", type=int, default=5000,
-                   help="Env steps of random exploration before training.")
+    p.add_argument("--warmup_steps", type=int, default=0,
+                   help="Env steps of random exploration before training (0 = disabled).")
     p.add_argument("--replay_buffer_size", type=int, default=1000000)
     p.add_argument("--demo_ratio", type=float, default=0.25)
 
@@ -340,12 +340,7 @@ def _run_training(args: argparse.Namespace) -> None:
 
         for _ in range(collect_steps):
             with torch.no_grad():
-                if env_step < args.warmup_steps:
-                    # Random exploration during warmup
-                    action_batch = torch.randn(
-                        args.num_envs, action_dim, device=device,
-                    ) * 0.5
-                elif args.actor_type == "gaussian":
+                if args.actor_type == "gaussian":
                     # Sample from Gaussian actor
                     table_img = obs["observation.image"]
                     wrist_img = obs["observation.wrist_image"]

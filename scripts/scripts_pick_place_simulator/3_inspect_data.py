@@ -12,6 +12,12 @@ Usage:
     python scripts/scripts_pick_place_simulator/3_inspect_data.py \
         --dataset data/exp_new/task_A_reversed_100.npz \
         --enable_xyz_viz --episode 0
+
+        
+    python scripts/scripts_pick_place_simulator/3_inspect_data.py \
+        --dataset data/pick_place_isaac_lab_simulation/exp17/task_B_100.npz \
+        --enable_xyz_viz --episode 0
+    
 """
 
 from __future__ import annotations
