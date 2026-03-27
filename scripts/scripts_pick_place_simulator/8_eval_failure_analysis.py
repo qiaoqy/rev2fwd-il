@@ -49,6 +49,50 @@ import torch
 
 
 # =========================================================================
+# Action chunk collector
+# =========================================================================
+class ActionChunkCollector:
+    """Collects predicted action chunks during evaluation.
+
+    Implements the same ``add_frame`` interface expected by
+    ``AlternatingTester._run_task`` so it can be plugged in as
+    ``action_chunk_visualizer``.
+    """
+
+    def __init__(self):
+        self.chunks: list[dict] = []  # one entry per inference step
+        self._inference_step = 0
+
+    # signature must match ActionChunkVisualizer.add_frame
+    def add_frame(
+        self,
+        ee_pose_raw,
+        ee_pose_norm,
+        action_chunk_norm,
+        action_chunk_raw=None,
+        gt_chunk_norm=None,
+        gt_chunk_raw=None,
+        table_image=None,
+        wrist_image=None,
+    ):
+        self.chunks.append({
+            "inference_step": self._inference_step,
+            "ee_pose_raw": np.asarray(ee_pose_raw).copy(),
+            "action_chunk_norm": np.asarray(action_chunk_norm).copy(),
+            "action_chunk_raw": (
+                np.asarray(action_chunk_raw).copy()
+                if action_chunk_raw is not None
+                else np.asarray(action_chunk_norm).copy()
+            ),
+        })
+        self._inference_step += 1
+
+    def reset(self):
+        self.chunks.clear()
+        self._inference_step = 0
+
+
+# =========================================================================
 # Video annotation helpers
 # =========================================================================
 def add_text_overlay(img: np.ndarray, text: str,
@@ -79,6 +123,75 @@ def add_multi_line_overlay(img: np.ndarray, lines: list[str],
     return img
 
 
+def _draw_chunk_plot(action_chunk_raw: np.ndarray,
+                     step_in_chunk: int,
+                     ee_xyz: np.ndarray,
+                     plot_h: int = 120,
+                     plot_w: int = 160) -> np.ndarray:
+    """Draw a small XYZ plot of the current action chunk.
+
+    Returns an (plot_h, plot_w, 3) uint8 image.
+    """
+    img = np.zeros((plot_h, plot_w, 3), dtype=np.uint8)
+    chunk_len = len(action_chunk_raw)
+    if chunk_len == 0:
+        return img
+
+    margin_l, margin_r, margin_t, margin_b = 30, 5, 12, 14
+    gw = plot_w - margin_l - margin_r
+    gh = plot_h - margin_t - margin_b
+
+    # X, Y, Z channels
+    colors = [(0, 0, 255), (0, 200, 0), (255, 100, 0)]  # R, G, B for X, Y, Z
+    labels = ["X", "Y", "Z"]
+
+    all_vals = action_chunk_raw.flatten()
+    ee_vals = ee_xyz[:3]
+    combined = np.concatenate([all_vals, ee_vals])
+    vmin, vmax = combined.min() - 0.01, combined.max() + 0.01
+    if vmax - vmin < 1e-6:
+        vmin -= 0.05
+        vmax += 0.05
+
+    def to_px(step, val):
+        x = margin_l + int(step / max(chunk_len - 1, 1) * gw)
+        y = margin_t + int((1.0 - (val - vmin) / (vmax - vmin)) * gh)
+        return (x, y)
+
+    # Grid
+    cv2.rectangle(img, (margin_l, margin_t),
+                  (margin_l + gw, margin_t + gh), (50, 50, 50), 1)
+    # Y-axis labels
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img, f"{vmax:.2f}", (1, margin_t + 8), font, 0.25, (160, 160, 160), 1)
+    cv2.putText(img, f"{vmin:.2f}", (1, margin_t + gh), font, 0.25, (160, 160, 160), 1)
+
+    # Plot each axis
+    for dim in range(min(3, action_chunk_raw.shape[1])):
+        pts = [to_px(s, action_chunk_raw[s, dim]) for s in range(chunk_len)]
+        for i in range(len(pts) - 1):
+            cv2.line(img, pts[i], pts[i + 1], colors[dim], 1, cv2.LINE_AA)
+        # Current EE pose marker (horizontal dashed line)
+        ee_y = to_px(0, ee_xyz[dim])[1]
+        for xx in range(margin_l, margin_l + gw, 6):
+            cv2.line(img, (xx, ee_y), (min(xx + 3, margin_l + gw), ee_y),
+                     colors[dim], 1)
+
+    # Vertical line at current step
+    cur_x = to_px(step_in_chunk, 0)[0]
+    cv2.line(img, (cur_x, margin_t), (cur_x, margin_t + gh),
+             (255, 255, 0), 1)
+
+    # Legend
+    for dim, (lbl, clr) in enumerate(zip(labels, colors)):
+        lx = margin_l + 4 + dim * 35
+        cv2.putText(img, lbl, (lx, margin_t + gh + 12), font, 0.3, clr, 1)
+    cv2.putText(img, "-- EE", (margin_l + 110, margin_t + gh + 12),
+                font, 0.25, (160, 160, 160), 1)
+
+    return img
+
+
 def render_episode_video(
     frames: list[np.ndarray],
     out_path: str | Path,
@@ -96,8 +209,20 @@ def render_episode_video(
     region_center_xy: tuple[float, float] | None = None,
     region_size_xy: tuple[float, float] | None = None,
     wrist_frames: list[np.ndarray] | None = None,
+    n_action_steps: int = 16,
+    action_chunks: list[dict] | None = None,
+    premove_len: int = 0,
 ) -> None:
-    """Render annotated MP4 for a single episode."""
+    """Render annotated MP4 for a single episode.
+
+    When *action_chunks* is provided (list of dicts from
+    ``ActionChunkCollector``), an extra debug panel is drawn showing
+    the predicted action-chunk trajectory and per-step action values.
+
+    *premove_len*: number of leading frames that belong to the pre-move
+    phase (before policy inference starts).  They are annotated with a
+    cyan "PRE-MOVE" label.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -106,6 +231,18 @@ def render_episode_video(
     scale = max(1, 384 // W)
     out_H, out_W = H * scale, W * scale
     has_wrist = (wrist_frames is not None and len(wrist_frames) > 0)
+
+    # Pre-build a mapping: env step -> (chunk_index, step_in_chunk, chunk_data)
+    # Action chunks only cover the policy phase (after premove_len)
+    chunk_map: dict[int, tuple[int, int, dict]] = {}  # step -> info
+    if action_chunks:
+        for ci, cdata in enumerate(action_chunks):
+            start_step = premove_len + ci * n_action_steps
+            chunk_len = len(cdata["action_chunk_raw"])
+            for s in range(chunk_len):
+                env_step = start_step + s
+                if env_step < T:
+                    chunk_map[env_step] = (ci, s, cdata)
 
     annotated = []
     for t in range(T):
@@ -119,10 +256,18 @@ def render_episode_video(
         gripper = actions[t, 7] if t < len(actions) else 0
         gripper_str = "OPEN" if gripper > 0.5 else "CLOSED"
 
+        ee_xyz = ee_poses[t, :3] if t < len(ee_poses) else np.zeros(3)
+        act_xyz = actions[t, :3] if t < len(actions) else np.zeros(3)
+
         lines = [
             f"Ep {ep_index} | Step {t+1}/{T}  Task {task_type}",
             f"ObjXY: ({obj_xy[0]:.3f}, {obj_xy[1]:.3f})  Z:{obj_z:.3f}",
         ]
+
+        # Pre-move phase annotation
+        is_premove = (t < premove_len)
+        if is_premove:
+            lines.insert(0, f">>> PRE-MOVE  {t+1}/{premove_len} <<<")
 
         if task_type == "B" and region_center_xy is not None and region_size_xy is not None:
             rcx, rcy = region_center_xy
@@ -141,6 +286,31 @@ def render_episode_video(
 
         lines.append(f"Gripper: {gripper_str} ({gripper:.2f})")
 
+        # Action chunk debug info (skip during pre-move)
+        chunk_info = chunk_map.get(t)
+        if is_premove:
+            chunk_info = None  # no chunk during pre-move
+        elif chunk_info is not None:
+            ci, si, cdata = chunk_info
+            chunk_len = len(cdata["action_chunk_raw"])
+            is_boundary = (si == 0)
+            marker = " <<INFER>>" if is_boundary else ""
+            lines.append(f"Chunk {ci} Step {si+1}/{chunk_len}{marker}")
+        else:
+            # Fallback: compute from n_action_steps
+            pol_t = t - premove_len
+            ci = pol_t // n_action_steps
+            si = pol_t % n_action_steps
+            is_boundary = (si == 0)
+            marker = " <<INFER>>" if is_boundary else ""
+            lines.append(f"Chunk {ci} Step {si+1}/{n_action_steps}{marker}")
+
+        # Show action vs EE pose
+        lines.append(f"Act: ({act_xyz[0]:.3f},{act_xyz[1]:.3f},{act_xyz[2]:.3f})")
+        lines.append(f"EE:  ({ee_xyz[0]:.3f},{ee_xyz[1]:.3f},{ee_xyz[2]:.3f})")
+        delta = np.linalg.norm(act_xyz - ee_xyz)
+        lines.append(f"|Act-EE|: {delta:.4f}")
+
         if success and success_step is not None and t + 1 >= success_step:
             lines.append("STATUS: SUCCESS")
         else:
@@ -149,6 +319,32 @@ def render_episode_video(
         frame = add_multi_line_overlay(frame, lines, start_y=2,
                                        line_height=int(14 * scale / 3 + 2),
                                        font_scale=0.35 * scale / 3 + 0.1)
+
+        # Draw chunk XYZ mini-plot in bottom-right corner
+        if chunk_info is not None:
+            ci, si, cdata = chunk_info
+            plot_h, plot_w = 120, 160
+            plot_img = _draw_chunk_plot(
+                cdata["action_chunk_raw"], si, ee_xyz,
+                plot_h=plot_h, plot_w=plot_w,
+            )
+            # Place in bottom-right of this camera panel
+            y0 = max(0, out_H - plot_h - 18)
+            x0 = max(0, out_W - plot_w - 4)
+            # Semi-transparent overlay
+            roi = frame[y0:y0 + plot_h, x0:x0 + plot_w]
+            blended = cv2.addWeighted(roi, 0.3, plot_img[:roi.shape[0], :roi.shape[1]], 0.7, 0)
+            frame[y0:y0 + plot_h, x0:x0 + plot_w] = blended
+
+        # Chunk boundary flash (yellow border)
+        if chunk_info is not None and chunk_info[1] == 0:
+            cv2.rectangle(frame, (0, 0), (out_W - 1, out_H - 1),
+                          (0, 255, 255), 2)
+
+        # Cyan border for pre-move frames
+        if is_premove:
+            cv2.rectangle(frame, (0, 0), (out_W - 1, out_H - 1),
+                          (255, 255, 0), 2)  # cyan in BGR
 
         # Progress bar
         bar_h = max(4, scale * 2)
@@ -214,6 +410,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--render_success_videos", action="store_true")
+    parser.add_argument("--pre_move_to_object", action="store_true",
+                        help="Move arm above the object before policy inference "
+                             "(debug: gives policy a better starting pose).")
+    parser.add_argument("--pre_move_height", type=float, default=0.15,
+                        help="Height above object for pre-move (default 0.15m).")
+    parser.add_argument("--pre_move_steps", type=int, default=80,
+                        help="Sim steps for the pre-move phase.")
 
     # Region (Mode 3)
     parser.add_argument("--goal_xy", type=float, nargs=2, default=[0.5, -0.2])
@@ -410,11 +613,114 @@ def main() -> None:
             print(f"\n  [Task {task_label}] Ep {ep_idx + 1}/{args.num_episodes}  "
                   f"obj=[{source_xy[0]:.3f}, {source_xy[1]:.3f}]")
 
+            # ----- Pre-move: move arm above the object -----
+            premove_images = []
+            premove_wrist = []
+            premove_ee = []
+            premove_obj = []
+            premove_act = []
+
+            if args.pre_move_to_object:
+                from rev2fwd_il.sim.scene_api import get_object_pose_w
+                GRIPPER_DOWN_QUAT = torch.tensor(
+                    [0.0, 1.0, 0.0, 0.0], device=device)
+
+                obj_pos = get_object_pose_w(env)[0].cpu().numpy()
+                obj_x, obj_y, obj_z = float(obj_pos[0]), float(obj_pos[1]), float(obj_pos[2])
+
+                def _make_action(x, y, z, grip):
+                    a = torch.zeros(1, env.action_space.shape[-1], device=device)
+                    a[0, 0], a[0, 1], a[0, 2] = x, y, z
+                    a[0, 3:7] = GRIPPER_DOWN_QUAT
+                    a[0, 7] = grip
+                    return a
+
+                def _record_and_step(action_t, n_steps):
+                    for _ in range(n_steps):
+                        tbl, wrs, ee_p, ob_p, gs = tester._get_observation()
+                        premove_images.append(tbl)
+                        if wrs is not None:
+                            premove_wrist.append(wrs)
+                        premove_ee.append(ee_p)
+                        premove_obj.append(ob_p)
+                        premove_act.append(action_t[0].cpu().numpy())
+                        env.step(action_t)
+
+                # Phase 1: Approach — move above the object
+                hover_z = obj_z + args.pre_move_height
+                approach_act = _make_action(obj_x, obj_y, hover_z, 1.0)
+                print(f"    [PRE-MOVE] Phase 1: Approach above "
+                      f"({obj_x:.3f}, {obj_y:.3f}, {hover_z:.3f})")
+                _record_and_step(approach_act, 60)
+
+                # Phase 2: Lower to grasp height (obj_z + 0.02m)
+                grasp_z = obj_z + 0.02
+                lower_act = _make_action(obj_x, obj_y, grasp_z, 1.0)
+                print(f"    [PRE-MOVE] Phase 2: Lower to grasp height z={grasp_z:.3f}")
+                _record_and_step(lower_act, 40)
+
+                # Phase 3: Close gripper
+                close_act = _make_action(obj_x, obj_y, grasp_z, -1.0)
+                print(f"    [PRE-MOVE] Phase 3: Close gripper")
+                _record_and_step(close_act, 20)
+
+                # Phase 4: Lift with object
+                lift_z = obj_z + args.pre_move_height
+                lift_act = _make_action(obj_x, obj_y, lift_z, -1.0)
+                print(f"    [PRE-MOVE] Phase 4: Lift to z={lift_z:.3f}")
+                _record_and_step(lift_act, 40)
+
+                # Phase 5: Settle at lifted position
+                _record_and_step(lift_act, 15)
+
+                ee_now = get_ee_pose_w(env)[0].cpu().numpy()
+                ob_now = get_object_pose_w(env)[0].cpu().numpy()
+                print(f"    [PRE-MOVE] Done. EE=({ee_now[0]:.3f}, {ee_now[1]:.3f}, "
+                      f"{ee_now[2]:.3f})  Obj=({ob_now[0]:.3f}, {ob_now[1]:.3f}, "
+                      f"{ob_now[2]:.3f})")
+                tester.current_gripper_state = -1.0
+
+            premove_len = len(premove_images)
+
+            # Reset policy action queue (fresh start after pre-move)
+            policy.reset()
+
+            # Set up action chunk collector for this episode
+            chunk_collector = ActionChunkCollector()
+            if task_label == "A":
+                tester.action_chunk_visualizer_A = chunk_collector
+            else:
+                tester.action_chunk_visualizer_B = chunk_collector
+
             # Run task
             if task_label == "A":
                 ep_data, success = tester.run_task_A()
             else:
                 ep_data, success = tester.run_task_B()
+
+            # Retrieve collected action chunks
+            ep_action_chunks = list(chunk_collector.chunks)
+
+            # Merge pre-move data into episode data
+            if premove_len > 0:
+                ep_data["images"] = np.concatenate(
+                    [np.array(premove_images, dtype=np.uint8),
+                     ep_data["images"]], axis=0)
+                ep_data["ee_pose"] = np.concatenate(
+                    [np.array(premove_ee, dtype=np.float32),
+                     ep_data["ee_pose"]], axis=0)
+                ep_data["obj_pose"] = np.concatenate(
+                    [np.array(premove_obj, dtype=np.float32),
+                     ep_data["obj_pose"]], axis=0)
+                ep_data["action"] = np.concatenate(
+                    [np.array(premove_act, dtype=np.float32),
+                     ep_data["action"]], axis=0)
+                if premove_wrist and ep_data.get("wrist_images") is not None:
+                    ep_data["wrist_images"] = np.concatenate(
+                        [np.array(premove_wrist, dtype=np.uint8),
+                         ep_data["wrist_images"]], axis=0)
+                if ep_data.get("success_step") is not None:
+                    ep_data["success_step"] += premove_len
 
             results.append(success)
             rate = sum(results) / len(results) * 100
@@ -446,6 +752,15 @@ def main() -> None:
             all_episodes_data[f"{prefix}_success"] = np.array(success)
             if ep_data.get("wrist_images") is not None:
                 all_episodes_data[f"{prefix}_wrist_images"] = ep_data["wrist_images"]
+
+            # Save action chunks for this episode
+            if ep_action_chunks:
+                # Stack chunk raw arrays: (num_chunks, chunk_len, 3)
+                raw_stack = np.array(
+                    [c["action_chunk_raw"] for c in ep_action_chunks],
+                    dtype=np.float32,
+                )
+                all_episodes_data[f"{prefix}_action_chunks_raw"] = raw_stack
 
             # Render video for failed episodes
             should_render = (not success) or args.render_success_videos
@@ -482,6 +797,9 @@ def main() -> None:
                     region_size_xy=(tuple(args.red_region_size_xy)
                                     if task_label == "B" else None),
                     wrist_frames=wrist_imgs,
+                    n_action_steps=n_act,
+                    action_chunks=ep_action_chunks if ep_action_chunks else None,
+                    premove_len=premove_len,
                 )
 
         elapsed = time.time() - start_time

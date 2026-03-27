@@ -1073,6 +1073,9 @@ def train_with_lerobot_api(
         # Also update output_dir to match --out
         train_cfg.output_dir = checkpoint_dir
         
+        # Override batch_size from command line (may differ from checkpoint config)
+        train_cfg.batch_size = args.batch_size
+        
         print(f"  Will continue training to step {args.steps}")
         print(f"  Dataset root updated to: {lerobot_dataset_dir}")
         print(f"  Creating NEW wandb run (not resuming old one)")

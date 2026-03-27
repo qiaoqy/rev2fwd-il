@@ -208,6 +208,15 @@ def create_xyz_visualization_video(
     # Normalize XYZ
     ee_xyz_norm = normalize_ee_pose_xyz(ee_xyz_raw, stats)  # (T, 3) - normalized XYZ
     
+    # Extract action data if available: action[t][:7] = ee_pose[t+1], action[t][7] = gripper[t]
+    actions = episode_data.get('action', None)  # (T, 8) or None
+    if actions is not None:
+        action_xyz_raw = actions[:, :3]  # (T, 3) - raw action XYZ
+        action_xyz_norm = normalize_ee_pose_xyz(action_xyz_raw, stats)  # (T, 3)
+    else:
+        action_xyz_raw = None
+        action_xyz_norm = None
+
     # Extract camera images
     table_images = episode_data['images']  # (T, H, W, 3)
     wrist_images = episode_data.get('wrist_images', None)  # (T, H, W, 3) or None
@@ -228,9 +237,13 @@ def create_xyz_visualization_video(
         # Normalized EE pose XYZ  
         ee_norm_xyz = ee_xyz_norm[t]  # (3,)
         
-        # For output, we leave empty (no action data in inspection)
-        action_raw = np.zeros(3)  # Placeholder
-        action_norm = np.zeros(3)  # Placeholder
+        # Use real action data from the dataset if available
+        if action_xyz_raw is not None:
+            action_raw = action_xyz_raw[t]  # (3,)
+            action_norm = action_xyz_norm[t]  # (3,)
+        else:
+            action_raw = np.zeros(3)
+            action_norm = np.zeros(3)
         
         # Camera images
         table_img = table_images[t]  # (H, W, 3)
