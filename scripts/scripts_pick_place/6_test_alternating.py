@@ -953,7 +953,11 @@ class AlternatingTester:
         self.action_chunk_visualizer_B = None
 
     def _get_observation(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        """Get current observation (images, ee_pose, obj_pose, gripper_state)."""
+        """Get current observation (images, ee_pose, obj_pose, gripper_state).
+        
+        Returns numpy arrays. Triggers implicit CUDA synchronization due to
+        .cpu().numpy() — prefer _get_observation_gpu() in hot loops.
+        """
         from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w
 
         # Get table camera RGB
@@ -978,6 +982,33 @@ class AlternatingTester:
         gripper_state = self.current_gripper_state
 
         return table_rgb_np, wrist_rgb_np, ee_pose, obj_pose, gripper_state
+
+    def _get_observation_gpu(self):
+        """Get current observation as GPU tensors (avoids implicit CUDA sync).
+
+        Returns:
+            table_rgb_gpu: (1, H, W, 3) uint8 GPU tensor
+            wrist_rgb_gpu: (1, H, W, 3) uint8 GPU tensor or None
+            ee_pose_gpu:   (7,) float32 GPU tensor
+            obj_pose_gpu:  (7,) float32 GPU tensor
+            gripper_state: float
+        """
+        from rev2fwd_il.sim.scene_api import get_ee_pose_w, get_object_pose_w
+
+        table_rgb_gpu = self.table_camera.data.output["rgb"]
+        if table_rgb_gpu.shape[-1] > 3:
+            table_rgb_gpu = table_rgb_gpu[..., :3]
+
+        wrist_rgb_gpu = None
+        if self.wrist_camera is not None:
+            wrist_rgb_gpu = self.wrist_camera.data.output["rgb"]
+            if wrist_rgb_gpu.shape[-1] > 3:
+                wrist_rgb_gpu = wrist_rgb_gpu[..., :3]
+
+        ee_pose_gpu = get_ee_pose_w(self.env)[0]
+        obj_pose_gpu = get_object_pose_w(self.env)[0]
+
+        return table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, self.current_gripper_state
 
     def _prepare_policy_input(
         self,
@@ -1034,6 +1065,52 @@ class AlternatingTester:
 
         return policy_inputs
 
+    def _prepare_policy_input_gpu(
+        self,
+        table_rgb_gpu: torch.Tensor,
+        wrist_rgb_gpu: torch.Tensor | None,
+        ee_pose_gpu: torch.Tensor,
+        obj_pose_gpu: torch.Tensor,
+        gripper_state: float,
+        include_obj_pose: bool,
+        include_gripper: bool,
+        has_wrist: bool,
+    ) -> Dict[str, torch.Tensor]:
+        """Prepare policy input directly from GPU tensors (no CPU roundtrip).
+
+        Args:
+            table_rgb_gpu: (1, H, W, 3) uint8 GPU tensor.
+            wrist_rgb_gpu: (1, H, W, 3) uint8 GPU tensor or None.
+            ee_pose_gpu:   (7,) float32 GPU tensor.
+            obj_pose_gpu:  (7,) float32 GPU tensor.
+            gripper_state: float.
+            include_obj_pose: Whether to include obj_pose in state.
+            include_gripper: Whether to include gripper_state in state.
+            has_wrist: Whether policy expects wrist camera input.
+        """
+        # Convert table image to float32 [0, 1] and BCHW format — stays on GPU
+        table_rgb_chw = table_rgb_gpu[0].permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+
+        # Build observation.state on GPU
+        state_parts = [ee_pose_gpu.unsqueeze(0)]
+        if include_obj_pose:
+            state_parts.append(obj_pose_gpu.unsqueeze(0))
+        if include_gripper:
+            gripper_t = torch.tensor([[gripper_state]], dtype=torch.float32, device=self.device)
+            state_parts.append(gripper_t)
+        state = torch.cat(state_parts, dim=-1)
+
+        policy_inputs = {
+            "observation.image": table_rgb_chw,
+            "observation.state": state,
+        }
+
+        if wrist_rgb_gpu is not None and has_wrist:
+            wrist_rgb_chw = wrist_rgb_gpu[0].permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+            policy_inputs["observation.wrist_image"] = wrist_rgb_chw
+
+        return policy_inputs
+
     def _run_task(
         self,
         policy,
@@ -1082,22 +1159,12 @@ class AlternatingTester:
         success_step = None
 
         for t in range(self.horizon):
-            # Get observation
-            table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
+            # -- GPU observation (no implicit CUDA sync) ---------------------
+            table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state = self._get_observation_gpu()
 
-            # Record data
-            images_list.append(table_rgb)
-            if wrist_rgb is not None:
-                wrist_images_list.append(wrist_rgb)
-            ee_pose_list.append(ee_pose)
-            obj_pose_list.append(obj_pose)
-            
-            # Record video frame (table camera view)
-            self.video_frames.append(table_rgb.copy())
-
-            # Prepare policy input with per-policy settings
-            policy_inputs = self._prepare_policy_input(
-                table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state,
+            # -- Build policy input on GPU -----------------------------------
+            policy_inputs = self._prepare_policy_input_gpu(
+                table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state,
                 include_obj_pose=include_obj_pose,
                 include_gripper=include_gripper,
                 has_wrist=has_wrist,
@@ -1109,21 +1176,15 @@ class AlternatingTester:
                 print(f"    [DEBUG] {task_name} Step 0: state_dim={state_dim}, "
                       f"include_obj_pose={include_obj_pose}, include_gripper={include_gripper}, has_wrist={has_wrist}")
                 print(f"    [DEBUG] {task_name} Step 0: observation.state={policy_inputs['observation.state'][0, :7].cpu().numpy()}")
-            
-            # Store raw EE pose before normalization for action chunk visualization
-            ee_pose_raw_np = ee_pose.copy()
 
-            # Preprocess
-            if preprocessor is not None:
-                policy_inputs = preprocessor(policy_inputs)
-            
-            # Store normalized EE pose for action chunk visualization
-            ee_pose_norm_np = policy_inputs['observation.state'][0, :7].cpu().numpy()
-            
             # Determine if this is an inference step (start of new action chunk)
             is_inference_step = (t % n_action_steps == 0)
 
-            # Get action from policy
+            # -- Preprocess --------------------------------------------------
+            if preprocessor is not None:
+                policy_inputs = preprocessor(policy_inputs)
+
+            # -- Inference ---------------------------------------------------
             action_chunk_norm = None
             action_chunk_raw = None
             with torch.no_grad():
@@ -1185,19 +1246,36 @@ class AlternatingTester:
                             print(f"[WARNING] Failed to get action chunk for visualization: {e}")
                             traceback.print_exc()
 
-            # Postprocess (unnormalize)
+            # -- Postprocess (unnormalize) -----------------------------------
             if postprocessor is not None:
                 action = postprocessor(action)
-            
+
+            # -- CPU copies for recording (after inference, GPU work done) ---
+            table_rgb = table_rgb_gpu[0].cpu().numpy().astype(np.uint8)
+            wrist_rgb = wrist_rgb_gpu[0].cpu().numpy().astype(np.uint8) if wrist_rgb_gpu is not None else None
+            ee_pose = ee_pose_gpu.cpu().numpy()
+            obj_pose = obj_pose_gpu.cpu().numpy()
+            action_np = action[0].cpu().numpy()
+
             # DEBUG: Print action details on first step
             if t == 0:
                 print(f"    [DEBUG] {task_name} Step 0: Raw action (normalized): {raw_action[0].cpu().numpy()}")
-                print(f"    [DEBUG] {task_name} Step 0: Unnormalized action: {action[0].cpu().numpy()}")
+                print(f"    [DEBUG] {task_name} Step 0: Unnormalized action: {action_np}")
+
+            # -- Record data -------------------------------------------------
+            images_list.append(table_rgb)
+            if wrist_rgb is not None:
+                wrist_images_list.append(wrist_rgb)
+            ee_pose_list.append(ee_pose)
+            obj_pose_list.append(obj_pose)
+            self.video_frames.append(table_rgb.copy())
+            action_list.append(action_np)
             
-            # Add frame to action chunk visualizer at inference steps
+            # -- Action chunk visualization ----------------------------------
             if action_chunk_visualizer is not None and is_inference_step and action_chunk_norm is not None:
+                ee_pose_norm_np = policy_inputs['observation.state'][0, :7].cpu().numpy()
                 action_chunk_visualizer.add_frame(
-                    ee_pose_raw=ee_pose_raw_np[:3],  # XYZ only
+                    ee_pose_raw=ee_pose[:3],  # XYZ only
                     ee_pose_norm=ee_pose_norm_np[:3],  # XYZ only
                     action_chunk_norm=action_chunk_norm[:, :3],  # XYZ only (horizon, 3)
                     action_chunk_raw=action_chunk_raw[:, :3] if action_chunk_raw is not None else None,
@@ -1207,18 +1285,12 @@ class AlternatingTester:
                     wrist_image=wrist_rgb,
                 )
 
-            action_np = action[0].cpu().numpy()
-            
-            action_list.append(action_np)
-            
-            # Update gripper state from action (last dimension)
+            # -- Update gripper state ----------------------------------------
             self.current_gripper_state = float(action_np[7])
 
-            # Execute action in environment
-            action_t = torch.from_numpy(action_np).float().unsqueeze(0).to(self.device)
+            # -- Execute action (keep on GPU, no CPU roundtrip) --------------
+            action_t = action  # already (1, action_dim) on GPU
             num_envs = self.env.unwrapped.num_envs
-            if action_t.ndim == 1:
-                action_t = action_t.unsqueeze(0)
             if action_t.shape[0] == 1 and num_envs > 1:
                 action_t = action_t.repeat(num_envs, 1)
 
@@ -1233,22 +1305,12 @@ class AlternatingTester:
                 # (includes arm returning toward home position).
                 print(f"    [{task_name}] Recording 50 additional frames after success...")
                 for extra_t in range(50):
-                    # Get observation
-                    table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
-                    
-                    # Record data
-                    images_list.append(table_rgb)
-                    if wrist_rgb is not None:
-                        wrist_images_list.append(wrist_rgb)
-                    ee_pose_list.append(ee_pose)
-                    obj_pose_list.append(obj_pose)
-                    
-                    # Record video frame
-                    self.video_frames.append(table_rgb.copy())
-                    
-                    # Prepare policy input
-                    policy_inputs = self._prepare_policy_input(
-                        table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state,
+                    # GPU observation
+                    table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state = self._get_observation_gpu()
+
+                    # Build policy input on GPU
+                    policy_inputs = self._prepare_policy_input_gpu(
+                        table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state,
                         include_obj_pose=include_obj_pose,
                         include_gripper=include_gripper,
                         has_wrist=has_wrist,
@@ -1265,19 +1327,29 @@ class AlternatingTester:
                     # Postprocess (unnormalize)
                     if postprocessor is not None:
                         action = postprocessor(action)
-                    
+
+                    # CPU copies for recording
+                    table_rgb = table_rgb_gpu[0].cpu().numpy().astype(np.uint8)
+                    wrist_rgb = wrist_rgb_gpu[0].cpu().numpy().astype(np.uint8) if wrist_rgb_gpu is not None else None
+                    ee_pose = ee_pose_gpu.cpu().numpy()
+                    obj_pose = obj_pose_gpu.cpu().numpy()
                     action_np = action[0].cpu().numpy()
-                    
+
+                    # Record data
+                    images_list.append(table_rgb)
+                    if wrist_rgb is not None:
+                        wrist_images_list.append(wrist_rgb)
+                    ee_pose_list.append(ee_pose)
+                    obj_pose_list.append(obj_pose)
+                    self.video_frames.append(table_rgb.copy())
                     action_list.append(action_np)
                     
                     # Update gripper state from policy output
                     self.current_gripper_state = float(action_np[7])
                     
-                    # Execute action in environment
-                    action_t = torch.from_numpy(action_np).float().unsqueeze(0).to(self.device)
+                    # Execute action (keep on GPU)
+                    action_t = action
                     num_envs = self.env.unwrapped.num_envs
-                    if action_t.ndim == 1:
-                        action_t = action_t.unsqueeze(0)
                     if action_t.shape[0] == 1 and num_envs > 1:
                         action_t = action_t.repeat(num_envs, 1)
                     
@@ -1522,15 +1594,12 @@ class AlternatingTester:
         print(f"    [{task_name}] Running {n_frames} transition frames (not recording)...")
         
         for t in range(n_frames):
-            # Get observation
-            table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state = self._get_observation()
-            
-            # Record video frame (but not data)
-            self.video_frames.append(table_rgb.copy())
-            
-            # Prepare policy input
-            policy_inputs = self._prepare_policy_input(
-                table_rgb, wrist_rgb, ee_pose, obj_pose, gripper_state,
+            # GPU observation (no implicit CUDA sync)
+            table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state = self._get_observation_gpu()
+
+            # Build policy input on GPU
+            policy_inputs = self._prepare_policy_input_gpu(
+                table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state,
                 include_obj_pose=include_obj_pose,
                 include_gripper=include_gripper,
                 has_wrist=has_wrist,
@@ -1547,17 +1616,17 @@ class AlternatingTester:
             # Postprocess (unnormalize)
             if postprocessor is not None:
                 action = postprocessor(action)
+
+            # CPU copy for video frame only
+            table_rgb = table_rgb_gpu[0].cpu().numpy().astype(np.uint8)
+            self.video_frames.append(table_rgb.copy())
+
+            # Update gripper state
+            self.current_gripper_state = float(action[0, 7].item())
             
-            action_np = action[0].cpu().numpy()
-            
-            # Update gripper state from policy output
-            self.current_gripper_state = float(action_np[7])
-            
-            # Execute action in environment
-            action_t = torch.from_numpy(action_np).float().unsqueeze(0).to(self.device)
+            # Execute action (keep on GPU)
+            action_t = action
             num_envs = self.env.unwrapped.num_envs
-            if action_t.ndim == 1:
-                action_t = action_t.unsqueeze(0)
             if action_t.shape[0] == 1 and num_envs > 1:
                 action_t = action_t.repeat(num_envs, 1)
             

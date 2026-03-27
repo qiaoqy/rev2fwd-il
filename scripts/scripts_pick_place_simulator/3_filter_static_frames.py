@@ -68,9 +68,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--min_static_frames", type=int, default=16,
                    help="Minimum consecutive static frames to trigger removal. "
                         "Default: 16.")
-    p.add_argument("--keep_boundary", type=int, default=2,
-                   help="Number of boundary frames to keep on each side of a "
-                        "removed static segment. Default: 2.")
     p.add_argument("--gripper_protect_radius", type=int, default=8,
                    help="Protect frames within this many frames of a gripper "
                         "state change (won't be removed). Default: 8.")
@@ -79,6 +76,9 @@ def _parse_args() -> argparse.Namespace:
                         "removed. If the furthest two EE positions within a "
                         "candidate run exceed this, the run is kept (slow "
                         "drift, not truly static). Default: 8 * velocity_threshold.")
+    p.add_argument("--min_segment_length", type=int, default=16,
+                   help="Discard segments shorter than this after splitting. "
+                        "Default: 16.")
 
     # Debug / video
     p.add_argument("--debug", action="store_true",
@@ -149,7 +149,6 @@ def build_removal_mask(
     episode: dict,
     velocity_threshold: float,
     min_static_frames: int,
-    keep_boundary: int,
     gripper_protect_radius: int,
     spatial_threshold: float | None = None,
 ) -> tuple[np.ndarray, dict]:
@@ -203,18 +202,14 @@ def build_removal_mask(
                 })
                 continue
 
-            # Keep boundary frames on each side
-            rm_start = start + keep_boundary
-            rm_end = end - keep_boundary
-            if rm_start <= rm_end:
-                remove_mask[rm_start:rm_end + 1] = True
-                removed_runs.append({
-                    "start": int(start), "end": int(end),
-                    "run_len": run_len,
-                    "diameter": round(float(diameter), 8),
-                    "removed_start": int(rm_start), "removed_end": int(rm_end),
-                    "removed_count": int(rm_end - rm_start + 1),
-                })
+            # Remove the entire static run
+            remove_mask[start:end + 1] = True
+            removed_runs.append({
+                "start": int(start), "end": int(end),
+                "run_len": run_len,
+                "diameter": round(float(diameter), 8),
+                "removed_count": run_len,
+            })
 
     # 5. Protect frames near gripper state transitions
     gripper = episode.get("gripper", episode["action"][:, 7])
@@ -229,10 +224,6 @@ def build_removal_mask(
             if remove_mask[f]:
                 remove_mask[f] = False
                 protected_frames.append(int(f))
-
-    # 6. Always keep first and last frame
-    remove_mask[0] = False
-    remove_mask[-1] = False
 
     info = {
         "T_original": T,
@@ -255,7 +246,6 @@ def filter_episode(
     episode: dict,
     velocity_threshold: float,
     min_static_frames: int,
-    keep_boundary: int,
     gripper_protect_radius: int,
     spatial_threshold: float | None = None,
 ) -> tuple[dict, dict]:
@@ -267,7 +257,7 @@ def filter_episode(
     """
     remove_mask, info = build_removal_mask(
         episode, velocity_threshold, min_static_frames,
-        keep_boundary, gripper_protect_radius, spatial_threshold,
+        gripper_protect_radius, spatial_threshold,
     )
 
     T = len(episode["images"])
@@ -502,9 +492,9 @@ def main() -> None:
     print(f"  Output:                {args.out}")
     print(f"  velocity_threshold:    {args.velocity_threshold}")
     print(f"  min_static_frames:     {args.min_static_frames}")
-    print(f"  keep_boundary:         {args.keep_boundary}")
     print(f"  gripper_protect_radius:{args.gripper_protect_radius}")
     print(f"  spatial_threshold:     {args.spatial_threshold}")
+    print(f"  min_segment_length:    {args.min_segment_length}")
     print(f"  debug:                 {args.debug}")
 
     input_path = Path(args.input)
@@ -564,7 +554,7 @@ def main() -> None:
         # Build removal mask (but don't filter yet, so debug can use original)
         remove_mask, info = build_removal_mask(
             ep, args.velocity_threshold, args.min_static_frames,
-            args.keep_boundary, args.gripper_protect_radius,
+            args.gripper_protect_radius,
             args.spatial_threshold,
         )
 
@@ -575,7 +565,10 @@ def main() -> None:
 
         # Split kept frames into contiguous segments (each becomes a separate episode)
         keep_indices = np.where(~remove_mask)[0]
-        segments = find_contiguous_segments(keep_indices)
+        all_segments = find_contiguous_segments(keep_indices)
+        # Drop segments shorter than min_segment_length
+        segments = [s for s in all_segments if len(s) >= args.min_segment_length]
+        dropped_segs = len(all_segments) - len(segments)
 
         ep_filtered_frames = 0
         for seg_indices in segments:
@@ -594,8 +587,9 @@ def main() -> None:
 
         # Add segment info to diagnostics
         info["num_segments"] = len(segments)
+        info["dropped_short_segments"] = dropped_segs
         info["segment_lengths"] = [len(s) for s in segments]
-        info["retention_pct"] = round(100 * len(keep_indices) / orig_len, 2) if orig_len else 0
+        info["retention_pct"] = round(100 * ep_filtered_frames / orig_len, 2) if orig_len else 0
 
         # Don't store keep_indices in info for serialisation (can be large)
         info_for_json = {k: v for k, v in info.items() if k != "keep_indices"}
@@ -608,9 +602,10 @@ def main() -> None:
         if i < 5 or (i + 1) % 20 == 0 or i == len(episodes) - 1:
             pct = 100 * info["num_removed"] / orig_len if orig_len else 0
             seg_lens = ",".join(str(l) for l in info["segment_lengths"])
+            drop_str = f" drop={dropped_segs}" if dropped_segs else ""
             print(f"  ep {i:3d}: {orig_len:5d} → {ep_filtered_frames:4d} frames  "
-                  f"(removed {info['num_removed']:3d}, {pct:.1f}%)  "
-                  f"segs={info['num_segments']} [{seg_lens}]  "
+                  f"(removed {orig_len - ep_filtered_frames:3d}, {pct:.1f}%)  "
+                  f"segs={info['num_segments']} [{seg_lens}]{drop_str}  "
                   f"runs_removed={info['static_runs_long']}  "
                   f"runs_skipped={info['static_runs_skipped']}  "
                   f"gripper_changes={len(info['gripper_change_frames'])}")
@@ -631,8 +626,8 @@ def main() -> None:
     print(f"velocity_threshold:       {args.velocity_threshold}")
     print(f"spatial_threshold:        {args.spatial_threshold}")
     print(f"min_static_frames:        {args.min_static_frames}")
-    print(f"keep_boundary:            {args.keep_boundary}")
     print(f"gripper_protect_radius:   {args.gripper_protect_radius}")
+    print(f"min_segment_length:       {args.min_segment_length}")
     print(f"Original total frames:    {total_orig}")
     print(f"Filtered total frames:    {total_filtered}")
     print(f"Frames removed:           {total_orig - total_filtered}")
@@ -677,12 +672,12 @@ def main() -> None:
         "velocity_threshold": args.velocity_threshold,
         "spatial_threshold": args.spatial_threshold,
         "min_static_frames": args.min_static_frames,
-        "keep_boundary": args.keep_boundary,
         "gripper_protect_radius": args.gripper_protect_radius,
         "num_input_episodes": len(episodes),
         "num_output_episodes": len(filtered_episodes),
         "num_episodes": len(filtered_episodes),
         "total_segments": total_segments,
+        "min_segment_length": args.min_segment_length,
         "original_total_frames": total_orig,
         "filtered_total_frames": total_filtered,
         "frames_removed": total_orig - total_filtered,
@@ -706,7 +701,6 @@ def main() -> None:
                 "velocity_threshold": args.velocity_threshold,
                 "spatial_threshold": args.spatial_threshold,
                 "min_static_frames": args.min_static_frames,
-                "keep_boundary": args.keep_boundary,
                 "gripper_protect_radius": args.gripper_protect_radius,
             },
             "overall": {

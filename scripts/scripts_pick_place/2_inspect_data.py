@@ -292,19 +292,27 @@ def save_frame_data_as_json(episode_data: dict, frame_idx: int, output_path: Pat
         frame_idx: Index of the frame.
         output_path: Path to save the JSON file.
     """
-    if frame_idx >= len(episode_data["obs"]):
-        raise ValueError(f"Frame {frame_idx} not found. Episode has {len(episode_data['obs'])} frames.")
+    # Determine frame count from available keys
+    ref_key = "obs" if "obs" in episode_data else "ee_pose"
+    if frame_idx >= len(episode_data[ref_key]):
+        raise ValueError(f"Frame {frame_idx} not found. Episode has {len(episode_data[ref_key])} frames.")
     
     frame_data = {
         "frame_idx": frame_idx,
-        "obs": episode_data["obs"][frame_idx].tolist(),
         "ee_pose": episode_data["ee_pose"][frame_idx].tolist(),
         "obj_pose": episode_data["obj_pose"][frame_idx].tolist(),
-        "gripper": float(episode_data["gripper"][frame_idx]),
-        "place_pose": episode_data["place_pose"].tolist(),
-        "goal_pose": episode_data["goal_pose"].tolist(),
         "success": bool(episode_data["success"]),
     }
+    if "obs" in episode_data:
+        frame_data["obs"] = episode_data["obs"][frame_idx].tolist()
+    if "gripper" in episode_data:
+        frame_data["gripper"] = float(episode_data["gripper"][frame_idx])
+    elif "action" in episode_data:
+        frame_data["gripper"] = float(episode_data["action"][frame_idx, 7])
+    if "place_pose" in episode_data:
+        frame_data["place_pose"] = episode_data["place_pose"].tolist()
+    if "goal_pose" in episode_data:
+        frame_data["goal_pose"] = episode_data["goal_pose"].tolist()
     
     with open(output_path, "w") as f:
         json.dump(frame_data, f, indent=2)
