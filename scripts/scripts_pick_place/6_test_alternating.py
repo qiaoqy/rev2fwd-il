@@ -1148,12 +1148,26 @@ class AlternatingTester:
         # Reset policy action queue for new task
         policy.reset()
 
+        # -- Monkey-patch conditional_sample to capture full trajectory ----
+        # This lets us inspect position 0 (the "history" action slot)
+        # without a separate stochastic sample.
+        _last_full_trajectory = [None]  # will hold (B, horizon, action_dim)
+        _orig_conditional_sample = None
+        if action_chunk_visualizer is not None and hasattr(policy, 'diffusion'):
+            _orig_conditional_sample = policy.diffusion.conditional_sample
+            def _capturing_conditional_sample(*args, **kwargs):
+                result = _orig_conditional_sample(*args, **kwargs)
+                _last_full_trajectory[0] = result.detach().clone()
+                return result
+            policy.diffusion.conditional_sample = _capturing_conditional_sample
+
         # Recording buffers
         images_list = []
         wrist_images_list = []
         ee_pose_list = []
         obj_pose_list = []
         action_list = []
+        _prev_action_raw = None  # previous step's unnormalized action (for pos-0 comparison)
 
         success = False
         success_step = None
@@ -1161,6 +1175,15 @@ class AlternatingTester:
         for t in range(self.horizon):
             # -- GPU observation (no implicit CUDA sync) ---------------------
             table_rgb_gpu, wrist_rgb_gpu, ee_pose_gpu, obj_pose_gpu, gripper_state = self._get_observation_gpu()
+
+            # -- Apply observation z-offset (inverse of action z-offset) -----
+            # This keeps the policy in a consistent "virtual" coordinate frame:
+            # policy sees ee_z + |offset|, outputs action_z in that frame,
+            # then action_z - |offset| is sent to env.step().
+            _z_off = getattr(self, 'action_z_offset', 0.0)
+            if _z_off != 0.0:
+                ee_pose_gpu = ee_pose_gpu.clone()
+                ee_pose_gpu[2] -= _z_off  # negate: action_z_offset=-0.03 → obs z += 0.03
 
             # -- Build policy input on GPU -----------------------------------
             policy_inputs = self._prepare_policy_input_gpu(
@@ -1177,12 +1200,16 @@ class AlternatingTester:
                       f"include_obj_pose={include_obj_pose}, include_gripper={include_gripper}, has_wrist={has_wrist}")
                 print(f"    [DEBUG] {task_name} Step 0: observation.state={policy_inputs['observation.state'][0, :7].cpu().numpy()}")
 
-            # Determine if this is an inference step (start of new action chunk)
-            is_inference_step = (t % n_action_steps == 0)
-
             # -- Preprocess --------------------------------------------------
             if preprocessor is not None:
                 policy_inputs = preprocessor(policy_inputs)
+
+            # -- Detect actual inference (queue empty → policy will generate) -
+            _did_infer = False
+            if action_chunk_visualizer is not None:
+                _aq = getattr(policy, '_queues', {}).get('action')
+                if _aq is not None and len(_aq) == 0:
+                    _did_infer = True
 
             # -- Inference ---------------------------------------------------
             action_chunk_norm = None
@@ -1191,43 +1218,32 @@ class AlternatingTester:
                 action = policy.select_action(policy_inputs)
                 raw_action = action.clone()
                 
-                # Get full action chunk for visualization at inference steps
-                if is_inference_step and action_chunk_visualizer is not None:
+                # Get full action chunk for visualization when inference
+                # actually happened. Extract the ACTUAL chunk from the
+                # policy's internal queue (not a separate inference which
+                # would produce a different stochastic sample).
+                if _did_infer and action_chunk_visualizer is not None:
                     try:
-                        # For diffusion policy, prepare the batch correctly
-                        n_obs_steps_required = policy.config.n_obs_steps if hasattr(policy, 'config') else 2
-                        
-                        inference_batch = {}
-                        
-                        # Copy state - replicate to fill n_obs_steps dimension
-                        if 'observation.state' in policy_inputs:
-                            state = policy_inputs['observation.state']  # (B, state_dim)
-                            if state.dim() == 2:
-                                state = state.unsqueeze(1).repeat(1, n_obs_steps_required, 1)
-                            inference_batch['observation.state'] = state
-                        
-                        # Stack image features into observation.images
-                        if hasattr(policy, 'config') and hasattr(policy.config, 'image_features'):
-                            image_features_list = []
-                            for key in policy.config.image_features:
-                                if key in policy_inputs:
-                                    img = policy_inputs[key]  # (B, C, H, W)
-                                    if img.dim() == 4:
-                                        img = img.unsqueeze(1).repeat(1, n_obs_steps_required, 1, 1, 1)
-                                    image_features_list.append(img)
-                            if image_features_list:
-                                inference_batch['observation.images'] = torch.stack(image_features_list, dim=2)
-                        
-                        # Call diffusion.generate_actions to get full chunk
-                        if hasattr(policy, 'diffusion'):
-                            full_chunk = policy.diffusion.generate_actions(inference_batch)
-                            # full_chunk shape: (B, horizon, action_dim)
-                            if full_chunk.dim() == 3:
-                                action_chunk_norm = full_chunk[0].cpu().numpy()  # (horizon, action_dim)
-                            elif full_chunk.dim() == 2:
-                                action_chunk_norm = full_chunk.cpu().numpy()
+                        # After select_action at an inference step, the policy
+                        # just generated a chunk and put it in _queues["action"].
+                        # The first action was already popped, so reconstruct
+                        # the full chunk: [popped action] + remaining queue.
+                        queue_key = "action"
+                        if hasattr(policy, '_queues') and queue_key in policy._queues:
+                            remaining = list(policy._queues[queue_key])  # list of (B, action_dim) or (action_dim,)
+                            # Prepend the just-returned action (raw_action before postprocessing)
+                            first = raw_action  # (B, action_dim)
+                            if first.dim() == 1:
+                                first = first.unsqueeze(0)
+                            all_actions = [first] + [a.unsqueeze(0) if a.dim() == 1 else a for a in remaining]
+                            chunk_tensor = torch.cat(all_actions, dim=0)  # (n_action_steps, action_dim) or (n_action_steps, B, action_dim)
+                            if chunk_tensor.dim() == 3:
+                                # (n_action_steps, B, action_dim) -> (B, n_action_steps, action_dim)
+                                chunk_tensor = chunk_tensor.transpose(0, 1)
+                                action_chunk_norm = chunk_tensor[0].cpu().numpy()
                             else:
-                                action_chunk_norm = full_chunk.cpu().numpy()[np.newaxis, :]
+                                # (n_action_steps, action_dim)
+                                action_chunk_norm = chunk_tensor.cpu().numpy()
                             
                             # Unnormalize each action in the chunk
                             if postprocessor is not None:
@@ -1236,9 +1252,45 @@ class AlternatingTester:
                                     single_action = torch.from_numpy(action_chunk_norm[i]).float().to(self.device)
                                     unnorm_action = postprocessor(single_action)
                                     unnorm_actions.append(unnorm_action.cpu().numpy())
-                                action_chunk_raw = np.array(unnorm_actions)  # (horizon, action_dim)
+                                action_chunk_raw = np.array(unnorm_actions)
                             else:
                                 action_chunk_raw = action_chunk_norm.copy()
+                        else:
+                            # Fallback: try the old separate-inference method
+                            n_obs_steps_required = policy.config.n_obs_steps if hasattr(policy, 'config') else 2
+                            inference_batch = {}
+                            if 'observation.state' in policy_inputs:
+                                state = policy_inputs['observation.state']
+                                if state.dim() == 2:
+                                    state = state.unsqueeze(1).repeat(1, n_obs_steps_required, 1)
+                                inference_batch['observation.state'] = state
+                            if hasattr(policy, 'config') and hasattr(policy.config, 'image_features'):
+                                image_features_list = []
+                                for key in policy.config.image_features:
+                                    if key in policy_inputs:
+                                        img = policy_inputs[key]
+                                        if img.dim() == 4:
+                                            img = img.unsqueeze(1).repeat(1, n_obs_steps_required, 1, 1, 1)
+                                        image_features_list.append(img)
+                                if image_features_list:
+                                    inference_batch['observation.images'] = torch.stack(image_features_list, dim=2)
+                            if hasattr(policy, 'diffusion'):
+                                full_chunk = policy.diffusion.generate_actions(inference_batch)
+                                if full_chunk.dim() == 3:
+                                    action_chunk_norm = full_chunk[0].cpu().numpy()
+                                elif full_chunk.dim() == 2:
+                                    action_chunk_norm = full_chunk.cpu().numpy()
+                                else:
+                                    action_chunk_norm = full_chunk.cpu().numpy()[np.newaxis, :]
+                                if postprocessor is not None:
+                                    unnorm_actions = []
+                                    for i in range(action_chunk_norm.shape[0]):
+                                        single_action = torch.from_numpy(action_chunk_norm[i]).float().to(self.device)
+                                        unnorm_action = postprocessor(single_action)
+                                        unnorm_actions.append(unnorm_action.cpu().numpy())
+                                    action_chunk_raw = np.array(unnorm_actions)
+                                else:
+                                    action_chunk_raw = action_chunk_norm.copy()
                                 
                     except Exception as e:
                         import traceback
@@ -1272,8 +1324,22 @@ class AlternatingTester:
             action_list.append(action_np)
             
             # -- Action chunk visualization ----------------------------------
-            if action_chunk_visualizer is not None and is_inference_step and action_chunk_norm is not None:
+            if action_chunk_visualizer is not None and _did_infer and action_chunk_norm is not None:
                 ee_pose_norm_np = policy_inputs['observation.state'][0, :7].cpu().numpy()
+
+                # Extract position-0 ("history" slot) from captured full trajectory
+                history_action_raw = None
+                if _last_full_trajectory[0] is not None:
+                    full_traj = _last_full_trajectory[0]  # (B, horizon, action_dim)
+                    pos0_norm = full_traj[0, 0, :].cpu().numpy()  # position 0
+                    if postprocessor is not None:
+                        pos0_tensor = torch.from_numpy(pos0_norm).float().to(self.device)
+                        pos0_unnorm = postprocessor(pos0_tensor).cpu().numpy()
+                    else:
+                        pos0_unnorm = pos0_norm.copy()
+                    history_action_raw = pos0_unnorm[:3]  # XYZ only
+                    _last_full_trajectory[0] = None  # consume
+
                 action_chunk_visualizer.add_frame(
                     ee_pose_raw=ee_pose[:3],  # XYZ only
                     ee_pose_norm=ee_pose_norm_np[:3],  # XYZ only
@@ -1283,13 +1349,22 @@ class AlternatingTester:
                     gt_chunk_raw=None,
                     table_image=table_rgb,
                     wrist_image=wrist_rgb,
+                    env_step=t,
+                    history_action_raw=history_action_raw,
+                    prev_real_action=_prev_action_raw[:3].copy() if _prev_action_raw is not None else None,
                 )
+
+            _prev_action_raw = action_np.copy()
 
             # -- Update gripper state ----------------------------------------
             self.current_gripper_state = float(action_np[7])
 
             # -- Execute action (keep on GPU, no CPU roundtrip) --------------
             action_t = action  # already (1, action_dim) on GPU
+            # Apply optional z-offset (e.g. lower the gripper by a fixed amount)
+            if getattr(self, 'action_z_offset', 0.0) != 0.0:
+                action_t = action_t.clone()
+                action_t[:, 2] += self.action_z_offset
             num_envs = self.env.unwrapped.num_envs
             if action_t.shape[0] == 1 and num_envs > 1:
                 action_t = action_t.repeat(num_envs, 1)
@@ -1361,6 +1436,10 @@ class AlternatingTester:
             # Print progress
             if (t + 1) % 100 == 0:
                 print(f"    [{task_name}] Step {t+1}/{self.horizon}")
+
+        # -- Restore monkey-patched conditional_sample -----------------------
+        if _orig_conditional_sample is not None:
+            policy.diffusion.conditional_sample = _orig_conditional_sample
 
         # Build episode dict
         episode_data = {

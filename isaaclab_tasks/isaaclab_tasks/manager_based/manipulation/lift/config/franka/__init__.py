@@ -63,6 +63,46 @@ gym.register(
 )
 
 ##
+# Multi-Object IK-Abs (Exp28)
+##
+
+gym.register(
+    id="Isaac-Lift-Cylinder-Franka-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.multi_object_env_cfg:FrankaCylinderLiftEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Lift-Sphere-Franka-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.multi_object_env_cfg:FrankaSphereLiftEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Lift-Bottle-Franka-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.multi_object_env_cfg:FrankaBottleLiftEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Lift-Gear-Franka-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.multi_object_env_cfg:FrankaGearLiftEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
+##
 # Inverse Kinematics - Relative Pose Control
 ##
 

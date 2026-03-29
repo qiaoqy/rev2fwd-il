@@ -157,59 +157,81 @@ def render_annotated_video(
     fps: int = 20,
     wrist_frames_sim: list[np.ndarray] | None = None,
     wrist_frames_data: np.ndarray | None = None,
+    premove_len: int = 0,
 ) -> None:
-    """Render side-by-side video: left=sim replay, right=original reversed data."""
-    T = min(len(sim_frames), len(data_frames))
+    """Render side-by-side video: left=sim replay, right=original reversed data.
+
+    When premove_len > 0, the first premove_len sim frames have no corresponding
+    data frames and are annotated with a cyan PRE-MOVE label.
+    """
+    T_sim = len(sim_frames)
+    T_data = len(data_frames)
     H, W = sim_frames[0].shape[:2]
     scale = max(1, 256 // W)
     out_H, out_W = H * scale, W * scale
 
     annotated = []
-    for t in range(T):
-        # Sim frame (left)
+    for t in range(T_sim):
+        # Sim frame (left) — always available
         sim_f = sim_frames[t]
         if scale > 1:
             sim_f = cv2.resize(sim_f, (out_W, out_H),
                                interpolation=cv2.INTER_NEAREST)
 
         obj_sim = obj_poses_sim[t] if t < len(obj_poses_sim) else np.zeros(3)
-        obj_data = obj_poses_data[t] if t < len(obj_poses_data) else np.zeros(3)
         ee_sim = ee_poses_sim[t] if t < len(ee_poses_sim) else np.zeros(7)
-        gripper = actions[t, 7] if t < len(actions) else 0
+        is_premove = (t < premove_len)
+        data_t = t - premove_len
 
-        # Overlay on sim frame
-        lines_sim = [
-            f"SIM REPLAY | Ep {ep_idx} | Step {t+1}/{T}",
+        if is_premove:
+            gripper = 1.0
+        else:
+            gripper = actions[data_t, 7] if data_t < len(actions) else 0
+
+        lines_sim = []
+        if is_premove:
+            lines_sim.append(f">>> PRE-MOVE {t+1}/{premove_len} <<<")
+        lines_sim.extend([
+            f"SIM REPLAY | Ep {ep_idx} | Step {t+1}/{T_sim}",
             f"ObjXY: ({obj_sim[0]:.3f}, {obj_sim[1]:.3f})  Z:{obj_sim[2]:.3f}",
             f"EE: ({ee_sim[0]:.3f}, {ee_sim[1]:.3f}, {ee_sim[2]:.3f})",
             f"Grip: {'OPEN' if gripper > 0.5 else 'CLOSED'} ({gripper:.2f})",
-        ]
+        ])
         for i, text in enumerate(lines_sim):
             y = 4 + (i + 1) * int(14 * scale / 2 + 2)
             sim_f = add_text_overlay(sim_f, text, position=(4, y),
                                      font_scale=0.35 * scale / 2 + 0.1)
+        if is_premove:
+            cv2.rectangle(sim_f, (0, 0), (out_W - 1, out_H - 1),
+                          (255, 255, 0), 2)
 
         # Data frame (right)
-        data_f = data_frames[t]
-        if scale > 1:
-            data_f = cv2.resize(data_f, (out_W, out_H),
-                                interpolation=cv2.INTER_NEAREST)
-
-        lines_data = [
-            f"REVERSED DATA | Ep {ep_idx} | Step {t+1}/{T}",
-            f"ObjXY: ({obj_data[0]:.3f}, {obj_data[1]:.3f})  Z:{obj_data[2]:.3f}",
-        ]
-        for i, text in enumerate(lines_data):
-            y = 4 + (i + 1) * int(14 * scale / 2 + 2)
-            data_f = add_text_overlay(data_f, text, position=(4, y),
+        if not is_premove and 0 <= data_t < T_data:
+            data_f = data_frames[data_t]
+            if scale > 1:
+                data_f = cv2.resize(data_f, (out_W, out_H),
+                                    interpolation=cv2.INTER_NEAREST)
+            obj_data = obj_poses_data[data_t] if data_t < len(obj_poses_data) else np.zeros(3)
+            lines_data = [
+                f"REVERSED DATA | Ep {ep_idx} | Step {data_t+1}/{T_data}",
+                f"ObjXY: ({obj_data[0]:.3f}, {obj_data[1]:.3f})  Z:{obj_data[2]:.3f}",
+            ]
+            for i, text in enumerate(lines_data):
+                y = 4 + (i + 1) * int(14 * scale / 2 + 2)
+                data_f = add_text_overlay(data_f, text, position=(4, y),
+                                          font_scale=0.35 * scale / 2 + 0.1)
+        else:
+            data_f = np.zeros((out_H, out_W, 3), dtype=np.uint8)
+            label = "PRE-MOVE (no data)" if is_premove else "NO DATA"
+            data_f = add_text_overlay(data_f, label, position=(4, out_H // 2),
                                       font_scale=0.35 * scale / 2 + 0.1)
 
-        # Side-by-side
         combined = np.concatenate([sim_f, data_f], axis=1)
 
-        # Wrist cameras below: sim wrist (left), data wrist (right)
+        # Wrist cameras
         has_sim_wrist = (wrist_frames_sim is not None and t < len(wrist_frames_sim))
-        has_data_wrist = (wrist_frames_data is not None and t < len(wrist_frames_data))
+        has_data_wrist = (not is_premove and wrist_frames_data is not None
+                          and 0 <= data_t < len(wrist_frames_data))
         if has_sim_wrist or has_data_wrist:
             if has_sim_wrist:
                 wf_sim = wrist_frames_sim[t]
@@ -219,7 +241,7 @@ def render_annotated_video(
             else:
                 wf_sim = np.zeros((out_H, out_W, 3), dtype=np.uint8)
             if has_data_wrist:
-                wf_data = wrist_frames_data[t]
+                wf_data = wrist_frames_data[data_t]
                 if scale > 1:
                     wf_data = cv2.resize(wf_data, (out_W, out_H),
                                          interpolation=cv2.INTER_NEAREST)
@@ -231,6 +253,143 @@ def render_annotated_video(
         annotated.append(combined)
 
     _write_video_h264(annotated, out_path, fps=fps)
+
+
+def _render_gripper_close_debug(
+    sim_frames: list[np.ndarray],
+    data_frames: np.ndarray,
+    ee_poses_sim: list[np.ndarray],
+    obj_poses_sim: list[np.ndarray],
+    ee_poses_data: np.ndarray,
+    obj_poses_data: np.ndarray,
+    actions: np.ndarray,
+    ep_idx: int,
+    out_dir: Path,
+    radius: int = 32,
+    fps: int = 5,
+    premove_len: int = 0,
+) -> None:
+    """Create slow-motion debug video around gripper-close events.
+
+    Shows ±radius frames around each gripper state change (OPEN→CLOSED),
+    with detailed ee_pose and obj_pose xyz annotations for both sim replay
+    and reversed data side-by-side.
+    """
+    T_data = len(actions)
+
+    # Find gripper close events in the action sequence (OPEN→CLOSED transitions)
+    gripper_vals = actions[:, 7]
+    close_frames = []
+    for t in range(1, T_data):
+        if gripper_vals[t - 1] > 0 and gripper_vals[t] <= 0:
+            close_frames.append(t)
+
+    if not close_frames:
+        print(f"  [Gripper Debug] No gripper-close events found in ep {ep_idx}")
+        return
+
+    print(f"  [Gripper Debug] Found {len(close_frames)} gripper-close event(s) "
+          f"at data frames: {close_frames}")
+
+    T_sim = len(sim_frames)
+    H, W = sim_frames[0].shape[:2]
+    scale = max(1, 384 // W)  # larger scale for debug clarity
+    out_H, out_W = H * scale, W * scale
+
+    for ci, close_t in enumerate(close_frames):
+        # Frame range in data coordinates
+        d_start = max(0, close_t - radius)
+        d_end = min(T_data - 1, close_t + radius)
+
+        # Corresponding sim frame range (offset by premove_len)
+        s_start = d_start + premove_len
+        s_end = min(T_sim - 1, d_end + premove_len)
+
+        frames_out = []
+        for d_t in range(d_start, d_end + 1):
+            s_t = d_t + premove_len  # sim frame index
+            rel = d_t - close_t  # relative to gripper close event
+
+            # ── SIM panel (left) ──
+            if s_t < T_sim:
+                sim_f = sim_frames[s_t].copy()
+            else:
+                sim_f = np.zeros((H, W, 3), dtype=np.uint8)
+            if scale > 1:
+                sim_f = cv2.resize(sim_f, (out_W, out_H),
+                                   interpolation=cv2.INTER_NEAREST)
+
+            ee_s = ee_poses_sim[s_t] if s_t < len(ee_poses_sim) else np.zeros(7)
+            obj_s = obj_poses_sim[s_t] if s_t < len(obj_poses_sim) else np.zeros(3)
+            grip = actions[d_t, 7] if d_t < T_data else 0
+            grip_str = "OPEN" if grip > 0.5 else "CLOSED"
+
+            # Highlight: yellow border at gripper close frame, red ±2 frames
+            if rel == 0:
+                cv2.rectangle(sim_f, (0, 0), (out_W - 1, out_H - 1),
+                              (0, 255, 255), 3)  # yellow
+            elif abs(rel) <= 2:
+                cv2.rectangle(sim_f, (0, 0), (out_W - 1, out_H - 1),
+                              (0, 0, 255), 2)  # red
+
+            fs = 0.38 * scale / 3 + 0.12
+            lh = int(15 * scale / 3 + 2)
+            lines_s = [
+                f"SIM | GripEvt{ci} | t={d_t} (rel={rel:+d})",
+                f"Grip: {grip_str} ({grip:.3f})",
+                f"EE X: {ee_s[0]:.4f}",
+                f"EE Y: {ee_s[1]:.4f}",
+                f"EE Z: {ee_s[2]:.4f}",
+                f"Obj X: {obj_s[0]:.4f}",
+                f"Obj Y: {obj_s[1]:.4f}",
+                f"Obj Z: {obj_s[2]:.4f}",
+            ]
+            for i, text in enumerate(lines_s):
+                y = 4 + (i + 1) * lh
+                sim_f = add_text_overlay(sim_f, text, position=(4, y),
+                                         font_scale=fs)
+
+            # ── DATA panel (right) ──
+            if d_t < len(data_frames):
+                data_f = data_frames[d_t].copy()
+            else:
+                data_f = np.zeros((H, W, 3), dtype=np.uint8)
+            if scale > 1:
+                data_f = cv2.resize(data_f, (out_W, out_H),
+                                    interpolation=cv2.INTER_NEAREST)
+
+            ee_d = ee_poses_data[d_t, :3] if d_t < len(ee_poses_data) else np.zeros(3)
+            obj_d = obj_poses_data[d_t, :3] if d_t < len(obj_poses_data) else np.zeros(3)
+
+            if rel == 0:
+                cv2.rectangle(data_f, (0, 0), (out_W - 1, out_H - 1),
+                              (0, 255, 255), 3)
+            elif abs(rel) <= 2:
+                cv2.rectangle(data_f, (0, 0), (out_W - 1, out_H - 1),
+                              (0, 0, 255), 2)
+
+            lines_d = [
+                f"DATA | GripEvt{ci} | t={d_t} (rel={rel:+d})",
+                f"Grip: {grip_str} ({grip:.3f})",
+                f"EE X: {ee_d[0]:.4f}",
+                f"EE Y: {ee_d[1]:.4f}",
+                f"EE Z: {ee_d[2]:.4f}",
+                f"Obj X: {obj_d[0]:.4f}",
+                f"Obj Y: {obj_d[1]:.4f}",
+                f"Obj Z: {obj_d[2]:.4f}",
+            ]
+            for i, text in enumerate(lines_d):
+                y = 4 + (i + 1) * lh
+                data_f = add_text_overlay(data_f, text, position=(4, y),
+                                          font_scale=fs)
+
+            combined = np.concatenate([sim_f, data_f], axis=1)
+            frames_out.append(combined)
+
+        video_path = out_dir / f"replay_ep{ep_idx}_gripper_close{ci}.mp4"
+        _write_video_h264(frames_out, video_path, fps=fps)
+        print(f"  [Gripper Debug] Saved: {video_path} "
+              f"(data frames [{d_start}-{d_end}], {len(frames_out)} frames @ {fps} fps)")
 
 
 # ── arg parsing ──────────────────────────────────────────────────────────
@@ -274,6 +433,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--command_source", type=str,
                         choices=["action", "ee_pose"], default="action",
                         help="Replay from 'action' field or 'ee_pose' + gripper.")
+
+    # Pre-move: position arm above object before replay
+    parser.add_argument("--pre_move_hover", action="store_true",
+                        help="Move arm above the object before replay starts.")
+    parser.add_argument("--pre_move_height", type=float, default=0.091,
+                        help="Height above object for pre-move hover (default 0.091m, "
+                             "gives ~0.113m EE Z with obj at 0.022).")
+    parser.add_argument("--pre_move_steps", type=int, default=60,
+                        help="Sim steps for the pre-move hover approach.")
+
+    # Gripper-close debug video
+    parser.add_argument("--gripper_debug_radius", type=int, default=32,
+                        help="Number of frames before/after gripper close to include "
+                             "in the debug slow-motion video (default: 32).")
+    parser.add_argument("--gripper_debug_fps", type=int, default=5,
+                        help="FPS for the gripper debug slow-motion video (default: 5).")
 
     from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(parser)
@@ -449,6 +624,61 @@ def main() -> None:
             teleport_object_to_pose(env, obj_pose_t, name="object")
             _settle(steps=20)
 
+            # ── Pre-move: hover above object ──
+            premove_frames = []
+            premove_wrist = []
+            premove_ee = []
+            premove_obj = []
+
+            if args.pre_move_hover:
+                GRIPPER_DOWN_QUAT = torch.tensor(
+                    [0.0, 1.0, 0.0, 0.0], device=device)
+                obj_now = get_object_pose_w(env)[0].cpu().numpy()
+                hover_x, hover_y = float(obj_now[0]), float(obj_now[1])
+                hover_z = float(obj_now[2]) + args.pre_move_height
+
+                hover_act = torch.zeros(1, env.action_space.shape[-1], device=device)
+                hover_act[0, 0] = hover_x
+                hover_act[0, 1] = hover_y
+                hover_act[0, 2] = hover_z
+                hover_act[0, 3:7] = GRIPPER_DOWN_QUAT
+                hover_act[0, 7] = 1.0  # gripper open
+
+                print(f"  [PRE-MOVE] Hover above ({hover_x:.3f}, {hover_y:.3f}, {hover_z:.3f})")
+                for _ in range(args.pre_move_steps):
+                    table_rgb = table_camera.data.output["rgb"]
+                    if table_rgb.shape[-1] > 3:
+                        table_rgb = table_rgb[..., :3]
+                    premove_frames.append(table_rgb.cpu().numpy().astype(np.uint8)[0])
+                    if wrist_camera is not None:
+                        wrist_rgb = wrist_camera.data.output["rgb"]
+                        if wrist_rgb.shape[-1] > 3:
+                            wrist_rgb = wrist_rgb[..., :3]
+                        premove_wrist.append(wrist_rgb.cpu().numpy().astype(np.uint8)[0])
+                    premove_ee.append(get_ee_pose_w(env)[0].cpu().numpy())
+                    premove_obj.append(get_object_pose_w(env)[0].cpu().numpy()[:3])
+                    env.step(hover_act)
+
+                # Settle at hover
+                for _ in range(15):
+                    table_rgb = table_camera.data.output["rgb"]
+                    if table_rgb.shape[-1] > 3:
+                        table_rgb = table_rgb[..., :3]
+                    premove_frames.append(table_rgb.cpu().numpy().astype(np.uint8)[0])
+                    if wrist_camera is not None:
+                        wrist_rgb = wrist_camera.data.output["rgb"]
+                        if wrist_rgb.shape[-1] > 3:
+                            wrist_rgb = wrist_rgb[..., :3]
+                        premove_wrist.append(wrist_rgb.cpu().numpy().astype(np.uint8)[0])
+                    premove_ee.append(get_ee_pose_w(env)[0].cpu().numpy())
+                    premove_obj.append(get_object_pose_w(env)[0].cpu().numpy()[:3])
+                    env.step(hover_act)
+
+                ee_after = get_ee_pose_w(env)[0].cpu().numpy()
+                print(f"  [PRE-MOVE] Done. EE=({ee_after[0]:.3f}, {ee_after[1]:.3f}, {ee_after[2]:.3f})")
+
+            premove_len = len(premove_frames)
+
             # Verify cube position
             init_obj = get_object_pose_w(env)[0].cpu().numpy()
             init_ee = get_ee_pose_w(env)[0].cpu().numpy()
@@ -456,10 +686,10 @@ def main() -> None:
                   f"ee=({init_ee[0]:.3f},{init_ee[1]:.3f},{init_ee[2]:.3f})")
 
             # Replay actions and record
-            sim_frames = []
-            wrist_frames = []
-            obj_poses_sim = []
-            ee_poses_sim = []
+            sim_frames = list(premove_frames)
+            wrist_frames = list(premove_wrist)
+            obj_poses_sim = list(premove_obj)
+            ee_poses_sim = list(premove_ee)
 
             for t in range(T_replay):
                 # Record observation
@@ -526,11 +756,28 @@ def main() -> None:
                 fps=args.video_fps,
                 wrist_frames_sim=wrist_frames if wrist_frames else None,
                 wrist_frames_data=data_wrist_images[:T_replay] if data_wrist_images is not None else None,
+                premove_len=premove_len,
             )
 
             # Also save sim-only video (just the sim replay frames)
             sim_only_path = out_dir / f"replay_ep{ep_idx}_sim_only.mp4"
             _write_video_h264(sim_frames, sim_only_path, fps=args.video_fps)
+
+            # ── Gripper-close debug slow-motion video ──
+            _render_gripper_close_debug(
+                sim_frames=sim_frames,
+                data_frames=data_images,
+                ee_poses_sim=ee_poses_sim,
+                obj_poses_sim=obj_poses_sim,
+                ee_poses_data=ep["ee_pose"],
+                obj_poses_data=data_obj_poses,
+                actions=action_seq,
+                ep_idx=ep_idx,
+                out_dir=out_dir,
+                radius=args.gripper_debug_radius,
+                fps=args.gripper_debug_fps,
+                premove_len=premove_len,
+            )
 
         env.close()
         print(f"\nAll replays complete. Videos saved to: {out_dir}")
