@@ -590,7 +590,7 @@ class DiffusionConditionalUnet1d(nn.Module):
     Note: this removes local conditioning as compared to the original diffusion policy code.
     """
 
-    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
+    def __init__(self, config: DiffusionConfig, global_cond_dim: int, action_feature=7):
         super().__init__()
 
         self.config = config
@@ -607,8 +607,11 @@ class DiffusionConditionalUnet1d(nn.Module):
         cond_dim = config.diffusion_step_embed_dim + global_cond_dim
 
         # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
-        # just reverse these.
-        in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
+        # just reverse these. TODO: fix action_feature shape
+        # in_out = [(config.f.shape[0], config.down_dims[0])] + list(
+        #     zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
+        # )
+        in_out = [(action_feature, config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
 
@@ -663,7 +666,9 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         self.final_conv = nn.Sequential(
             DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
+            # nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
+            nn.Conv1d(config.down_dims[0], 1, 1),
+            # 1 dimiension output to predict the value of the trajectory
         )
 
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
@@ -675,6 +680,7 @@ class DiffusionConditionalUnet1d(nn.Module):
             output: (B, T, input_dim)
         Returns:
             (B, T, input_dim) diffusion model prediction.
+
         """
         # For 1D convolutions we'll need feature dimension first.
         x = einops.rearrange(x, "b t d -> b d t")
@@ -709,6 +715,12 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         x = einops.rearrange(x, "b d t -> b t d")
         return x
+
+    # TODO: compute value loss
+    def compute_loss(self, x: Tensor, timestep: Tensor | int, global_cond=None, target=None) -> Tensor:
+        pred = self.forward(x, timestep, global_cond)
+        loss = F.mse_loss(pred, target)
+        return loss
 
 
 class DiffusionConditionalResidualBlock1d(nn.Module):
