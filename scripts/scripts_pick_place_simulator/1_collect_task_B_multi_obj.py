@@ -20,7 +20,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from datetime import datetime
+
+
+def _ts() -> str:
+    """Return current timestamp string for logging."""
+    return datetime.now().strftime("%H:%M:%S")
 
 # Map from object_type to registered gym task id
 TASK_IDS = {
@@ -91,20 +98,97 @@ def main() -> None:
     _orig_spec.loader.exec_module(_orig)
 
     make_env_with_camera = _orig.make_env_with_camera
+    add_camera_to_env_cfg = _orig.add_camera_to_env_cfg
     rollout_expert_B_with_goal_actions = _orig.rollout_expert_B_with_goal_actions
     save_episodes_with_goal_actions = _orig.save_episodes_with_goal_actions
+
+    import gymnasium as gym
+
+    def _make_env_for_object(object_type, num_envs, device, use_fabric,
+                             image_width, image_height, episode_length_s,
+                             disable_terminations):
+        """Create environment, using cube env config as base and swapping object if needed."""
+        if object_type == "cube":
+            return make_env_with_camera(
+                task_id=TASK_IDS["cube"],
+                num_envs=num_envs, device=device, use_fabric=use_fabric,
+                image_width=image_width, image_height=image_height,
+                episode_length_s=episode_length_s,
+                disable_terminations=disable_terminations,
+            )
+
+        # For non-cube objects: start from cube config, swap the object
+        import isaaclab_tasks  # noqa: F401
+        from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+        from isaaclab.assets import RigidObjectCfg
+
+        obj_cfg = get_object_config(object_type)
+        cube_task_id = TASK_IDS["cube"]
+
+        print(f"[{_ts()}] Parsing base cube config...", flush=True)
+        env_cfg = parse_env_cfg(cube_task_id, device=device,
+                                num_envs=int(num_envs), use_fabric=bool(use_fabric))
+
+        # Swap the object spawn config
+        env_cfg.scene.object = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Object",
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=list(obj_cfg.init_pos),
+                rot=list(obj_cfg.init_rot),
+            ),
+            spawn=obj_cfg.spawn_cfg_fn(),
+        )
+        print(f"[{_ts()}] Object swapped to {object_type}.", flush=True)
+
+        # USD-file objects (e.g. gear) have internal body names that differ
+        # from the default "Object" → drop body_names from reset_object_position
+        # so the regex matcher doesn't fail.
+        from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg as _UsdCheck
+        if isinstance(env_cfg.scene.object.spawn, _UsdCheck):
+            from isaaclab.managers import EventTermCfg as EventTerm
+            from isaaclab.managers import SceneEntityCfg
+            import isaaclab_tasks.manager_based.manipulation.lift.mdp as _mdp
+            env_cfg.events.reset_object_position = EventTerm(
+                func=_mdp.reset_root_state_uniform,
+                mode="reset",
+                params={
+                    "pose_range": {"x": (-0.1, 0.1), "y": (-0.25, 0.25), "z": (0.0, 0.0)},
+                    "velocity_range": {},
+                    "asset_cfg": SceneEntityCfg("object"),
+                },
+            )
+            print(f"[{_ts()}] USD object detected — reset_object_position body_names dropped.", flush=True)
+
+        if episode_length_s is not None:
+            env_cfg.episode_length_s = episode_length_s
+        if disable_terminations:
+            if hasattr(env_cfg, 'terminations') and hasattr(env_cfg.terminations, 'time_out'):
+                env_cfg.terminations.time_out = None
+            if hasattr(env_cfg, 'terminations') and hasattr(env_cfg.terminations, 'object_dropping'):
+                env_cfg.terminations.object_dropping = None
+
+        add_camera_to_env_cfg(env_cfg, image_width, image_height)
+
+        print(f"[{_ts()}] Creating gym environment...", flush=True)
+        env = gym.make(cube_task_id, cfg=env_cfg)
+        return env
+
+    print(f"[{_ts()}] Helper functions loaded.", flush=True)
 
     try:
         set_seed(args.seed)
         rng = np.random.default_rng(args.seed)
+        print(f"[{_ts()}] Seeds set. Starting collection for '{args.object_type}'...", flush=True)
 
         # ---- Object config ----
         obj_cfg = get_object_config(args.object_type)
         task_id = TASK_IDS[args.object_type]
+        print(f"[{_ts()}] Object config loaded: {obj_cfg.description}", flush=True)
 
         # ---- Create environment ----
-        env = make_env_with_camera(
-            task_id=task_id,
+        print(f"[{_ts()}] Creating environment (object_type={args.object_type})...", flush=True)
+        env = _make_env_for_object(
+            object_type=args.object_type,
             num_envs=args.num_envs,
             device=args.device,
             use_fabric=not bool(args.disable_fabric),
@@ -114,6 +198,7 @@ def main() -> None:
             disable_terminations=True,
         )
         device = env.unwrapped.device
+        print(f"[{_ts()}] Environment created. device={device}", flush=True)
 
         # ---- Task spec (use object-specific parameters) ----
         task_spec = PickPlaceTaskSpec(
@@ -149,18 +234,21 @@ def main() -> None:
         markers = None
         start_time = time.time()
 
-        print(f"\n{'='*60}")
-        print(f"Collecting {args.num_episodes} Task B episodes")
-        print(f"  object_type={args.object_type}")
-        print(f"  task_id={task_id}")
-        print(f"  object_height={obj_cfg.object_height}, grasp_z_offset={obj_cfg.grasp_z_offset}")
-        print(f"  hover_z={obj_cfg.hover_z}, release_z_offset={obj_cfg.release_z_offset}")
-        print(f"  num_envs={args.num_envs}, horizon={args.horizon}, settle={args.settle_steps}")
-        print(f"  red_region_center={args.red_region_center_xy}, size={args.red_region_size_xy}")
-        print(f"{'='*60}\n")
+        print(f"\n[{_ts()}] {'='*60}")
+        print(f"[{_ts()}] Collecting {args.num_episodes} Task B episodes")
+        print(f"[{_ts()}]   object_type={args.object_type}")
+        print(f"[{_ts()}]   task_id={task_id}")
+        print(f"[{_ts()}]   object_height={obj_cfg.object_height}, grasp_z_offset={obj_cfg.grasp_z_offset}")
+        print(f"[{_ts()}]   hover_z={obj_cfg.hover_z}, release_z_offset={obj_cfg.release_z_offset}")
+        print(f"[{_ts()}]   place_z={obj_cfg.place_z}, goal_z={obj_cfg.goal_z}")
+        print(f"[{_ts()}]   mesh_origin_offset={obj_cfg.mesh_origin_offset}")
+        print(f"[{_ts()}]   num_envs={args.num_envs}, horizon={args.horizon}, settle={args.settle_steps}")
+        print(f"[{_ts()}]   red_region_center={args.red_region_center_xy}, size={args.red_region_size_xy}")
+        print(f"[{_ts()}] {'='*60}\n", flush=True)
 
         while len(episodes) < args.num_episodes and batch_count < max_batches:
             batch_count += 1
+            print(f"[{_ts()}] Starting batch {batch_count}/{max_batches}...", flush=True)
             results, markers = rollout_expert_B_with_goal_actions(
                 env=env,
                 expert=expert,
@@ -169,43 +257,61 @@ def main() -> None:
                 horizon=args.horizon,
                 settle_steps=args.settle_steps,
                 markers=markers,
+                place_z=obj_cfg.place_z,
+                goal_z=obj_cfg.goal_z,
+                mesh_origin_offset=obj_cfg.mesh_origin_offset,
             )
+            print(f"[{_ts()}] Batch {batch_count} rollout done. Processing results...", flush=True)
             batch_completed = 0
             batch_success = 0
             for episode_dict, expert_completed_flag in results:
+                # Save ALL episodes (including incomplete ones) for debugging
+                episode_dict["object_type"] = args.object_type
+                episode_dict["expert_completed"] = bool(expert_completed_flag)
+                episodes.append(episode_dict)
                 if expert_completed_flag:
-                    # Tag episode with object type
-                    episode_dict["object_type"] = args.object_type
                     batch_completed += 1
-                    episodes.append(episode_dict)
-                    if episode_dict["success"]:
-                        batch_success += 1
-                    if len(episodes) >= args.num_episodes:
-                        break
+                if episode_dict["success"]:
+                    batch_success += 1
+                if len(episodes) >= args.num_episodes:
+                    break
 
             elapsed = time.time() - start_time
             total_attempts = batch_count * args.num_envs
             rate = total_attempts / elapsed if elapsed > 0 else 0
             print(
-                f"Batch {batch_count:3d} | Saved: {len(episodes)}/{args.num_episodes} | "
+                f"[{_ts()}] Batch {batch_count:3d} | Saved: {len(episodes)}/{args.num_episodes} | "
                 f"This batch: {batch_completed}/{args.num_envs} completed, {batch_success} success | "
-                f"Rate: {rate:.1f} ep/s"
+                f"Rate: {rate:.1f} ep/s",
+                flush=True,
             )
 
         # ---- Summary ----
         elapsed = time.time() - start_time
         success_count = sum(1 for ep in episodes if ep["success"])
-        print(f"\n{'='*60}")
-        print(f"Collection finished in {elapsed:.1f}s  [{args.object_type}]")
-        print(f"Saved: {len(episodes)}, Success: {success_count} ({100*success_count/len(episodes) if episodes else 0:.1f}%)")
+        completed_count = sum(1 for ep in episodes if ep.get("expert_completed", True))
+        print(f"\n[{_ts()}] {'='*60}")
+        print(f"[{_ts()}] Collection finished in {elapsed:.1f}s  [{args.object_type}]")
+        print(f"[{_ts()}] Total: {len(episodes)}, Completed: {completed_count}, Success: {success_count} ({100*success_count/len(episodes) if episodes else 0:.1f}%)")
         print(f"{'='*60}\n")
 
         episodes = episodes[:args.num_episodes]
+        print(f"[{_ts()}] Saving {len(episodes)} episodes to {args.out}...", flush=True)
         save_episodes_with_goal_actions(args.out, episodes)
+        print(f"[{_ts()}] Save done. Closing environment...", flush=True)
         env.close()
+        print(f"[{_ts()}] Environment closed.", flush=True)
+
+    except Exception:
+        import traceback
+        print(f"\n[{_ts()}] *** EXCEPTION ***", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
     finally:
+        print(f"[{_ts()}] Shutting down simulation app...", flush=True)
         simulation_app.close()
+        print("Simulation app closed. Exiting.", flush=True)
 
 
 if __name__ == "__main__":

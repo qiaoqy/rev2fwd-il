@@ -538,7 +538,55 @@ def make_env_with_camera(
     import isaaclab_tasks  # noqa: F401
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
-    env_cfg = parse_env_cfg(task_id, device=device, num_envs=int(num_envs), use_fabric=bool(use_fabric))
+    # --- Handle multi-object task IDs (Gear, Cylinder, Bottle, etc.) ---
+    # These are registered in the local editable install but NOT in the conda-
+    # installed isaaclab_tasks.  Fall back to using the Cube env config and
+    # swapping the object, identical to 1_collect_task_B_multi_obj.py.
+    _MULTI_OBJ_MAP = {
+        "Isaac-Lift-Gear-Franka-IK-Abs-v0": "gear",
+        "Isaac-Lift-Cylinder-Franka-IK-Abs-v0": "cylinder",
+        "Isaac-Lift-Sphere-Franka-IK-Abs-v0": "sphere",
+        "Isaac-Lift-Bottle-Franka-IK-Abs-v0": "bottle",
+    }
+    _object_type = _MULTI_OBJ_MAP.get(task_id)
+
+    if _object_type is not None:
+        from isaaclab.assets import RigidObjectCfg
+        from rev2fwd_il.sim.object_registry import get_object_config
+
+        _cube_task_id = "Isaac-Lift-Cube-Franka-IK-Abs-v0"
+        env_cfg = parse_env_cfg(_cube_task_id, device=device,
+                                num_envs=int(num_envs), use_fabric=bool(use_fabric))
+
+        obj_cfg = get_object_config(_object_type)
+        env_cfg.scene.object = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Object",
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=list(obj_cfg.init_pos),
+                rot=list(obj_cfg.init_rot),
+            ),
+            spawn=obj_cfg.spawn_cfg_fn(),
+        )
+
+        # USD-file objects may have body names != "Object" — drop body_names filter
+        from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg as _UsdCheck
+        if isinstance(env_cfg.scene.object.spawn, _UsdCheck):
+            from isaaclab.managers import EventTermCfg as EventTerm
+            from isaaclab.managers import SceneEntityCfg
+            import isaaclab_tasks.manager_based.manipulation.lift.mdp as _mdp
+            env_cfg.events.reset_object_position = EventTerm(
+                func=_mdp.reset_root_state_uniform,
+                mode="reset",
+                params={
+                    "pose_range": {"x": (-0.1, 0.1), "y": (-0.25, 0.25), "z": (0.0, 0.0)},
+                    "velocity_range": {},
+                    "asset_cfg": SceneEntityCfg("object"),
+                },
+            )
+        # Use cube task_id for gym.make since that's what's registered
+        task_id = _cube_task_id
+    else:
+        env_cfg = parse_env_cfg(task_id, device=device, num_envs=int(num_envs), use_fabric=bool(use_fabric))
 
     if episode_length_s is not None:
         env_cfg.episode_length_s = episode_length_s

@@ -1,0 +1,586 @@
+"""Pick-and-place expert with heavily enhanced waypoint randomization (v2).
+
+Based on PickPlaceExpertB, with:
+1. Drastically larger XY offset ranges for all waypoint levels.
+2. ±0.02 XY noise on grasp and place positions.
+3. Additional intermediate waypoints on approach and departure paths to
+   simulate a gradual alignment/correction process:
+   - Pick approach: APPROACH → MID_APPROACH → ABOVE → CORRECT → ALIGN → GO_TO
+   - Place descent: same structure
+   - Departure: LIFT_AFTER_RELEASE → DEPART_CORRECT → DEPART_ABOVE → DEPART_MID → DEPART_HIGH
+4. Significantly larger orientation perturbation on mid-level waypoints.
+5. Independent random parameters for departure path.
+"""
+
+from __future__ import annotations
+
+import math
+from enum import IntEnum
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    import gymnasium as gym
+
+
+class ExpertState(IntEnum):
+    """States for the pick-and-place finite state machine (23 states)."""
+
+    REST = 0
+    # Pick approach path (6 waypoints: far → close)
+    APPROACH_OBJ = 1           # ±0.20, highest
+    MID_APPROACH_OBJ = 2       # ±0.12 (NEW)
+    GO_ABOVE_OBJ = 3           # ±0.08
+    CORRECT_OBJ = 4            # ±0.04 (NEW)
+    ALIGN_TO_OBJ = 5           # ±0.025
+    GO_TO_OBJ = 6              # ±0.02 grasp noise
+    CLOSE = 7
+    LIFT = 8
+    # Place descent path (6 waypoints: far → close)
+    APPROACH_PLACE = 9         # ±0.20
+    MID_APPROACH_PLACE = 10    # ±0.12 (NEW)
+    GO_ABOVE_PLACE = 11        # ±0.08
+    CORRECT_PLACE = 12         # ±0.04 (NEW)
+    ALIGN_TO_PLACE = 13        # ±0.025
+    GO_TO_PLACE = 14           # ±0.02 place noise
+    LOWER_TO_RELEASE = 15
+    OPEN = 16
+    # Departure path (5 waypoints: close → far, independent draws)
+    LIFT_AFTER_RELEASE = 17    # correct level
+    DEPART_CORRECT = 18        # above level (NEW)
+    DEPART_ABOVE = 19          # mid level (NEW)
+    DEPART_MID = 20            # approach level (renamed)
+    DEPART_HIGH = 21           # highest departure (renamed)
+    RETURN_REST = 22
+    DONE = 23
+
+
+GRIPPER_OPEN = 1.0
+GRIPPER_CLOSE = -1.0
+
+
+def _small_random_quat(
+    n: int,
+    device: torch.device,
+    roll_deg: float = 10.0,
+    pitch_deg: float = 10.0,
+    yaw_deg: float = 15.0,
+) -> torch.Tensor:
+    """Sample small-angle quaternions (wxyz) with bounded Euler perturbations.
+
+    Returns:
+        Quaternion tensor (n, 4) in [w, x, y, z] order.
+    """
+    roll = torch.empty(n, device=device).uniform_(-roll_deg, roll_deg) * (math.pi / 180.0)
+    pitch = torch.empty(n, device=device).uniform_(-pitch_deg, pitch_deg) * (math.pi / 180.0)
+    yaw = torch.empty(n, device=device).uniform_(-yaw_deg, yaw_deg) * (math.pi / 180.0)
+
+    cr, sr = torch.cos(roll * 0.5), torch.sin(roll * 0.5)
+    cp, sp = torch.cos(pitch * 0.5), torch.sin(pitch * 0.5)
+    cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return torch.stack([w, x, y, z], dim=-1)
+
+
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of two wxyz quaternion tensors (broadcast-safe)."""
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
+
+
+class PickPlaceExpertRandWaypoint:
+    """FSM expert with heavily enhanced random waypoints, more intermediate
+    waypoints, and independent departure path (v2).
+
+    23 states total. Includes MID_APPROACH and CORRECT intermediate waypoints
+    on pick, place, and depart paths to simulate gradual alignment.
+
+    Action format: [x, y, z, qw, qx, qy, qz, gripper] = 8 dims
+    Gripper: OPEN = +1, CLOSE = -1
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        device: str | torch.device,
+        hover_z: float = 0.25,
+        grasp_z_offset: float = 0.02,
+        release_z_offset: float = -0.03,
+        position_threshold: float = 0.01,
+        wait_steps: int = 10,
+    ):
+        self.num_envs = num_envs
+        self.device = torch.device(device)
+        self.hover_z = hover_z
+        self.grasp_z_offset = grasp_z_offset
+        self.release_z_offset = release_z_offset
+        self.position_threshold = position_threshold
+        self.wait_steps = wait_steps
+
+        # State tracking
+        self.state = torch.full((num_envs,), ExpertState.REST, dtype=torch.int32, device=self.device)
+        self.wait_counter = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+
+        self.rest_pose = None
+        self.place_pose = None
+
+        # Fixed grasp orientation (gripper pointing down): wxyz [0,1,0,0]
+        self.grasp_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device)
+
+        # Object XY at grasp time (stored when entering CLOSE)
+        self.grasp_obj_xy = None
+
+        # ---- randomisation params (initialised in first reset) ----
+        self._rand_init = False
+
+    # ------------------------------------------------------------------
+    # reset
+    # ------------------------------------------------------------------
+    def reset(
+        self,
+        ee_pose: torch.Tensor,
+        place_xy: tuple[float, float],
+        place_z: float = 0.055,
+        env_ids: torch.Tensor | None = None,
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        n = self.num_envs
+        d = self.device
+
+        if not self._rand_init:
+            z = lambda: torch.zeros(n, device=d)
+            z2 = lambda: torch.zeros(n, 2, device=d)
+            q = lambda: torch.zeros(n, 4, device=d)
+
+            self.episode_hover_z = z()
+
+            # --- approach / mid_approach / above / correct / align (pick side) ---
+            self.approach_obj_dxy = z2()
+            self.approach_obj_extra_z = z()
+            self.mid_approach_obj_dxy = z2()
+            self.mid_approach_obj_extra_z = z()
+            self.above_obj_dxy = z2()
+            self.above_obj_extra_z = z()
+            self.correct_obj_dxy = z2()
+            self.correct_obj_extra_z = z()
+            self.align_obj_dxy = z2()
+            self.align_obj_extra_z = z()
+
+            # --- approach / mid_approach / above / correct / align (place side) ---
+            self.approach_place_dxy = z2()
+            self.approach_place_extra_z = z()
+            self.mid_approach_place_dxy = z2()
+            self.mid_approach_place_extra_z = z()
+            self.above_place_dxy = z2()
+            self.above_place_extra_z = z()
+            self.correct_place_dxy = z2()
+            self.correct_place_extra_z = z()
+            self.align_place_dxy = z2()
+            self.align_place_extra_z = z()
+
+            # --- grasp / place noise (X only, no Y) ---
+            self.grasp_dx = z()
+            self.grasp_dz = z()
+            self.place_dx = z()
+            self.place_dz = z()
+
+            # --- departure (5 levels, independent from descent) ---
+            self.depart_correct_dxy = z2()
+            self.depart_correct_dz = z()
+            self.depart_above_dxy = z2()
+            self.depart_above_extra_z = z()
+            self.depart_mid_dxy = z2()
+            self.depart_mid_extra_z = z()
+            self.depart_high_dxy = z2()
+            self.depart_high_extra_z = z()
+
+            # --- orientation perturbation for mid-level waypoints ---
+            self.quat_perturbation = q()
+            self.quat_perturbation[:, 0] = 1.0  # identity
+
+            self._rand_init = True
+
+        k = len(env_ids)
+
+        # Global hover height
+        self.episode_hover_z[env_ids] = torch.empty(k, device=d).uniform_(0.2, 0.3)
+
+        # ==== PICK SIDE ====
+        # ---- Approach obj: ±20 cm, +3~10 cm Z ----
+        self.approach_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        self.approach_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
+
+        # ---- Mid-approach obj: ±12 cm, +1~5 cm Z (NEW) ----
+        self.mid_approach_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.12, 0.12)
+        self.mid_approach_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.01, 0.05)
+
+        # ---- Above obj: ±8 cm, +0~3 cm Z ----
+        self.above_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.above_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
+
+        # ---- Correct obj: ±4 cm, +8~12 cm above obj ----
+        self.correct_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
+        self.correct_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.12)
+
+        # ---- Align obj: ±25 mm, +3~6 cm above obj ----
+        self.align_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.025, 0.025)
+        self.align_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.06)
+
+        # ==== PLACE SIDE ====
+        # ---- Approach place: ±20 cm, +3~10 cm Z ----
+        self.approach_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        self.approach_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
+
+        # ---- Mid-approach place: ±12 cm, +1~5 cm Z (NEW) ----
+        self.mid_approach_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.12, 0.12)
+        self.mid_approach_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.01, 0.05)
+
+        # ---- Above place: ±8 cm, +0~3 cm Z ----
+        self.above_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.above_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
+
+        # ---- Correct place: ±4 cm, +8~12 cm above place ----
+        self.correct_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
+        self.correct_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.12)
+
+        # ---- Align place: ±25 mm, +3~6 cm above place ----
+        self.align_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.025, 0.025)
+        self.align_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.06)
+
+        # ==== GRASP / PLACE NOISE: X +[0, 1cm], Y=0, Z [0, 2cm] ====
+        self.grasp_dx[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.01)
+        self.grasp_dz[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.02)
+        self.place_dx[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.01)
+        self.place_dz[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.02)
+
+        # ==== DEPARTURE (5 levels, independent from descent) ====
+        # Level 1 - correct: ±4 cm, +0~3 cm Z (matches above level)
+        self.depart_correct_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
+        self.depart_correct_dz[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
+
+        # Level 2 - above: ±8 cm, +0~3 cm Z
+        self.depart_above_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.depart_above_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
+
+        # Level 3 - mid: ±12 cm, +1~5 cm Z
+        self.depart_mid_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.12, 0.12)
+        self.depart_mid_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.01, 0.05)
+
+        # Level 4 - high: ±20 cm, +3~10 cm Z
+        self.depart_high_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        self.depart_high_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
+
+        # ---- Orientation perturbation (disabled – no rotation randomisation) ----
+        self.quat_perturbation[env_ids] = _small_random_quat(k, d, roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0)
+
+        # ---- Rest pose (override orientation to gripper-down) ----
+        if self.rest_pose is None:
+            self.rest_pose = ee_pose.clone()
+            self.rest_pose[:, 3:7] = self.grasp_quat
+        else:
+            self.rest_pose[env_ids] = ee_pose[env_ids].clone()
+            self.rest_pose[env_ids, 3:7] = self.grasp_quat
+
+        # ---- Place pose ----
+        if self.place_pose is None:
+            self.place_pose = torch.zeros(self.num_envs, 7, device=d)
+
+        self.place_pose[env_ids, 0] = place_xy[0]
+        self.place_pose[env_ids, 1] = place_xy[1]
+        self.place_pose[env_ids, 2] = place_z
+        self.place_pose[env_ids, 3:7] = self.grasp_quat
+
+        # ---- State ----
+        self.state[env_ids] = ExpertState.APPROACH_OBJ
+        self.wait_counter[env_ids] = 0
+
+    # ------------------------------------------------------------------
+    # act
+    # ------------------------------------------------------------------
+    def act(
+        self,
+        ee_pose: torch.Tensor,
+        object_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        action = torch.zeros(self.num_envs, 8, device=self.device)
+        action[:, :7] = ee_pose.clone()
+        action[:, 7] = GRIPPER_OPEN
+
+        obj_xy = object_pose[:, :2]
+        obj_z = object_pose[:, 2]
+
+        # Pre-compute perturbed orientation for mid-level waypoints
+        perturbed_quat = _quat_mul(self.grasp_quat.unsqueeze(0), self.quat_perturbation)  # (N,4)
+
+        # ---- pick-side waypoints (6 levels: approach → mid → above → correct → align → grasp) ----
+        approach_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        approach_obj_pos[:, :2] = obj_xy + self.approach_obj_dxy
+        approach_obj_pos[:, 2] = self.episode_hover_z + self.approach_obj_extra_z
+
+        mid_approach_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        mid_approach_obj_pos[:, :2] = obj_xy + self.mid_approach_obj_dxy
+        mid_approach_obj_pos[:, 2] = self.episode_hover_z + self.mid_approach_obj_extra_z
+
+        above_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        above_obj_pos[:, :2] = obj_xy + self.above_obj_dxy
+        above_obj_pos[:, 2] = self.episode_hover_z + self.above_obj_extra_z
+
+        correct_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        correct_obj_pos[:, :2] = obj_xy + self.correct_obj_dxy
+        correct_obj_pos[:, 2] = obj_z + self.grasp_z_offset + self.correct_obj_extra_z
+
+        align_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        align_obj_pos[:, :2] = obj_xy + self.align_obj_dxy
+        align_obj_pos[:, 2] = obj_z + self.grasp_z_offset + self.align_obj_extra_z
+
+        at_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        at_obj_pos[:, 0] = obj_xy[:, 0] + self.grasp_dx
+        at_obj_pos[:, 1] = obj_xy[:, 1]
+        at_obj_pos[:, 2] = obj_z + self.grasp_z_offset
+
+        # ---- place-side waypoints (6 levels, descent) ----
+        approach_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        approach_place_pos[:, :2] = self.place_pose[:, :2] + self.approach_place_dxy
+        approach_place_pos[:, 2] = self.episode_hover_z + self.approach_place_extra_z
+
+        mid_approach_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        mid_approach_place_pos[:, :2] = self.place_pose[:, :2] + self.mid_approach_place_dxy
+        mid_approach_place_pos[:, 2] = self.episode_hover_z + self.mid_approach_place_extra_z
+
+        above_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        above_place_pos[:, :2] = self.place_pose[:, :2] + self.above_place_dxy
+        above_place_pos[:, 2] = self.episode_hover_z + self.above_place_extra_z
+
+        correct_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        correct_place_pos[:, :2] = self.place_pose[:, :2] + self.correct_place_dxy
+        correct_place_pos[:, 2] = self.place_pose[:, 2] + self.correct_place_extra_z
+
+        align_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        align_place_pos[:, :2] = self.place_pose[:, :2] + self.align_place_dxy
+        align_place_pos[:, 2] = self.place_pose[:, 2] + self.align_place_extra_z
+
+        at_place_pos = self.place_pose[:, :3].clone()
+        at_place_pos[:, 0] = at_place_pos[:, 0] + self.place_dx
+
+        release_pos = self.place_pose[:, :3].clone()
+        release_pos[:, 0] = release_pos[:, 0] + self.place_dx
+        release_pos[:, 2] = self.place_pose[:, 2] + self.release_z_offset
+
+        # ---- departure waypoints (5 levels, independent from descent) ----
+        depart_correct_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        depart_correct_pos[:, :2] = self.place_pose[:, :2] + self.depart_correct_dxy
+        depart_correct_pos[:, 2] = self.episode_hover_z + self.depart_correct_dz
+
+        depart_above_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        depart_above_pos[:, :2] = self.place_pose[:, :2] + self.depart_above_dxy
+        depart_above_pos[:, 2] = self.episode_hover_z + self.depart_above_extra_z
+
+        depart_mid_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        depart_mid_pos[:, :2] = self.place_pose[:, :2] + self.depart_mid_dxy
+        depart_mid_pos[:, 2] = self.episode_hover_z + self.depart_mid_extra_z
+
+        depart_high_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        depart_high_pos[:, :2] = self.place_pose[:, :2] + self.depart_high_dxy
+        depart_high_pos[:, 2] = self.episode_hover_z + self.depart_high_extra_z
+
+        # ---- FSM logic ----
+        for state_val in ExpertState:
+            mask = self.state == state_val
+            if not mask.any():
+                continue
+
+            if state_val == ExpertState.REST:
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+
+            # ==== PICK APPROACH PATH ====
+            elif state_val == ExpertState.APPROACH_OBJ:
+                action[mask, :3] = approach_obj_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, approach_obj_pos, ExpertState.MID_APPROACH_OBJ)
+
+            elif state_val == ExpertState.MID_APPROACH_OBJ:
+                action[mask, :3] = mid_approach_obj_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, mid_approach_obj_pos, ExpertState.GO_ABOVE_OBJ)
+
+            elif state_val == ExpertState.GO_ABOVE_OBJ:
+                action[mask, :3] = above_obj_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, above_obj_pos, ExpertState.CORRECT_OBJ)
+
+            elif state_val == ExpertState.CORRECT_OBJ:
+                action[mask, :3] = correct_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, correct_obj_pos, ExpertState.ALIGN_TO_OBJ)
+
+            elif state_val == ExpertState.ALIGN_TO_OBJ:
+                action[mask, :3] = align_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, align_obj_pos, ExpertState.GO_TO_OBJ)
+
+            elif state_val == ExpertState.GO_TO_OBJ:
+                action[mask, :3] = at_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, at_obj_pos, ExpertState.CLOSE)
+
+            elif state_val == ExpertState.CLOSE:
+                action[mask, :3] = at_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+                # Store object table XY before lifting
+                if self.grasp_obj_xy is None:
+                    self.grasp_obj_xy = obj_xy.clone()
+                self.grasp_obj_xy[mask] = obj_xy[mask]
+                self.wait_counter[mask] += 1
+                transition = mask & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.LIFT
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.LIFT:
+                # Lift straight up from grasp position (no XY offset)
+                lift_target = torch.zeros(self.num_envs, 3, device=self.device)
+                lift_target[:, :2] = self.grasp_obj_xy
+                lift_target[:, 2] = self.episode_hover_z + self.above_obj_extra_z
+                action[mask, :3] = lift_target[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, lift_target, ExpertState.APPROACH_PLACE)
+
+            # ==== PLACE DESCENT PATH ====
+            elif state_val == ExpertState.APPROACH_PLACE:
+                action[mask, :3] = approach_place_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, approach_place_pos, ExpertState.MID_APPROACH_PLACE)
+
+            elif state_val == ExpertState.MID_APPROACH_PLACE:
+                action[mask, :3] = mid_approach_place_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, mid_approach_place_pos, ExpertState.GO_ABOVE_PLACE)
+
+            elif state_val == ExpertState.GO_ABOVE_PLACE:
+                action[mask, :3] = above_place_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, above_place_pos, ExpertState.CORRECT_PLACE)
+
+            elif state_val == ExpertState.CORRECT_PLACE:
+                action[mask, :3] = correct_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, correct_place_pos, ExpertState.ALIGN_TO_PLACE)
+
+            elif state_val == ExpertState.ALIGN_TO_PLACE:
+                action[mask, :3] = align_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, align_place_pos, ExpertState.GO_TO_PLACE)
+
+            elif state_val == ExpertState.GO_TO_PLACE:
+                action[mask, :3] = at_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, at_place_pos, ExpertState.LOWER_TO_RELEASE)
+
+            elif state_val == ExpertState.LOWER_TO_RELEASE:
+                action[mask, :3] = release_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+                self._transition(mask, ee_pose, release_pos, ExpertState.OPEN)
+
+            elif state_val == ExpertState.OPEN:
+                action[mask, :3] = release_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+                self.wait_counter[mask] += 1
+                transition = mask & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.LIFT_AFTER_RELEASE
+                self.wait_counter[transition] = 0
+
+            # ==== DEPARTURE PATH ====
+            elif state_val == ExpertState.LIFT_AFTER_RELEASE:
+                action[mask, :3] = depart_correct_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, depart_correct_pos, ExpertState.DEPART_CORRECT)
+
+            elif state_val == ExpertState.DEPART_CORRECT:
+                action[mask, :3] = depart_above_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, depart_above_pos, ExpertState.DEPART_ABOVE)
+
+            elif state_val == ExpertState.DEPART_ABOVE:
+                action[mask, :3] = depart_mid_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, depart_mid_pos, ExpertState.DEPART_MID)
+
+            elif state_val == ExpertState.DEPART_MID:
+                action[mask, :3] = depart_high_pos[mask]
+                action[mask, 3:7] = perturbed_quat[mask]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, depart_high_pos, ExpertState.DEPART_HIGH)
+
+            elif state_val == ExpertState.DEPART_HIGH:
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, self.rest_pose[:, :3], ExpertState.RETURN_REST)
+
+            elif state_val == ExpertState.RETURN_REST:
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+                self._transition(mask, ee_pose, self.rest_pose[:, :3], ExpertState.DONE)
+
+            elif state_val == ExpertState.DONE:
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+
+        return action
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _transition(
+        self,
+        mask: torch.Tensor,
+        ee_pose: torch.Tensor,
+        target_pos: torch.Tensor,
+        next_state: ExpertState,
+    ) -> None:
+        dist = torch.norm(ee_pose[mask, :3] - target_pos[mask], dim=-1)
+        reached = dist < self.position_threshold
+        reached_envs = mask.clone()
+        reached_envs[mask] = reached
+        self.state[reached_envs] = next_state
+
+    def get_state_names(self) -> list[str]:
+        return [ExpertState(s.item()).name for s in self.state]
+
+    def is_done(self) -> torch.Tensor:
+        return self.state == ExpertState.DONE

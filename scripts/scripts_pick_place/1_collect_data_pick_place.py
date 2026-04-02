@@ -751,6 +751,9 @@ def rollout_expert_B_with_goal_actions(
     horizon: int,
     settle_steps: int = 30,
     markers: tuple = None,
+    place_z: float = 0.055,
+    goal_z: float = 0.055,
+    mesh_origin_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ):
     """Run parallel reverse rollouts with Expert B and record next-frame ee_pose actions.
     
@@ -783,6 +786,13 @@ def rollout_expert_B_with_goal_actions(
     device = env.unwrapped.device
     num_envs = env.unwrapped.num_envs
     print(f"[DEBUG] rollout: device={device}, num_envs={num_envs}")
+
+    # Mesh-origin offset: correct prim root pos → mesh geometric centre
+    _mo = mesh_origin_offset
+    _mesh_off = torch.tensor([[_mo[0], _mo[1], _mo[2], 0, 0, 0, 0]],
+                             dtype=torch.float32, device=device).expand(num_envs, -1)
+    if any(v != 0.0 for v in _mo):
+        print(f"[DEBUG] rollout: mesh_origin_offset={_mo} — will correct obj_pose")
     
     # Get camera sensor references
     print("[DEBUG] rollout: Getting camera sensor references...")
@@ -815,7 +825,12 @@ def rollout_expert_B_with_goal_actions(
     # Step 2: Teleport cube to goal position for all envs
     # =========================================================================
     print("[DEBUG] rollout: Teleporting cube to goal position...")
-    goal_pose = make_goal_pose_w(env, task_spec.goal_xy, z=0.055)
+    goal_pose = make_goal_pose_w(env, task_spec.goal_xy, z=goal_z)
+    # If mesh centre ≠ prim root, shift the prim so mesh centre lands at goal_xy
+    if _mo[0] != 0.0 or _mo[1] != 0.0:
+        goal_pose[:, 0] -= _mo[0]
+        goal_pose[:, 1] -= _mo[1]
+        print(f"[DEBUG] rollout: teleport adjusted by mesh_offset xy=({-_mo[0]:.4f}, {-_mo[1]:.4f})")
     teleport_object_to_pose(env, goal_pose, name="object")
     print("[DEBUG] rollout: Cube teleported")
     
@@ -877,10 +892,10 @@ def rollout_expert_B_with_goal_actions(
                     place_xys.append(xy)
                     break
     place_poses_np = np.array([
-        [xy[0], xy[1], 0.055, 1.0, 0.0, 0.0, 0.0] for xy in place_xys
+        [xy[0], xy[1], place_z, 1.0, 0.0, 0.0, 0.0] for xy in place_xys
     ], dtype=np.float32)
     goal_pose_np = np.array(
-        [task_spec.goal_xy[0], task_spec.goal_xy[1], 0.055, 1.0, 0.0, 0.0, 0.0], 
+        [task_spec.goal_xy[0], task_spec.goal_xy[1], goal_z, 1.0, 0.0, 0.0, 0.0], 
         dtype=np.float32
     )
     
@@ -888,7 +903,7 @@ def rollout_expert_B_with_goal_actions(
     # Step 4: Initialize expert for each env with different place targets
     # =========================================================================
     ee_pose = get_ee_pose_w(env)
-    expert.reset(ee_pose, place_xys[0], place_z=0.055)
+    expert.reset(ee_pose, place_xys[0], place_z=place_z)
     for i, xy in enumerate(place_xys):
         expert.place_pose[i, 0] = xy[0]
         expert.place_pose[i, 1] = xy[1]
@@ -977,7 +992,7 @@ def rollout_expert_B_with_goal_actions(
         if t == 0 or (t + 1) % 50 == 0:
             print(f"[DEBUG] rollout: Step {t+1}/{horizon}")
         ee_pose = get_ee_pose_w(env)
-        object_pose = get_object_pose_w(env)
+        object_pose = get_object_pose_w(env) + _mesh_off
         
         # Get observation vector
         if isinstance(obs_dict, dict):
@@ -1055,7 +1070,7 @@ def rollout_expert_B_with_goal_actions(
     print(f"[DEBUG] rollout: Starting settle steps ({settle_steps})...")
     for t in range(settle_steps):
         ee_pose = get_ee_pose_w(env)
-        object_pose = get_object_pose_w(env)
+        object_pose = get_object_pose_w(env) + _mesh_off
         
         if isinstance(obs_dict, dict):
             obs_vec = obs_dict.get("policy", obs_dict.get("obs", None))
@@ -1113,7 +1128,7 @@ def rollout_expert_B_with_goal_actions(
     # Step 8: Check success and build episode dicts
     # =========================================================================
     print("[DEBUG] rollout: Building episode dicts...")
-    object_pose = get_object_pose_w(env)
+    object_pose = get_object_pose_w(env) + _mesh_off
     results = []
     
     for i in range(num_envs):
