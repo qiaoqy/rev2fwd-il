@@ -245,10 +245,10 @@ print(f"Test 3 (loss backward) 通过 ✓, loss={loss.item():.4f}")
 
 ### 1.4 验收标准
 
-- [ ] `CriticConfig` 可独立实例化，`__post_init__` 校验通过
-- [ ] `CriticConfig(freeze_vision_encoder=True, action_model_checkpoint=None)` 触发 warning
-- [ ] `DiffusionConditionalUnet1d` 接受 `CriticConfig`，无 `action_feature` 硬编码
-- [ ] debug Test 1: UNet 无图像模式输出 shape `(B, T, 1)`
+- [x] `CriticConfig` 可独立实例化，`__post_init__` 校验通过
+- [x] `CriticConfig(freeze_vision_encoder=True, action_model_checkpoint=None)` 触发 warning
+- [x] `DiffusionConditionalUnet1d` 接受 `CriticConfig`，无 `action_feature` 硬编码
+- [x] debug Test 1: UNet 无图像模式输出 shape `(B, T, 1)`
 - [ ] debug Test 2: CriticModel 带双相机输入输出 shape `(B, T, 1)`
 - [ ] debug Test 3: `compute_loss` + `backward()` 无报错
 
@@ -260,32 +260,95 @@ print(f"Test 3 (loss backward) 通过 ✓, loss={loss.item():.4f}")
 
 ### 2.1 理解现有数据结构
 
-**Episode 数据源** (`src/rev2fwd_il/data/episode.py`):
+#### 数据产生
+
+Rollout 数据由 `scripts/scripts_pick_place_simulator/6_eval_cyclic.py` 调用 `AlternatingTester`（定义在 `scripts/scripts_pick_place/6_test_alternating.py`）收集。每个 cycle 先跑 Task A（pick→place at goal），再跑 Task B（pick from goal→place on table），分别记录 rollout episode。
+
+每个 episode 在 rollout 过程中逐帧记录 images、ee_pose、obj_pose、action（模型输出的 goal position），最终构建为 dict（参见 `6_test_alternating.py` L1493–L1512）：
+
 ```python
-@dataclass
-class Episode:
-    obs: np.ndarray       # (T, obs_dim)
-    ee_pose: np.ndarray   # (T, 7)
-    obj_pose: np.ndarray  # (T, 7)
-    gripper: np.ndarray   # (T,)
-    place_pose: np.ndarray  # (7,)
-    goal_pose: np.ndarray   # (7,)
-    success: bool = False   # ← 唯一的 reward 信号
+episode_data = {
+    "images":      np.array(images_list, dtype=np.uint8),      # (T, H, W, 3)
+    "ee_pose":     np.array(ee_pose_list, dtype=np.float32),   # (T, 7) — [x, y, z, qw, qx, qy, qz]
+    "obj_pose":    np.array(obj_pose_list, dtype=np.float32),  # (T, 7)
+    "action":      np.array(action_list, dtype=np.float32),    # (T, 8) — [goal_x..z, qw..qz, gripper]
+    "success":     success,                                     # bool
+    "success_step": success_step,                               # int, 首次达成成功条件的时间步
+}
+# 可选字段（取决于 wrist camera 是否存在）
+if wrist_images_list:
+    episode_data["wrist_images"] = np.array(wrist_images_list, dtype=np.uint8)  # (T, H, W, 3)
+# 可选字段（取决于 caller 是否传入）
+if place_pose is not None:
+    episode_data["place_pose"] = place_pose   # (7,) — Task B 的放置目标
+if goal_pose is not None:
+    episode_data["goal_pose"] = goal_pose     # (7,) — Task A 的放置目标
 ```
 
-**NPZ 加载** (`scripts/scripts_pick_place/4_train_diffusion.py` L406):
+#### 数据保存
+
+`AlternatingTester.save_data(out_A, out_B)` 只保存**成功** episode（参见 `6_test_alternating.py` L1962–L1970）：
+
+```python
+success_A = [ep for ep in self.episodes_A if ep["success"]]
+success_B = [ep for ep in self.episodes_B if ep["success"]]
+np.savez_compressed(out_A, episodes=np.array(success_A, dtype=object))
+np.savez_compressed(out_B, episodes=np.array(success_B, dtype=object))
+```
+
+并行收集时每个 GPU 产生一个分片（如 `iter2_collect_A_p4.npz`），再合并为 `iter2_collect_A.npz`。
+
+#### 数据读取
+
+`load_episodes_from_npz()`（定义在 `scripts/scripts_pick_place/4_train_diffusion.py` L406）：
+
 ```python
 def load_episodes_from_npz(path, num_episodes=-1) -> list[dict]:
     with np.load(path, allow_pickle=True) as data:
         episodes = list(data["episodes"])
-    # episode dict 包含: images, ee_pose, obj_pose, action, gripper, ...
-    # 注意：NPZ 格式的 episode 是 dict，不是 Episode dataclass
+    # 校验 "action" 字段存在
+    return episodes
 ```
 
-**关键观察**:
-- NPZ episode dict 中 `success` 字段可能存在也可能不存在（取决于数据收集方式）
-- `Episode` dataclass 有 `success` 字段，但 NPZ dict 不一定有
-- 需要确认目标数据（rollout data）的具体 key 结构
+`convert_npz_to_lerobot_format()` 逐帧写入 LeRobot dataset，其中 state 由 `ee_pose` (+可选 `obj_pose`/gripper) 拼接，action 直接取 `ep["action"][t]`（8 维 goal position）。
+
+#### 实际数据示例
+
+`debug/example_rollout.npz`（从 `exp27/iter2_collect_A_p4.npz` 复制）：
+
+```
+Top-level keys: ["episodes"]
+Number of episodes: 4（全部成功，失败 episode 已在 save_data 时过滤）
+Type: list[dict]
+
+Episode 0 keys + shapes:
+  images:       (858, 128, 128, 3)  uint8    — table camera RGB
+  wrist_images: (858, 128, 128, 3)  uint8    — wrist camera RGB
+  ee_pose:      (858, 7)            float32  — [x, y, z, qw, qx, qy, qz]
+  obj_pose:     (858, 7)            float32  — 物体位姿
+  action:       (858, 8)            float32  — [goal_x..z, qw..qz, gripper]
+  success:      True                bool     — 是否成功
+  success_step: 808                 int      — 首次满足成功条件的时间步
+  place_pose:   (7,)                float32  — 放置目标位姿
+  goal_pose:    (7,)                float32  — 目标位姿
+
+其他 episode 长度: T=792, 1250, 920（变长，因 horizon 内不同时刻达成成功）
+```
+
+#### 与 `Episode` dataclass 的区别
+
+`src/rev2fwd_il/data/episode.py` 中的 `Episode` dataclass 是早期实物机器人数据格式，字段不同（含 `obs`、`gripper` 等）。当前 simulator pipeline 全部使用 **NPZ episode dict** 格式，不使用 `Episode` dataclass。Critic 数据管线应基于 NPZ dict 格式设计。
+
+#### Critic 需要用到的字段
+
+| 字段 | 用途 |
+|------|------|
+| `action` (T, 8) | UNet 输入（critic 评估的 trajectory） |
+| `ee_pose` (T, 7) | observation.state（robot proprio） |
+| `images` (T, H, W, 3) | observation.image（table camera） |
+| `wrist_images` (T, H, W, 3) | observation.wrist_image（wrist camera） |
+| `success` (bool) | 计算 Bellman return 的 reward 信号 |
+| `success_step` (int) | 精确定位成功时刻，用于稀疏 reward 赋值 |
 
 ### 2.2 实现 Bellman Return 计算
 

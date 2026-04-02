@@ -59,6 +59,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--red_region_size_xy", type=float, nargs=2,
                         default=[0.3, 0.3])
 
+    # Save options
+    parser.add_argument("--save_all", action="store_true",
+                        help="Save all episodes (success+failure), not just successes.")
+
     # Video
     parser.add_argument("--save_video", action="store_true")
     parser.add_argument("--video_path", type=str, default=None)
@@ -312,8 +316,19 @@ def main() -> None:
         print(f"  Task B success: {n_success_B}/{len(results_B)} = {rate_B:.1%}")
         print(f"  Time:           {elapsed:.1f}s")
 
-        # Save successful rollout data
-        tester.save_data(args.out_A, args.out_B)
+        # Save rollout data
+        if args.save_all:
+            # Save ALL episodes (success + failure) for analysis
+            for out_path, episodes in [(args.out_A, tester.episodes_A),
+                                        (args.out_B, tester.episodes_B)]:
+                if episodes:
+                    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(out_path, episodes=np.array(episodes, dtype=object))
+                    n_succ = sum(1 for ep in episodes if ep["success"])
+                    print(f"Saved {len(episodes)} episodes ({n_succ} success, "
+                          f"{len(episodes)-n_succ} fail) to {out_path}")
+        else:
+            tester.save_data(args.out_A, args.out_B)
 
         # Save JSON statistics
         stats = {
