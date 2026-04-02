@@ -38,6 +38,7 @@ from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from src.rev2fwd_il.models.critic_config import CriticConfig
 from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -590,7 +591,7 @@ class DiffusionConditionalUnet1d(nn.Module):
     Note: this removes local conditioning as compared to the original diffusion policy code.
     """
 
-    def __init__(self, config: DiffusionConfig, global_cond_dim: int, action_feature=7):
+    def __init__(self, config: CriticConfig, global_cond_dim: int):
         super().__init__()
 
         self.config = config
@@ -607,11 +608,8 @@ class DiffusionConditionalUnet1d(nn.Module):
         cond_dim = config.diffusion_step_embed_dim + global_cond_dim
 
         # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
-        # just reverse these. TODO: fix action_feature shape
-        # in_out = [(config.f.shape[0], config.down_dims[0])] + list(
-        #     zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
-        # )
-        in_out = [(action_feature, config.down_dims[0])] + list(
+        # just reverse these.
+        in_out = [(config.action_dim, config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
 
