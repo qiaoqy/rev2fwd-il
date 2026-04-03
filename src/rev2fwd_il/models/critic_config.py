@@ -40,7 +40,7 @@ class CriticConfig:
     n_obs_steps: int = 2
 
     # === Critic-specific params ===
-    gamma: float = 0.99
+    gamma: float = 0.995
     value_loss_type: str = "mse"  # "mse" | "huber"
 
     # === Training params ===

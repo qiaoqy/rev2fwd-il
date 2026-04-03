@@ -133,7 +133,7 @@ def _render_value_curve_frame(
 
 
 def create_episode_video(ep: dict, out_path: str, ep_idx: int = 0,
-                         fps: int = 20, max_frames: int = 500):
+                         fps: int = 20, max_frames: int = 1000):
     """Create a video with camera images on top and real-time value curve below.
 
     Layout (vertically stacked):

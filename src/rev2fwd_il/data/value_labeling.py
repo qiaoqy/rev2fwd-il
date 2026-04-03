@@ -5,7 +5,7 @@ import numpy as np
 
 def compute_bellman_returns(
     episodes: list[dict],
-    gamma: float = 0.99,
+    gamma: float = 0.995,
     success_reward: float = 1.0,
 ) -> list[np.ndarray]:
     """Compute discounted Bellman returns for each episode.
@@ -14,13 +14,11 @@ def compute_bellman_returns(
       - Successful episode: r(success_step) = success_reward, r(t != success_step) = 0
       - Failed episode: r(t) = 0 for all t
 
-    Bellman return (backward from terminal step):
-      V(T-1) = r(T-1)
-      V(t)   = r(t) + gamma * V(t+1)
+    Value assignment for successful episodes (with success_step S):
+      - t >= S: V(t) = success_reward  (already succeeded, full value)
+      - t <  S: V(t) = gamma^(S - t) * success_reward  (discounted from success point)
 
-    For sparse reward with success_step S, this gives:
-      - t <= S: V(t) = gamma^(S - t) * success_reward
-      - t >  S: V(t) = 0
+    Failed episodes: V(t) = 0 for all t.
 
     Args:
         episodes: List of episode dicts. Each dict must contain:
@@ -47,11 +45,11 @@ def compute_bellman_returns(
         success_step = min(success_step, T - 1)
 
         values = np.zeros(T, dtype=np.float32)
-        # Assign reward at success_step, then propagate backward
-        values[success_step] = success_reward
+        # Steps at and after success_step get full reward (already succeeded)
+        values[success_step:] = success_reward
+        # Steps before success_step get discounted value
         for t in range(success_step - 1, -1, -1):
             values[t] = gamma * values[t + 1]
-        # Steps after success_step remain 0
 
         bellman_values.append(values)
 

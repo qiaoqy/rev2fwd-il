@@ -37,7 +37,7 @@ def parse_args():
                         help="Directory containing rollout partition files")
     parser.add_argument("--task", type=str, default="A", choices=["A", "B"],
                         help="Task to process (A or B)")
-    parser.add_argument("--gamma", type=float, default=0.99,
+    parser.add_argument("--gamma", type=float, default=0.995,
                         help="Discount factor for Bellman returns")
     parser.add_argument("--success_reward", type=float, default=1.0,
                         help="Reward value at success timestep")
@@ -194,11 +194,11 @@ def verify_bellman_returns(episodes: list[dict], gamma: float) -> None:
                 print(f"    FAIL ep{i}: non-monotonic values before success_step")
                 all_ok = False
 
-            # Values after success_step should be 0
+            # Values at and after success_step should be 1.0
             if ss < T - 1:
-                post_values = bv[ss + 1:]
-                if not np.allclose(post_values, 0.0):
-                    print(f"    FAIL ep{i}: non-zero values after success_step")
+                post_values = bv[ss:]
+                if not np.allclose(post_values, 1.0, atol=1e-6):
+                    print(f"    FAIL ep{i}: values after success_step are not 1.0")
                     all_ok = False
 
             # Check V(0) ≈ gamma^ss

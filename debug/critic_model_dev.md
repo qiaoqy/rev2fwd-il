@@ -349,22 +349,20 @@ import numpy as np
 
 def compute_bellman_returns(
     episodes: list[dict],
-    gamma: float = 0.99,
+    gamma: float = 0.995,
     success_reward: float = 1.0,
 ) -> list[np.ndarray]:
     """为每个 episode 计算 discounted Bellman return。
     
     Reward 定义（稀疏）:
-      - 成功 episode: r(T) = success_reward, r(t<T) = 0
+      - 成功 episode: r(success_step) = success_reward, r(t != success_step) = 0
       - 失败 episode: r(t) = 0 for all t
     
-    Bellman return（从末尾反向计算）:
-      V(T) = r(T)
-      V(t) = r(t) + γ * V(t+1)
+    Value 赋值（成功 episode，success_step=S）:
+      - t >= S: V(t) = success_reward（已成功，full value）
+      - t <  S: V(t) = γ^(S-t) * success_reward（从成功点向前折扣）
     
-    对于稀疏 reward，等价于:
-      - 成功 episode: V(t) = γ^(T-t) * success_reward
-      - 失败 episode: V(t) = 0
+    失败 episode: V(t) = 0 for all t
     
     Args:
         episodes: list of episode dicts，每个 dict 须含 "action" (T, action_dim) 和 "success" (bool)
@@ -383,10 +381,14 @@ def compute_bellman_returns(
             bellman_values.append(np.zeros(T, dtype=np.float32))
             continue
         
-        # 成功 episode：从末尾反向计算
+        success_step = ep.get("success_step", T - 1)
+        success_step = min(success_step, T - 1)
+        
         values = np.zeros(T, dtype=np.float32)
-        values[-1] = success_reward
-        for t in range(T - 2, -1, -1):
+        # 成功后所有帧 value=1
+        values[success_step:] = success_reward
+        # 成功前从 success_step 向前折扣
+        for t in range(success_step - 1, -1, -1):
             values[t] = gamma * values[t + 1]
         
         bellman_values.append(values)
@@ -435,8 +437,8 @@ lerobot 的 `load_previous_and_future_frames` 会对 episode 边界做 copy-padd
 
 ### 2.5 验收标准
 
-- [x] `compute_bellman_returns()` 单元测试：成功 episode value 单调递增（从 0 到 1），失败 episode 全零
-- [x] 示例：T=100, γ=0.99, success → `V(0)=0.99^99≈0.370`, `V(99)=1.0`
+- [x] `compute_bellman_returns()` 单元测试：成功 episode value 单调递增（从 0 到 1），成功后 value=1，失败 episode 全零
+- [x] 示例：T=100, γ=0.995, success_step=80 → `V(0)=0.995^80≈0.670`, `V(80..99)=1.0`
 - [x] NPZ → LeRobot 转换后，dataset 中每个 frame 包含 `bellman_value` 字段
 - [x] 数据可视化：抽几个 episode 画 value 曲线，确认形状合理
 
@@ -675,6 +677,210 @@ debug/
 | **2** | Bellman return 标注 | Phase 1 (需要 γ 从 config 读取) | `value_labeling.py`, dataset 含 `bellman_value` |
 | **3** | Critic loss + visual encoder 完整实现 | Phase 1 + 2 | `CriticModel`（含 rgb_encoder 从 action model 初始化后端到端训练）可独立训练 |
 | **4** | Value 加权接入 action loss | Phase 2 (需要 bellman_value 数据) | action policy value-guided 训练 |
+
+## Phase 5: Critic 训练实验
+
+> 只使用 Task A rollout 数据训练 critic model，不使用 Task B 数据。
+
+### 5.0 Critic Model 输入输出说明
+
+Critic model 是一个 **Q-function 形式的 value estimator**，输入同时包含 **observation** 和 **action**，输出每个时间步的 value。
+
+#### 输入
+
+| 字段 | Shape | 作用 | 处理方式 |
+|------|-------|------|---------|
+| `observation.state` | `(B, n_obs, 15)` | 机器人状态（ee_pose 7 + obj_pose 7 + gripper 1） | 拼入 global conditioning |
+| `observation.images` | `(B, n_obs, 2, 3, 128, 128)` | 双相机图像（table + wrist） | 经 ResNet18 → SpatialSoftmax → 拼入 global conditioning |
+| **`action`** | **`(B, T, 8)`** | **action trajectory（goal_xyz, quat, gripper）** | **作为 UNet 的主输入序列** |
+
+**是的，action 是 critic 的核心输入之一。** 这是 critic 与 action policy 的关键区别：
+
+- **Action policy** (DiffusionModel): UNet 输入是 noisy action，输出是 denoised action（或 noise prediction）
+- **Critic model** (CriticModel): UNet 输入是 clean action trajectory，输出是每个时间步的 value
+
+数据流：
+```
+observation.state ─────────────┐
+                                ├─→ global_cond (B, global_cond_dim)
+observation.images → ResNet18 ─┘         │
+                                          ↓
+action (B, T, 8) ──→ UNet1d(x=action, cond=global_cond, timestep=0) ──→ pred_value (B, T, 1)
+```
+
+- `observation` 经编码后作为 UNet 的 **global conditioning**（通过 FiLM 调制 ResBlock）
+- `action` 是 UNet 的 **主序列输入**（1D 卷积沿时间维度 T 滑动）
+- `timestep` 固定为 0（critic 不做 denoising，sinusoidal embedding 退化为可学习 bias）
+
+#### 输出
+
+| 字段 | Shape | 含义 |
+|------|-------|------|
+| `pred_value` | `(B, T, 1)` | 每个时间步的 predicted Bellman return |
+
+#### 训练 target
+
+| 字段 | Shape | 含义 |
+|------|-------|------|
+| `bellman_value` | `(B, T)` | Ground-truth discounted return：成功 episode 中 $t \geq S$ 时为 1.0，$t < S$ 时为 $\gamma^{(S - t)}$；失败 episode 为 0 |
+| `action_is_pad` | `(B, T)` | Padding mask，padded 位置的 loss 被置零 |
+
+#### 语义
+
+给定当前观测 $o_t$ 和未来 action 序列 $a_{t:t+T}$，critic 预测"执行这些 action 后最终成功的折扣概率"：
+- $V = 1$: 已经成功（t >= success_step），或 (obs, action) 组合大概率成功
+- $V \in (0, 1)$: 接近但尚未成功，value 随距离 success_step 的远近而折扣
+- $V = 0$: 失败 episode
+
+### 5.1 DDP (DistributedDataParallel) 说明
+
+DDP 是 PyTorch 的多 GPU 分布式训练方案（`torch.nn.parallel.DistributedDataParallel`）。核心机制：
+- 每个 GPU 维护模型的完整副本
+- 数据通过 `DistributedSampler` 按 GPU 数量分片，每个 GPU 只看到 1/N 的数据
+- forward pass 各 GPU 独立进行
+- backward pass 结束时，DDP hook 自动 all-reduce 梯度，确保所有 GPU 的模型参数保持同步
+- 相比 `DataParallel`，DDP 每个 GPU 一个进程，无 GIL 瓶颈，通信效率更高
+
+**DDP bug 修复**: 之前训练脚本中调用 `model.module.compute_loss()` 绕过了 DDP wrapper，导致 backward 时梯度同步 hook 不触发。修复为通过 `model(batch)` 走 DDP 的 `forward()`，在外部计算 loss。
+
+### 5.2 数据概况
+
+仅使用 Task A rollout 数据（`iter3_rollout_A_p*.npz` → `critic_A_train/test.npz`）。
+
+| 集合 | Episodes | 成功/失败 | 总帧数 | 平均 episode 长度 | Bellman 均值 |
+|------|----------|-----------|--------|-------------------|-------------|
+| Train | 79 | 58✓ / 21✗ | 134,593 | 1,704 | 0.200 |
+| Test | 21 | 15✓ / 6✗ | 35,868 | 1,708 | 0.207 |
+
+### 5.3 当前训练命令
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9 \
+torchrun --nproc_per_node=10 --master_port=29500 \
+debug/train_critic.py \
+  --task A \
+  --batch_size 80 \
+  --num_steps 50000 \
+  --lr 1e-4 \
+  --grad_clip 1.0 \
+  --log_freq 100 \
+  --eval_freq 2000 \
+  --save_freq 10000 \
+  --num_workers 4 \
+  --output_dir debug/data/critic_A_ddp_v1
+```
+
+### 5.4 训练配置与 Epoch 计算
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| GPUs | 10 (cuda:0-9) | DDP，每卡一个进程 |
+| Global batch size | 80 | 所有 GPU 合计 |
+| Per-GPU batch | 8 | 80 / 10 |
+| Train samples | 134,593 | sliding window stride=1 |
+| Per-GPU samples/epoch | ~13,459 | 134,593 / 10 (DistributedSampler 分片) |
+| Steps/epoch | ~1,682 | 13,459 / 8 |
+| Total steps | 50,000 | — |
+| **Total epochs** | **~29.7** | 50,000 / 1,682 |
+| LR schedule | cosine annealing | 1e-4 → 0 |
+| Vision encoder init | iter_10/policy_A | 65 keys matched, 不冻结 |
+| Model params | 267,142,433 | 全部可训练 |
+| 训练速度 | ~3.1 it/s | — |
+| 预计总时间 | ~270 min | — |
+
+### 5.5 训练进度 (critic_A_ddp_v1)
+
+| Step | Train Loss | Eval Loss | LR |
+|------|-----------|-----------|-----|
+| 100 | 0.1244 | — | 1.00e-4 |
+| 500 | 0.0046 | — | 1.00e-4 |
+| 1000 | 0.0041 | — | 9.99e-5 |
+| 2000 | 0.0024 | **0.0255** | 9.96e-5 |
+| 3000 | 0.0028 | — | 9.91e-5 |
+
+输出目录: `debug/data/critic_A_ddp_v1/`
+Tensorboard: `tensorboard --logdir debug/data/critic_A_ddp_v1/tb`
+
+### 5.5b 训练进度 (critic_A_ddp_v2) — γ=0.995 + success tail value=1
+
+**数据变更**（相对 v1）：
+- γ: 0.99 → 0.995（更高折扣，value 向前传播更远）
+- 成功后帧: V=0 → V=1（success_step 之后所有帧 value 设为 1.0）
+- Bellman 均值: 0.081 → 0.200
+
+| Step | Train Loss | Eval Loss | LR | 备注 |
+|------|-----------|-----------|-----|------|
+| 100 | 0.1839 | — | 1.00e-4 | |
+| 500 | 0.0075 | — | 1.00e-4 | |
+| 1000 | 0.0057 | — | 9.99e-5 | |
+| 2000 | 0.0037 | **0.0585** | 9.96e-5 | |
+| 4000 | 0.0012 | 0.0564 | 9.84e-5 | |
+| 6000 | 0.0005 | 0.0560 | 9.64e-5 | |
+| 10000 | 0.0003 | 0.0570 | 9.05e-5 | ckpt saved |
+| 20000 | 0.0001 | 0.0576 | 5.95e-5 | ckpt saved |
+| 30000 | 0.00005 | 0.0575 | 3.05e-5 | ckpt saved |
+| 40000 | 0.00002 | 0.0581 | 9.55e-6 | ckpt saved |
+| **50000** | **0.000009** | **0.0576** | 0 | **final** |
+
+**观察**:
+- Train loss 持续下降至 ~1e-5，说明模型容量足够拟合训练集
+- Eval loss 在 step ~6000 后稳定在 ~0.057，未再改善 → **train set 已过拟合**
+- 最佳 eval 出现在 step ~6000 (0.0560)，后续 eval 在 0.056~0.058 范围震荡
+- 相比 v1 (eval=0.0255)，v2 eval loss 更高是因为 target value 分布变了（均值从 0.081 → 0.200）
+
+输出目录: `debug/data/critic_A_ddp_v2/`
+Tensorboard: `tensorboard --logdir debug/data/critic_A_ddp_v2/tb`
+
+### 5.6 Critic v2 测试集评估
+
+在测试集 (`critic_A_test.npz`, 21 episodes) 上选取 5 条数据（4 成功 + 1 失败）进行推理，可视化 predicted value vs GT bellman value。
+
+**评估脚本**: `debug/eval_critic_visual.py`
+**Checkpoint**: `debug/data/critic_A_ddp_v2/checkpoints/final/checkpoint.pt` (step=50000)
+**输出目录**: `debug/data/eval_critic_A_v2/`
+
+#### 定量结果
+
+| Episode | T | Success | MAE | MSE |
+|---------|------|---------|---------|---------|
+| 1 | 917 | ✅ | 0.0347 | 0.0024 |
+| 3 | 1400 | ✅ | 0.0269 | 0.0028 |
+| 4 | 1098 | ✅ | 0.0247 | 0.0011 |
+| 5 | 887 | ✅ | 0.0344 | 0.0022 |
+| 0 | 3000 | ❌ | 0.1198 | 0.0692 |
+
+#### 定性分析
+
+**成功 episode (Ep 1, 3, 4, 5)**:
+- 预测曲线整体趋势正确：从 0 单调上升至 1.0，接近 success_step 后快速上升
+- 预测比 GT 偏高（尤其中段 t=300~600），MAE ~0.03
+- 在接近 success_step 及之后区域（V≈1.0），预测非常准确
+- 预测曲线存在噪声/锯齿，GT 是平滑指数曲线
+
+**失败 episode (Ep 0)**:
+- GT 全程为 0，但**模型在 t=500~1300 区间预测出了较高 value（最高 ~0.85）**
+- 这说明该失败 episode 的 observation-action 序列与某些成功 episode 相似，critic 被"欺骗"
+- t=1300 后 value 骤降并稳定在 ~0（机器人停止有意义动作后，critic 正确给出低 value）
+- 这是当前模型最大的问题：**对"看起来像成功但最终失败"的 episode 区分能力不足**
+
+#### 生成的可视化文件
+
+每个 episode 目录下包含：
+- `value_curve.png`: 3 子图（predicted vs GT 曲线、prediction error、EE xyz 轨迹）
+- `overview.png`: 曲线 + 6 个均匀采样帧（标注 GT/Pred value）
+- `video.mp4`: 逐帧实时视频（画面 + value bar）
+
+汇总图：`debug/data/eval_critic_A_v2/aggregate_pred_vs_gt.png`
+
+### 5.7 之前的实验记录
+
+| 实验 | 目录 | 说明 | 状态 |
+|------|------|------|------|
+| Overfit test | `critic_A_overfit_test/` | 4 episodes, 单卡, 2000 steps | ✅ eval loss → 4.4e-5 |
+| Task A full v1 | `critic_A_full_v1/` | 单卡, batch=16, 50K steps | ⚠️ 已停止 (DDP bug) |
+| Task B full v1 | `critic_B_full_v1/` | 单卡, batch=16, 50K steps | ❌ 已停止 (不再训练 B) |
+| **Task A DDP v1** | **`critic_A_ddp_v1/`** | **10卡 DDP, batch=80, 50K steps, γ=0.99** | **✅ 完成** |
+| **Task A DDP v2** | **`critic_A_ddp_v2/`** | **10卡 DDP, batch=80, 50K steps, γ=0.995, success tail=1** | **✅ 完成, final eval=0.0576** |
 
 ## 附录: Global Conditioning 维度计算
 

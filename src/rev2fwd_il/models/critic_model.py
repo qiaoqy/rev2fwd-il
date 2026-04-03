@@ -758,14 +758,39 @@ class CriticModel(nn.Module):
 
         After loading, weights are NOT frozen — rgb_encoder trains end-to-end with UNet.
 
+        Supports both:
+          - Directory path (loads model.safetensors inside it)
+          - Direct .safetensors or .pt file path
+
         Action model state_dict key pattern:
             diffusion.rgb_encoder.{...} -> rgb_encoder.{...}
         """
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        import os
+        from pathlib import Path
 
-        # Handle possible wrapper keys (e.g. "model." prefix).
-        if "model" in state_dict:
-            state_dict = state_dict["model"]
+        ckpt_path = Path(checkpoint_path)
+
+        # If directory, look for model.safetensors or model.pt
+        if ckpt_path.is_dir():
+            safetensors_path = ckpt_path / "model.safetensors"
+            pt_path = ckpt_path / "model.pt"
+            if safetensors_path.exists():
+                ckpt_path = safetensors_path
+            elif pt_path.exists():
+                ckpt_path = pt_path
+            else:
+                raise FileNotFoundError(
+                    f"No model.safetensors or model.pt found in {checkpoint_path}"
+                )
+
+        if str(ckpt_path).endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state_dict = load_file(str(ckpt_path))
+        else:
+            state_dict = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+            # Handle possible wrapper keys (e.g. "model." prefix).
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
 
         # Extract rgb_encoder keys.
         prefix = "diffusion.rgb_encoder."
