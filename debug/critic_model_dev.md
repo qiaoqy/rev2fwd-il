@@ -882,6 +882,87 @@ Tensorboard: `tensorboard --logdir debug/data/critic_A_ddp_v2/tb`
 | **Task A DDP v1** | **`critic_A_ddp_v1/`** | **10卡 DDP, batch=80, 50K steps, γ=0.99** | **✅ 完成** |
 | **Task A DDP v2** | **`critic_A_ddp_v2/`** | **10卡 DDP, batch=80, 50K steps, γ=0.995, success tail=1** | **✅ 完成, final eval=0.0576** |
 
+## Phase 6: B Rollout 倒放 → Critic Value 标记实验
+
+> 将 B rollout 数据直接倒放（不做任何过滤和调速处理），用训练好的 Task A critic model 对倒放后的数据标记 predicted value，可视化评估 critic 对反转 B 数据的判断能力。
+
+### 6.1 动机
+
+Critic model (v2) 在 Task A 测试集上表现良好（成功 episode MAE~0.03），但这些数据都是原始 A rollout。实际应用中，Policy A 的训练数据来源是 **B rollout 倒放**，而非直接的 A rollout。因此需要验证：
+
+1. **Critic 对倒放 B 数据的泛化能力**：倒放 B 数据与原始 A rollout 在分布上有多大差异？Critic 能否正确评估？
+2. **为 value-weighted training 做数据探索**：如果 critic 能合理区分好/坏的倒放轨迹，就可以用 predicted value 过滤或加权这些数据来训练 Policy A。
+3. **观察未过滤/未调速数据的特征**：之前 exp27 pipeline 对 B rollout 做了 filter → speed-adjust → z-fix → reverse，本实验只做 reverse，观察 critic 对"原始质量"倒放数据的响应。
+
+### 6.2 数据来源
+
+| 数据 | 路径 | 说明 |
+|------|------|------|
+| B rollout 分片 | `debug/data/iter3_rollout_B_p{0..9}.npz` | 10 个 GPU 收集的 B rollout（每分片 10 eps） |
+| 合并后 | `debug/data/iter3_rollout_B_all.npz` | 合并 100 episodes（99 成功 + 1 失败） |
+| 倒放后 | `debug/data/iter3_rollout_B_reversed.npz` | 仅倒放，不过滤不调速 |
+| Critic checkpoint | `debug/data/critic_A_ddp_v2/checkpoints/final/checkpoint.pt` | Task A critic v2 (γ=0.995, step=50000) |
+
+### 6.3 处理流程
+
+```
+iter3_rollout_B_p{0..9}.npz
+       │
+       ├── 合并 → iter3_rollout_B_all.npz (100 eps)
+       │
+       └── 倒放 (2_reverse_to_task_A.py, success_only=0)
+                  │
+                  └── iter3_rollout_B_reversed.npz
+                             │
+                             └── Critic 推理 (eval_critic_visual.py 风格)
+                                        │
+                                        └── 可视化 5 条 episode (value 曲线 + overview + video)
+```
+
+**注意**：倒放时使用 `success_only=0`，保留失败 episode，观察 critic 对失败数据的响应。
+
+### 6.4 与 exp27 pipeline 的区别
+
+| 步骤 | Exp27 Pipeline | 本实验 |
+|------|---------------|--------|
+| Filter (静止帧) | ✅ | ❌ 不做 |
+| Speed-adjust (加速) | ✅ (interp_factor=1) | ❌ 不做 |
+| Z-offset fix | ✅ (z -= 0.02) | ❌ 不做 |
+| Reverse | ✅ | ✅ |
+
+本实验只做最后一步 reverse，保留数据原始质量，观察 critic 的判断。
+
+### 6.5 脚本
+
+**合并 B 分片 + 倒放 + Critic 评估可视化**: `debug/eval_critic_on_reversed_B.py`
+
+```bash
+# 合并 B 分片
+python debug/eval_critic_on_reversed_B.py \
+    --data_dir debug/data \
+    --checkpoint debug/data/critic_A_ddp_v2/checkpoints/final/checkpoint.pt \
+    --num_episodes 5 \
+    --out_dir debug/data/eval_critic_reversed_B \
+    --device cuda:0
+```
+
+### 6.6 关注点
+
+在可视化结果中重点观察：
+1. **成功 B episode 倒放后**：critic predicted value 是否呈现合理的从低到高递增趋势？
+2. **失败 B episode 倒放后**：critic 是否给出低 value？
+3. **与 A rollout 对比**：倒放 B 的 value 曲线形状是否与原始 A rollout 类似？
+4. **静止帧/慢速帧的影响**：未过滤的数据中，静止段是否导致 critic value 出现异常平坦或跳变？
+
+### 6.7 验收标准
+
+- [ ] B 分片合并为 `iter3_rollout_B_all.npz` (100 eps)
+- [ ] 倒放为 `iter3_rollout_B_reversed.npz` (100 eps, success_only=0)
+- [ ] Critic 对 5 条倒放 episode 生成 value curve + overview + video 可视化
+- [ ] 结果保存到 `debug/data/eval_critic_reversed_B/`
+
+---
+
 ## 附录: Global Conditioning 维度计算
 
 ```
