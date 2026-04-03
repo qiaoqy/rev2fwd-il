@@ -435,10 +435,10 @@ lerobot 的 `load_previous_and_future_frames` 会对 episode 边界做 copy-padd
 
 ### 2.5 验收标准
 
-- [ ] `compute_bellman_returns()` 单元测试：成功 episode value 单调递增（从 0 到 1），失败 episode 全零
-- [ ] 示例：T=100, γ=0.99, success → `V(0)=0.99^99≈0.370`, `V(99)=1.0`
-- [ ] NPZ → LeRobot 转换后，dataset 中每个 frame 包含 `bellman_value` 字段
-- [ ] 数据可视化：抽几个 episode 画 value 曲线，确认形状合理
+- [x] `compute_bellman_returns()` 单元测试：成功 episode value 单调递增（从 0 到 1），失败 episode 全零
+- [x] 示例：T=100, γ=0.99, success → `V(0)=0.99^99≈0.370`, `V(99)=1.0`
+- [x] NPZ → LeRobot 转换后，dataset 中每个 frame 包含 `bellman_value` 字段
+- [x] 数据可视化：抽几个 episode 画 value 曲线，确认形状合理
 
 ---
 
@@ -467,232 +467,103 @@ Critic (对称结构):
                         value loss)
 ```
 
-### 3.2 新建 `CriticModel` 外层封装
+### 3.2 已完成的改动
 
-**文件**: `src/rev2fwd_il/models/critic_model.py`（在现有文件中新增）
+#### 3.2.1 `CriticModel` 外层封装（`src/rev2fwd_il/models/critic_model.py`）
 
-CriticModel 需要处理双相机图像输入 + proprio state，通过 visual encoder 提取图像特征后拼接为 global_cond 传入 UNet。
+在 `DiffusionConditionalUnet1d.forward` 之后、`DiffusionConditionalResidualBlock1d` 之前新增了 `CriticModel` 类（约 160 行），包含以下组件：
 
-**Visual Encoder 权重初始化策略**: ResNet 从 action model checkpoint 加载预训练权重，继承 action model 中已学到的视觉表征知识，然后**不冻结**，与 UNet 一起端到端训练。这样既利用了 action model 的预训练知识作为更好的初始化起点，又允许 critic 根据 value prediction 任务的需求对视觉特征进行微调。
+**`__init__`**:
+- 从 `CriticConfig.input_features` 自动导出 `robot_state_feature` 和 `image_features`
+- 构建 `DiffusionRgbEncoder`（共享 encoder 或 per-camera encoder，取决于 `use_separate_rgb_encoder_per_camera`）
+- 计算 `global_cond_dim = (state_dim + visual_feature_dim) * n_obs_steps`
+- 可选从 action model checkpoint 加载 rgb_encoder 权重（`config.action_model_checkpoint`）
+- 构建 `DiffusionConditionalUnet1d`（critic 版，final_conv 输出 1 维）
 
-```
-Action model checkpoint (DiffusionPolicy state_dict)
-    │
-    ├── diffusion.rgb_encoder.backbone.0.weight    ──┐
-    ├── diffusion.rgb_encoder.backbone.0.bias       │
-    ├── diffusion.rgb_encoder.pool.*                 ├──→  CriticModel.rgb_encoder (初始化权重)
-    ├── diffusion.rgb_encoder.out.weight             │     (不冻结，与 UNet 一起端到端训练)
-    ├── diffusion.rgb_encoder.out.bias              ──┘
-    │
-    ├── diffusion.unet.*                            ✗ 不加载
-    └── diffusion.noise_scheduler.*                 ✗ 不加载
-```
+**`_load_vision_weights_from_action_model(checkpoint_path)`**:
+- 加载 action model state_dict，提取 `diffusion.rgb_encoder.*` 前缀的 key
+- strip 前缀后 `load_state_dict(strict=False)` 到 `self.rgb_encoder`
+- 加载后**不冻结**，与 UNet 一起端到端训练
+- 打印 matched/missing/unexpected keys 供诊断
 
-**关键前提**: CriticConfig 的 vision backbone 参数（`vision_backbone`, `crop_shape`, `use_group_norm`, `spatial_softmax_num_keypoints` 等）必须与 action model 训练时的 `DiffusionConfig` 一致，否则模型结构不匹配，`load_state_dict` 会失败。
+**`_prepare_global_conditioning(batch)`**:
+- 与 `DiffusionModel._prepare_global_conditioning` 逻辑完全对称
+- 编码 `observation.state` (B, n_obs, state_dim) + `observation.images` (B, n_obs, num_cameras, C, H, W)
+- 输出 (B, global_cond_dim) 拼接向量
 
-```python
-class CriticModel(nn.Module):
-    """外层封装，负责视觉编码 + obs encoding + value loss 计算。
-    
-    类似 lerobot 的 DiffusionModel 对 DiffusionConditionalUnet1d 的封装。
-    支持从 action model checkpoint 加载 visual encoder 权重作为初始化，
-    加载后不冻结，rgb_encoder 与 UNet 一起端到端训练。
-    """
-    
-    def __init__(self, config: CriticConfig):
-        super().__init__()
-        self.config = config
-        
-        # ====== 构建 visual encoder（从 input_features 自动导出相机数量） ======
-        global_cond_dim = config.robot_state_feature.shape[0]  # proprio（从 input_features 自动导出）
-        
-        if config.image_features:
-            num_images = len(config.image_features)
-            if config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
-                self.rgb_encoder = nn.ModuleList(encoders)
-                self.visual_feature_dim = encoders[0].feature_dim * num_images
-            else:
-                self.rgb_encoder = DiffusionRgbEncoder(config)
-                self.visual_feature_dim = self.rgb_encoder.feature_dim * num_images
-            global_cond_dim += self.visual_feature_dim
-        else:
-            self.rgb_encoder = None
-            self.visual_feature_dim = 0
-        
-        # ====== 从 action model 加载 visual encoder 权重（作为初始化，不冻结） ======
-        if config.action_model_checkpoint is not None and self.rgb_encoder is not None:
-            self._load_vision_weights_from_action_model(config.action_model_checkpoint)
-        
-        # ====== UNet (value head) ======
-        self.unet = DiffusionConditionalUnet1d(
-            config,
-            global_cond_dim=global_cond_dim * config.n_obs_steps,
-        )
-    
-    def _load_vision_weights_from_action_model(self, checkpoint_path: str):
-        """从 action model checkpoint 中提取 rgb_encoder 权重并加载作为初始化。
-        
-        加载后不冻结，rgb_encoder 将与 UNet 一起端到端训练。
-        
-        Action model 的权重结构 (DiffusionPolicy state_dict):
-            diffusion.rgb_encoder.backbone.0.weight
-            diffusion.rgb_encoder.pool...
-            diffusion.rgb_encoder.out.weight
-            ...
-        
-        Critic 中 rgb_encoder 的结构与 action model 完全一致
-        （使用相同的 DiffusionRgbEncoder 类 + 相同的 config 参数），
-        因此可以直接匹配 key name。
-        """
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        
-        # 处理可能的 wrapper key（如 "model." 前缀）
-        if "model" in state_dict:
-            state_dict = state_dict["model"]
-        
-        # 提取 rgb_encoder 相关的 key
-        # action model: "diffusion.rgb_encoder.{...}" → critic: "rgb_encoder.{...}"
-        prefix = "diffusion.rgb_encoder."
-        vision_sd = {}
-        for k, v in state_dict.items():
-            if k.startswith(prefix):
-                new_key = k[len(prefix):]  # strip prefix
-                vision_sd[new_key] = v
-        
-        if len(vision_sd) == 0:
-            raise ValueError(
-                f"No rgb_encoder weights found in checkpoint: {checkpoint_path}. "
-                f"Available keys (first 10): {list(state_dict.keys())[:10]}"
-            )
-        
-        # 加载权重（strict=False 允许 encoder list vs single encoder 的差异）
-        missing, unexpected = self.rgb_encoder.load_state_dict(vision_sd, strict=False)
-        print(f"[CriticModel] Loaded vision encoder from action model: {checkpoint_path}")
-        print(f"  matched keys: {len(vision_sd) - len(unexpected)}")
-        print(f"  (not frozen — will be trained end-to-end with UNet)")
-        if missing:
-            print(f"  missing keys: {missing[:5]}...")
-        if unexpected:
-            print(f"  unexpected keys: {unexpected[:5]}...")
-    
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """编码图像特征 + proprio，拼接为 global conditioning。
-        
-        与 DiffusionModel._prepare_global_conditioning 逻辑一致。
-        """
-        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
-        global_cond_feats = [batch["observation.state"]]  # (B, n_obs, state_dim)
-        
-        if self.rgb_encoder is not None and "observation.images" in batch:
-            if self.config.use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(
-                    batch["observation.images"], "b s n ... -> n (b s) ..."
-                )
-                img_features_list = torch.cat([
-                    encoder(images)
-                    for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                ])
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)",
-                    b=batch_size, s=n_obs_steps
-                )
-            else:
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
-                )
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)",
-                    b=batch_size, s=n_obs_steps
-                )
-            global_cond_feats.append(img_features)
-        
-        # (B, n_obs, state_dim + visual_feat_dim) → (B, n_obs * total_dim)
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
-    
-    def forward(self, batch: dict[str, Tensor]) -> Tensor:
-        """
-        Args:
-            batch:
-                "observation.state":  (B, n_obs, state_dim)
-                "observation.images": (B, n_obs, num_cameras, C, H, W)  — 可选
-                "action":             (B, T, action_dim)
-        Returns:
-            pred_value: (B, T, 1)
-        """
-        global_cond = self._prepare_global_conditioning(batch)
-        
-        action = batch["action"]
-        timestep = torch.zeros(action.shape[0], device=action.device).long()
-        
-        pred_value = self.unet(action, timestep, global_cond=global_cond)
-        return pred_value
-    
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """
-        batch 须包含:
-            "action":              (B, T, action_dim)
-            "observation.state":   (B, n_obs, state_dim)
-            "observation.images":  (B, n_obs, num_cameras, C, H, W)  — 可选
-            "bellman_value":       (B, T)
-            "action_is_pad":       (B, T)      — 可选
-        """
-        pred_value = self.forward(batch)
-        target_value = batch["bellman_value"]
-        
-        if self.config.value_loss_type == "mse":
-            loss = F.mse_loss(pred_value.squeeze(-1), target_value, reduction="none")
-        elif self.config.value_loss_type == "huber":
-            loss = F.huber_loss(pred_value.squeeze(-1), target_value, reduction="none")
-        
-        if "action_is_pad" in batch:
-            loss = loss * (~batch["action_is_pad"]).float()
-        
-        return loss.mean()
-```
+**`forward(batch)`**:
+- 调用 `_prepare_global_conditioning` 获取 global_cond
+- **固定 timestep=0**（方案 A）：critic 不做 denoising，所有输入视为 clean action
+- 调用 `self.unet(action, timestep=0, global_cond=global_cond)` 返回 `(B, T, 1)`
 
-**使用方式**:
-```python
-# 直接从 action model 的 config 复制 input_features + vision 参数
-config = CriticConfig(
-    input_features=action_config.input_features,  # 含 STATE + VISUAL entries
-    action_dim=action_config.action_feature.shape[0],
-    # vision backbone 参数需与 action model 一致（确保结构匹配以加载权重）
-    vision_backbone=action_config.vision_backbone,     # "resnet18"
-    crop_shape=action_config.crop_shape,               # (128, 128)
-    use_group_norm=action_config.use_group_norm,       # True
-    spatial_softmax_num_keypoints=action_config.spatial_softmax_num_keypoints,  # 32
-    use_separate_rgb_encoder_per_camera=action_config.use_separate_rgb_encoder_per_camera,
-    # 从 action model 加载 visual encoder 权重作为初始化
-    action_model_checkpoint="path/to/action_model/pretrained_model/",
-)
-critic = CriticModel(config)  # 自动加载权重，全参数端到端训练
-optimizer = torch.optim.Adam(critic.parameters(), lr=config.optimizer_lr)
-```
+**`compute_loss(batch)`**:
+- 调用 `self.forward(batch)` 获取 `pred_value (B, T, 1)`
+- 与 `batch["bellman_value"] (B, T)` 计算 per-step loss（支持 MSE / Huber）
+- 可选用 `batch["action_is_pad"]` mask 排除 padded 区域
+- 返回 `loss.mean()`
 
-### 3.3 UNet 内部 `compute_loss` 的处理
+#### 3.2.2 删除 UNet 内部的 `compute_loss`
 
-将 `DiffusionConditionalUnet1d.compute_loss` 直接删除，所有 loss 计算移到 `CriticModel` 层。
+原来 `DiffusionConditionalUnet1d` 中有一个占位的 `compute_loss` 方法（简单 MSE），已被删除。所有 loss 计算移到 `CriticModel` 层。
 
-### 3.4 Timestep 设计决策
+#### 3.2.3 Import 路径修复
 
-Critic 不做 denoising，但 UNet 结构中有 `diffusion_step_encoder`，需要决策如何处理 timestep 输入：
+- `critic_model.py` 中 `from src.rev2fwd_il.models.critic_config import CriticConfig` → `from rev2fwd_il.models.critic_config import CriticConfig`（匹配 editable install 的包名）
+- `critic_debug.py` 中同步修复
+
+### 3.3 Timestep 设计决策
+
+采用**方案 A：固定 timestep=0**。
+
+Critic 不做 denoising，但 UNet 结构中保留了 `diffusion_step_encoder`。`forward` 中每次都传入 `timestep = torch.zeros(B, dtype=torch.long)`，sinusoidal embedding 输出固定不变，等效于一个可学习的 bias。
 
 | 方案 | 描述 | 优缺点 |
 |------|------|---------|
-| A. 固定 timestep=0 | 所有输入都视为 clean action | 简单，但浪费了 timestep embedding 的表达能力 |
+| **A. 固定 timestep=0** ✅ 已采用 | 所有输入都视为 clean action | 简单，但浪费了 timestep embedding 的表达能力 |
 | B. 移除 timestep | 将 diffusion_step_encoder 替换为固定 embedding | 架构最干净，但需额外改动 |
 
-**建议**：Phase 3 先用方案 A（最简），后续根据实验效果决定是否改为 B。
+后续根据实验效果决定是否改为方案 B。
 
-### 3.5 验收标准
+### 3.4 已通过的测试（`debug/critic_debug.py`）
 
-- [ ] `CriticModel` 可独立实例化（含双相机 visual encoder），`forward` 和 `compute_loss` 维度正确
-- [ ] `CriticModel.compute_loss` 梯度回传正常（backward 无报错），rgb_encoder 和 UNet 参数均有梯度
-- [ ] 权重加载：从真实 action model checkpoint 加载 `rgb_encoder`，`load_state_dict` 无 missing key
-- [ ] 加载后所有参数 `requires_grad == True`（包括 rgb_encoder），优化器更新全部参数
-- [ ] 在小批量数据上 overfit 测试（含图像输入）：loss 可收敛
-- [ ] `debug/critic_debug.py` 更新为测试 `CriticModel`（含双相机图像输入 + 权重加载验证）
+| Test | 描述 | 状态 |
+|------|------|------|
+| Test 1 | UNet 无图像模式输出 shape `(4, 16, 1)` | ✅ |
+| Test 2 | `CriticModel` + 双相机 (96×96) 输入→输出 `(4, 16, 1)` | ✅ |
+| Test 3 | `compute_loss` + `backward()` 无报错，loss=0.9223 | ✅ |
+| Test 4 | 所有 266,680,609 参数 `requires_grad=True` | ✅ |
+| Test 5 | 梯度流通：`rgb_encoder` 和 `unet` 均有非零 grad | ✅ |
+
+测试配置：
+```python
+config_full = CriticConfig(
+    input_features={
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+        "observation.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96)),
+        "observation.wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96)),
+    },
+    action_dim=7, horizon=16, n_obs_steps=2, crop_shape=(84, 84),
+    action_model_checkpoint=None,  # 随机初始化
+)
+```
+
+### 3.5 尚未完成的测试
+
+| 测试项 | 描述 | 为什么还不能做 |
+|--------|------|---------------|
+| 真实权重加载 | 从实际训练好的 action model checkpoint 加载 `rgb_encoder`，验证 `load_state_dict` 无 missing key | 需要一个可用的 action model checkpoint 路径，且 CriticConfig 的 vision 参数需与 action model 的 DiffusionConfig 一致 |
+| 小批量 overfit | 在小批量数据上反复训练，验证 loss 可收敛到接近 0 | 需要 Phase 2 的 `bellman_value` 标注数据，或手动构造合理的 target value |
+| action_is_pad mask | 验证 padded 区域的 loss 确实被 mask 掉（pad 区域改变 target 不影响 loss） | 简单测试，可随时补充 |
+| Huber loss 路径 | `value_loss_type="huber"` 下 `compute_loss` 正常工作 | 简单测试，可随时补充 |
+
+### 3.6 验收标准
+
+- [x] `CriticModel` 可独立实例化（含双相机 visual encoder），`forward` 和 `compute_loss` 维度正确
+- [x] `CriticModel.compute_loss` 梯度回传正常（backward 无报错），rgb_encoder 和 UNet 参数均有梯度
+- [ ] **权重加载**：从真实 action model checkpoint 加载 `rgb_encoder`，`load_state_dict` 无 missing key
+- [x] 加载后所有参数 `requires_grad == True`（包括 rgb_encoder），优化器更新全部参数
+- [ ] **在小批量数据上 overfit 测试**（含图像输入）：loss 可收敛
+- [x] `debug/critic_debug.py` 更新为测试 `CriticModel`（含双相机图像输入 + 梯度流验证）
 
 ---
 
