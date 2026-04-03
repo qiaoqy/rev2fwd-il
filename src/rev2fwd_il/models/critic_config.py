@@ -24,9 +24,9 @@ class CriticConfig:
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
 
-    # === Vision encoder weight strategy ===
-    freeze_vision_encoder: bool = True
-    action_model_checkpoint: str | None = None
+    # === Vision encoder weight initialization ===
+    action_model_checkpoint: str | None = None  # Load rgb_encoder weights from action model as initialization;
+                                                 # not frozen, trained end-to-end with UNet
 
     # === UNet structure params (aligned with DiffusionConfig) ===
     down_dims: tuple[int, ...] = (512, 1024, 2048)
@@ -73,10 +73,3 @@ class CriticConfig:
             )
         if self.value_loss_type not in ("mse", "huber"):
             raise ValueError(f"value_loss_type must be 'mse' or 'huber', got '{self.value_loss_type}'")
-        if self.freeze_vision_encoder and self.action_model_checkpoint is None and self.image_features:
-            import warnings
-
-            warnings.warn(
-                "freeze_vision_encoder=True but action_model_checkpoint is None. "
-                "Vision encoder will be randomly initialized and frozen (likely not useful)."
-            )

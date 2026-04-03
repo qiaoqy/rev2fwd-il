@@ -38,7 +38,7 @@ from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from src.rev2fwd_il.models.critic_config import CriticConfig
+from rev2fwd_il.models.critic_config import CriticConfig
 from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -714,11 +714,161 @@ class DiffusionConditionalUnet1d(nn.Module):
         x = einops.rearrange(x, "b d t -> b t d")
         return x
 
-    # TODO: compute value loss
-    def compute_loss(self, x: Tensor, timestep: Tensor | int, global_cond=None, target=None) -> Tensor:
-        pred = self.forward(x, timestep, global_cond)
-        loss = F.mse_loss(pred, target)
-        return loss
+class CriticModel(nn.Module):
+    """Outer wrapper for critic: visual encoding + obs encoding + value loss.
+
+    Mirrors lerobot's DiffusionModel wrapping of DiffusionConditionalUnet1d.
+    Supports loading visual encoder weights from an action model checkpoint
+    (not frozen, trained end-to-end with UNet).
+    """
+
+    def __init__(self, config: CriticConfig):
+        super().__init__()
+        self.config = config
+
+        # Build observation encoders (from input_features).
+        global_cond_dim = config.robot_state_feature.shape[0]
+
+        if config.image_features:
+            num_images = len(config.image_features)
+            if config.use_separate_rgb_encoder_per_camera:
+                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+                self.rgb_encoder = nn.ModuleList(encoders)
+                self.visual_feature_dim = encoders[0].feature_dim * num_images
+            else:
+                self.rgb_encoder = DiffusionRgbEncoder(config)
+                self.visual_feature_dim = self.rgb_encoder.feature_dim * num_images
+            global_cond_dim += self.visual_feature_dim
+        else:
+            self.rgb_encoder = None
+            self.visual_feature_dim = 0
+
+        # Load visual encoder weights from action model checkpoint (as initialization).
+        if config.action_model_checkpoint is not None and self.rgb_encoder is not None:
+            self._load_vision_weights_from_action_model(config.action_model_checkpoint)
+
+        # UNet (value head).
+        self.unet = DiffusionConditionalUnet1d(
+            config,
+            global_cond_dim=global_cond_dim * config.n_obs_steps,
+        )
+
+    def _load_vision_weights_from_action_model(self, checkpoint_path: str):
+        """Load rgb_encoder weights from action model checkpoint as initialization.
+
+        After loading, weights are NOT frozen — rgb_encoder trains end-to-end with UNet.
+
+        Action model state_dict key pattern:
+            diffusion.rgb_encoder.{...} -> rgb_encoder.{...}
+        """
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+        # Handle possible wrapper keys (e.g. "model." prefix).
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
+
+        # Extract rgb_encoder keys.
+        prefix = "diffusion.rgb_encoder."
+        vision_sd = {}
+        for k, v in state_dict.items():
+            if k.startswith(prefix):
+                vision_sd[k[len(prefix):]] = v
+
+        if len(vision_sd) == 0:
+            raise ValueError(
+                f"No rgb_encoder weights found in checkpoint: {checkpoint_path}. "
+                f"Available keys (first 10): {list(state_dict.keys())[:10]}"
+            )
+
+        missing, unexpected = self.rgb_encoder.load_state_dict(vision_sd, strict=False)
+        print(f"[CriticModel] Loaded vision encoder from action model: {checkpoint_path}")
+        print(f"  matched keys: {len(vision_sd) - len(unexpected)}")
+        print(f"  (not frozen — will be trained end-to-end with UNet)")
+        if missing:
+            print(f"  missing keys: {missing[:5]}...")
+        if unexpected:
+            print(f"  unexpected keys: {unexpected[:5]}...")
+
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode image features + proprio, concatenate as global conditioning.
+
+        Mirrors DiffusionModel._prepare_global_conditioning.
+        """
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        global_cond_feats = [batch["observation.state"]]  # (B, n_obs, state_dim)
+
+        if self.rgb_encoder is not None and "observation.images" in batch:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                images_per_camera = einops.rearrange(
+                    batch["observation.images"], "b s n ... -> n (b s) ..."
+                )
+                img_features_list = torch.cat(
+                    [
+                        encoder(images)
+                        for encoder, images in zip(
+                            self.rgb_encoder, images_per_camera, strict=True
+                        )
+                    ]
+                )
+                img_features = einops.rearrange(
+                    img_features_list, "(n b s) ... -> b s (n ...)",
+                    b=batch_size, s=n_obs_steps
+                )
+            else:
+                img_features = self.rgb_encoder(
+                    einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
+                )
+                img_features = einops.rearrange(
+                    img_features, "(b s n) ... -> b s (n ...)",
+                    b=batch_size, s=n_obs_steps
+                )
+            global_cond_feats.append(img_features)
+
+        # (B, n_obs, state_dim + visual_feat_dim) -> (B, n_obs * total_dim)
+        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def forward(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        Args:
+            batch:
+                "observation.state":  (B, n_obs, state_dim)
+                "observation.images": (B, n_obs, num_cameras, C, H, W)  — optional
+                "action":             (B, T, action_dim)
+        Returns:
+            pred_value: (B, T, 1)
+        """
+        global_cond = self._prepare_global_conditioning(batch)
+
+        action = batch["action"]
+        # Fixed timestep=0: critic does not do denoising (Option A).
+        timestep = torch.zeros(action.shape[0], device=action.device, dtype=torch.long)
+
+        pred_value = self.unet(action, timestep, global_cond=global_cond)
+        return pred_value
+
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        batch must contain:
+            "action":              (B, T, action_dim)
+            "observation.state":   (B, n_obs, state_dim)
+            "observation.images":  (B, n_obs, num_cameras, C, H, W)  — optional
+            "bellman_value":       (B, T)
+            "action_is_pad":       (B, T)  — optional
+        """
+        pred_value = self.forward(batch)  # (B, T, 1)
+        target_value = batch["bellman_value"]  # (B, T)
+
+        if self.config.value_loss_type == "mse":
+            loss = F.mse_loss(pred_value.squeeze(-1), target_value, reduction="none")
+        elif self.config.value_loss_type == "huber":
+            loss = F.huber_loss(pred_value.squeeze(-1), target_value, reduction="none")
+        else:
+            raise ValueError(f"Unsupported value_loss_type: {self.config.value_loss_type}")
+
+        if "action_is_pad" in batch:
+            loss = loss * (~batch["action_is_pad"]).float()
+
+        return loss.mean()
 
 
 class DiffusionConditionalResidualBlock1d(nn.Module):
