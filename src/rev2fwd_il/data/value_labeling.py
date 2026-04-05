@@ -11,12 +11,16 @@ def compute_bellman_returns(
     """Compute discounted Bellman returns for each episode.
 
     Reward definition (sparse):
-      - Successful episode: r(success_step) = success_reward, r(t != success_step) = 0
+      - Successful episode: virtual reward at step T (episode end), r = success_reward
       - Failed episode: r(t) = 0 for all t
 
-    Value assignment for successful episodes (with success_step S):
-      - t >= S: V(t) = success_reward  (already succeeded, full value)
-      - t <  S: V(t) = gamma^(S - t) * success_reward  (discounted from success point)
+    Value assignment for successful episodes (T = total episode length):
+      - V(t) = gamma^(T - t) * success_reward  (discounted from episode end)
+      - V(T-1) = gamma * success_reward  (last frame, one step from virtual terminal)
+      - V(0) = gamma^T * success_reward  (first frame)
+
+    This treats the entire episode as necessary for success — the success point
+    is the episode boundary rather than an intermediate success_step.
 
     Failed episodes: V(t) = 0 for all t.
 
@@ -24,9 +28,8 @@ def compute_bellman_returns(
         episodes: List of episode dicts. Each dict must contain:
             - "action": np.ndarray of shape (T, action_dim), used to determine episode length
             - "success": bool
-            - "success_step": int (required if success=True), the timestep where success is first achieved
         gamma: Discount factor.
-        success_reward: Reward value at the success timestep.
+        success_reward: Reward value at the virtual terminal state.
 
     Returns:
         List of np.ndarray, each of shape (T,), aligned with the corresponding episode's action length.
@@ -40,16 +43,10 @@ def compute_bellman_returns(
             bellman_values.append(np.zeros(T, dtype=np.float32))
             continue
 
-        success_step = ep.get("success_step", T - 1)
-        # Clamp to valid range
-        success_step = min(success_step, T - 1)
-
-        values = np.zeros(T, dtype=np.float32)
-        # Steps at and after success_step get full reward (already succeeded)
-        values[success_step:] = success_reward
-        # Steps before success_step get discounted value
-        for t in range(success_step - 1, -1, -1):
-            values[t] = gamma * values[t + 1]
+        # Discount from virtual terminal at step T
+        # V(t) = gamma^(T - t) * success_reward
+        exponents = np.arange(T, 0, -1, dtype=np.float32)  # [T, T-1, ..., 1]
+        values = (gamma ** exponents) * success_reward
 
         bellman_values.append(values)
 

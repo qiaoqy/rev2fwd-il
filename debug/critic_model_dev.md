@@ -338,11 +338,18 @@ Episode 0 keys + shapes:
 | `images` (T, H, W, 3) | observation.image（table camera） |
 | `wrist_images` (T, H, W, 3) | observation.wrist_image（wrist camera） |
 | `success` (bool) | 计算 Bellman return 的 reward 信号 |
-| `success_step` (int) | 精确定位成功时刻，用于稀疏 reward 赋值 |
 
 ### 2.2 实现 Bellman Return 计算
 
 **文件**: `src/rev2fwd_il/data/value_labeling.py`（新建）
+
+**Value 标注策略**：将成功 episode 的总步数 T 设为虚拟 success point，所有帧从 episode 末端折扣计算 value。不使用 `success_step` 字段。
+
+设计理由：
+- 原方案使用 `success_step`（首次检测到成功的时间步），导致 success_step 之后的帧 value 全为 1.0，这些帧对 critic 的训练信号较弱
+- 新方案将整条 episode 视为"通向成功的完整轨迹"，从 episode 末端虚拟终止点折扣，所有帧的 value 严格 < 1.0 且单调递增
+- V(T-1) = γ × success_reward（最后一帧，距终止一步）
+- V(0) = γ^T × success_reward（第一帧，距终止最远）
 
 ```python
 import numpy as np
@@ -355,19 +362,20 @@ def compute_bellman_returns(
     """为每个 episode 计算 discounted Bellman return。
     
     Reward 定义（稀疏）:
-      - 成功 episode: r(success_step) = success_reward, r(t != success_step) = 0
+      - 成功 episode: 虚拟 reward 位于 step T（episode 末端），r = success_reward
       - 失败 episode: r(t) = 0 for all t
     
-    Value 赋值（成功 episode，success_step=S）:
-      - t >= S: V(t) = success_reward（已成功，full value）
-      - t <  S: V(t) = γ^(S-t) * success_reward（从成功点向前折扣）
+    Value 赋值（成功 episode，T = 总步数）:
+      - V(t) = γ^(T-t) * success_reward（从 episode 末端折扣）
+      - V(T-1) = γ * success_reward（最后一帧）
+      - V(0) = γ^T * success_reward（第一帧）
     
     失败 episode: V(t) = 0 for all t
     
     Args:
         episodes: list of episode dicts，每个 dict 须含 "action" (T, action_dim) 和 "success" (bool)
         gamma: discount factor
-        success_reward: 成功时终止步的 reward 值
+        success_reward: 虚拟终止状态的 reward 值
     
     Returns:
         list of np.ndarray，每个 shape (T,)，与对应 episode 的 action 长度相同
@@ -381,15 +389,10 @@ def compute_bellman_returns(
             bellman_values.append(np.zeros(T, dtype=np.float32))
             continue
         
-        success_step = ep.get("success_step", T - 1)
-        success_step = min(success_step, T - 1)
-        
-        values = np.zeros(T, dtype=np.float32)
-        # 成功后所有帧 value=1
-        values[success_step:] = success_reward
-        # 成功前从 success_step 向前折扣
-        for t in range(success_step - 1, -1, -1):
-            values[t] = gamma * values[t + 1]
+        # 从 episode 末端虚拟终止点折扣
+        # V(t) = γ^(T-t) * success_reward
+        exponents = np.arange(T, 0, -1, dtype=np.float32)  # [T, T-1, ..., 1]
+        values = (gamma ** exponents) * success_reward
         
         bellman_values.append(values)
     
@@ -437,8 +440,8 @@ lerobot 的 `load_previous_and_future_frames` 会对 episode 边界做 copy-padd
 
 ### 2.5 验收标准
 
-- [x] `compute_bellman_returns()` 单元测试：成功 episode value 单调递增（从 0 到 1），成功后 value=1，失败 episode 全零
-- [x] 示例：T=100, γ=0.995, success_step=80 → `V(0)=0.995^80≈0.670`, `V(80..99)=1.0`
+- [x] `compute_bellman_returns()` 单元测试：成功 episode value 单调递增（从 ~0 到 <1.0），无任何帧 value=1.0，失败 episode 全零
+- [x] 示例：T=100, γ=0.995 → `V(0)=0.995^100≈0.606`, `V(99)=0.995^1≈0.995`（所有帧 value < 1.0）
 - [x] NPZ → LeRobot 转换后，dataset 中每个 frame 包含 `bellman_value` 字段
 - [x] 数据可视化：抽几个 episode 画 value 曲线，确认形状合理
 
@@ -722,14 +725,14 @@ action (B, T, 8) ──→ UNet1d(x=action, cond=global_cond, timestep=0) ──
 
 | 字段 | Shape | 含义 |
 |------|-------|------|
-| `bellman_value` | `(B, T)` | Ground-truth discounted return：成功 episode 中 $t \geq S$ 时为 1.0，$t < S$ 时为 $\gamma^{(S - t)}$；失败 episode 为 0 |
+| `bellman_value` | `(B, T)` | Ground-truth discounted return：成功 episode 中 $V(t) = \gamma^{(T - t)}$（T 为 episode 总步数，所有帧 value < 1.0）；失败 episode 为 0 |
 | `action_is_pad` | `(B, T)` | Padding mask，padded 位置的 loss 被置零 |
 
 #### 语义
 
 给定当前观测 $o_t$ 和未来 action 序列 $a_{t:t+T}$，critic 预测"执行这些 action 后最终成功的折扣概率"：
-- $V = 1$: 已经成功（t >= success_step），或 (obs, action) 组合大概率成功
-- $V \in (0, 1)$: 接近但尚未成功，value 随距离 success_step 的远近而折扣
+- $V \approx \gamma$: 最后一帧，距虚拟成功终止点一步
+- $V \in (0, 1)$: 所有帧的 value 严格 < 1.0，从 episode 末端向前单调递减
 - $V = 0$: 失败 episode
 
 ### 5.1 DDP (DistributedDataParallel) 说明
