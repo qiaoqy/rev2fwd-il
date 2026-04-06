@@ -300,9 +300,10 @@ def save_frame_data_as_json(episode_data: dict, frame_idx: int, output_path: Pat
     frame_data = {
         "frame_idx": frame_idx,
         "ee_pose": episode_data["ee_pose"][frame_idx].tolist(),
-        "obj_pose": episode_data["obj_pose"][frame_idx].tolist(),
         "success": bool(episode_data["success"]),
     }
+    if "obj_pose" in episode_data:
+        frame_data["obj_pose"] = episode_data["obj_pose"][frame_idx].tolist()
     if "obs" in episode_data:
         frame_data["obs"] = episode_data["obs"][frame_idx].tolist()
     if "gripper" in episode_data:

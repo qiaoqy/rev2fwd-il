@@ -65,8 +65,6 @@ def load_critic_model(checkpoint_path: str, device: str) -> CriticModel:
             "observation.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
             "observation.wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
         },
-        action_dim=8,
-        horizon=16,
         n_obs_steps=2,
         crop_shape=(128, 128),
         value_loss_type="mse",
@@ -75,8 +73,7 @@ def load_critic_model(checkpoint_path: str, device: str) -> CriticModel:
         use_group_norm=True,
         spatial_softmax_num_keypoints=32,
         use_separate_rgb_encoder_per_camera=False,
-        use_film_scale_modulation=True,
-        down_dims=(512, 1024, 2048),
+        mlp_hidden_dims=(512, 512, 256, 256),
     )
 
     model = CriticModel(config)
@@ -104,20 +101,21 @@ def predict_episode_values(
 ) -> np.ndarray:
     """Run critic model on every frame of an episode, return predicted V(t).
 
-    For each timestep t, constructs a sliding window of (obs, action[t:t+horizon])
-    and takes the predicted value at the first position of the horizon window.
+    For each timestep t, constructs observation (state + images) and
+    predicts a scalar value V(s_t).
+
+    Args:
+        horizon: Unused, kept for backward compatibility with caller signatures.
 
     Returns:
         pred_values: (T,) array of predicted values, one per frame.
     """
     T = len(ep["action"])
-    action_dim = ep["action"].shape[1]
     pred_values = np.zeros(T, dtype=np.float32)
 
     # Pre-build all samples
     all_obs_states = []
     all_obs_images = []
-    all_actions = []
 
     for start in range(T):
         # Observation
@@ -133,17 +131,9 @@ def predict_episode_values(
         all_obs_states.append(np.stack(obs_states, axis=0))
         all_obs_images.append(np.stack(obs_imgs, axis=0))
 
-        # Action window
-        action = np.zeros((horizon, action_dim), dtype=np.float32)
-        for h in range(horizon):
-            t = start + h
-            action[h] = ep["action"][min(t, T - 1)]
-        all_actions.append(action)
-
     # Batched inference
     all_obs_states = np.stack(all_obs_states)   # (T, n_obs, 15)
     all_obs_images = np.stack(all_obs_images)   # (T, n_obs, 2, 3, H, W)
-    all_actions = np.stack(all_actions)          # (T, horizon, action_dim)
 
     with torch.no_grad():
         for i in range(0, T, batch_size):
@@ -151,18 +141,16 @@ def predict_episode_values(
             batch = {
                 "observation.state": torch.from_numpy(all_obs_states[i:j]).to(device),
                 "observation.images": torch.from_numpy(all_obs_images[i:j]).to(device),
-                "action": torch.from_numpy(all_actions[i:j]).to(device),
             }
-            out = model(batch)  # (B, horizon, 1)
-            # Take first position of the horizon window as the value at timestep t
-            pred_values[i:j] = out[:, 0, 0].cpu().numpy()
+            out = model(batch)  # (B, 1)
+            pred_values[i:j] = out[:, 0].cpu().numpy()
 
     return pred_values
 
 
 def plot_pred_vs_gt(ep: dict, pred_values: np.ndarray, ep_idx: int, out_path: str):
     """Plot predicted vs ground-truth Bellman value curves."""
-    bv = ep["bellman_value"]
+    bv = ep["mc_value"]
     T = len(bv)
     success = ep.get("success", False)
     success_step = ep.get("success_step", None)
@@ -183,7 +171,7 @@ def plot_pred_vs_gt(ep: dict, pred_values: np.ndarray, ep_idx: int, out_path: st
     ax.set_xlabel("Timestep")
     ax.set_title("Predicted vs Ground-Truth Value")
     ax.set_xlim(0, T)
-    ax.set_ylim(-0.1, 1.15)
+    ax.set_ylim(-1.1, 0.1)
     ax.grid(True, alpha=0.3)
     if success and success_step is not None:
         ss = min(success_step, T - 1)
@@ -226,7 +214,7 @@ def plot_pred_vs_gt(ep: dict, pred_values: np.ndarray, ep_idx: int, out_path: st
 
 def plot_overview_with_frames(ep: dict, pred_values: np.ndarray, ep_idx: int, out_path: str):
     """Overview image: value curves + sampled camera frames with pred/GT annotations."""
-    bv = ep["bellman_value"]
+    bv = ep["mc_value"]
     T = len(bv)
     success = ep.get("success", False)
     success_step = ep.get("success_step", None)
@@ -244,7 +232,7 @@ def plot_overview_with_frames(ep: dict, pred_values: np.ndarray, ep_idx: int, ou
     ax_curve.set_ylabel("Value V(t)")
     ax_curve.set_xlabel("Timestep")
     ax_curve.set_xlim(0, T)
-    ax_curve.set_ylim(-0.1, 1.15)
+    ax_curve.set_ylim(-1.1, 0.1)
     ax_curve.grid(True, alpha=0.3)
 
     if success and success_step is not None:
@@ -287,7 +275,7 @@ def create_episode_video(ep: dict, pred_values: np.ndarray, out_path: str,
 
     images = ep["images"]
     wrist = ep.get("wrist_images", None)
-    bv = ep.get("bellman_value", None)
+    bv = ep.get("mc_value", None)
     success_step = ep.get("success_step", None)
     T_full = len(images)
     T = min(T_full, max_frames)
@@ -346,7 +334,7 @@ def _render_pred_vs_gt_frame(
     ax.plot(t, bv[t], "bo", markersize=4)
     ax.plot(t, pred[t], "ro", markersize=4)
 
-    ax.text(t, max(bv[t], pred[t]) + 0.08,
+    ax.text(t, max(bv[t], pred[t]) + 0.03,
             f"GT={bv[t]:.3f} Pred={pred[t]:.3f}",
             fontsize=7, ha="center", color="black", clip_on=True)
 
@@ -354,7 +342,7 @@ def _render_pred_vs_gt_frame(
         ax.axvline(x=success_step, color="green", linestyle="--", alpha=0.5, linewidth=1)
 
     ax.set_xlim(0, T)
-    ax.set_ylim(-0.05, 1.15)
+    ax.set_ylim(-1.1, 0.1)
     ax.set_xlabel("Timestep", fontsize=7)
     ax.set_ylabel("V(t)", fontsize=7)
     ax.set_title(f"Pred vs GT  t={t}/{T}", fontsize=8)
@@ -469,7 +457,7 @@ def main():
             batch_size=args.batch_size,
         )
 
-        bv = ep["bellman_value"]
+        bv = ep["mc_value"]
         mae = np.abs(pred_values - bv).mean()
         mse = np.square(pred_values - bv).mean()
         print(f"    MAE={mae:.6f}, MSE={mse:.6f}")

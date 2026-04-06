@@ -51,3 +51,52 @@ def compute_bellman_returns(
         bellman_values.append(values)
 
     return bellman_values
+
+
+def compute_mc_returns(
+    episodes: list[dict],
+    max_episode_length: int = 3000,
+) -> list[np.ndarray]:
+    """Monte Carlo return with per-step penalty and success terminal reward.
+
+    Reward definition:
+        r(t) = -1  for all t in {0, ..., T-1}
+        R_success = max_episode_length  (added at final step of success episodes)
+
+    Value definition (undiscounted, gamma=1):
+        Success episode:  V(t) = R_success - (T - t)
+        Failure episode:  V(t) = -(T - t)
+
+    Normalized to [-1, 0):
+        V_bar(t) = (V(t) - R_success) / (2 * R_success)
+
+    Properties:
+        - Success episodes: V_bar(t) in (-0.5, 0)
+          V_bar(T-1) = -1/(2R) ≈ 0,  V_bar(0) when T=R: -0.5
+        - Failure episodes: V_bar(t) in (-1, -0.5)
+          V_bar(T-1) = -0.5 - 1/(2R) ≈ -0.5,  V_bar(0) when T=R: -1
+        - -0.5 is the natural success/failure boundary
+        - Shorter success episodes have higher (less negative) V_bar(0)
+
+    Args:
+        episodes: List of episode dicts with "action" (T, D) and "success" (bool).
+        max_episode_length: R_success = normalization constant. Should be >= longest
+            episode length to ensure success V(0) >= -0.5.
+
+    Returns:
+        List of np.ndarray, each (T,) float32.
+    """
+    mc_values = []
+    R = max_episode_length
+    for ep in episodes:
+        T = len(ep["action"])
+        success = ep.get("success", False)
+        remaining = np.arange(T, 0, -1, dtype=np.float32)  # [T, T-1, ..., 1]
+        if success:
+            # V_mc = R - remaining; V_bar = (V_mc - R) / (2R) = -remaining / (2R)
+            values = -remaining / (2 * R)
+        else:
+            # V_mc = -remaining; V_bar = (-remaining - R) / (2R) = -0.5 - remaining / (2R)
+            values = -0.5 - remaining / (2 * R)
+        mc_values.append(values)
+    return mc_values

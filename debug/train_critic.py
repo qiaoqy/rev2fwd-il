@@ -42,25 +42,21 @@ from rev2fwd_il.models.critic_model import CriticModel
 # ============================================================
 
 class CriticEpisodeDataset(Dataset):
-    """Sliding-window dataset over NPZ episodes for critic training.
+    """Per-frame dataset over NPZ episodes for critic training.
 
-    Each sample is a window of (obs_state, obs_images, action, bellman_value)
-    from a single episode.
-
-    Observations use n_obs_steps frames ending at the window start.
-    Actions and bellman_value span [start, start + horizon).
+    Each sample is a single frame's (obs_state, obs_images, mc_value).
+    Observations use n_obs_steps frames ending at the sample frame.
+    No action window is needed (V(s) critic, not Q(s,a)).
     """
 
     def __init__(
         self,
         npz_path: str,
-        horizon: int = 16,
         n_obs_steps: int = 2,
         include_obj_pose: bool = True,
         include_gripper: bool = True,
         max_episodes: int = -1,
     ):
-        self.horizon = horizon
         self.n_obs_steps = n_obs_steps
         self.include_obj_pose = include_obj_pose
         self.include_gripper = include_gripper
@@ -71,12 +67,11 @@ class CriticEpisodeDataset(Dataset):
         if max_episodes > 0:
             episodes = episodes[:max_episodes]
 
-        # Build index: (episode_idx, start_frame)
+        # Build index: (episode_idx, frame)
         self.episodes = episodes
         self.samples = []
         for ep_idx, ep in enumerate(episodes):
             T = len(ep["action"])
-            # Sliding window with stride=1
             for t in range(T):
                 self.samples.append((ep_idx, t))
 
@@ -99,15 +94,15 @@ class CriticEpisodeDataset(Dataset):
         return t_clamped
 
     def __getitem__(self, idx):
-        ep_idx, start = self.samples[idx]
+        ep_idx, t = self.samples[idx]
         ep = self.episodes[ep_idx]
         T = len(ep["action"])
 
-        # ---- Observation: n_obs_steps frames ending at `start` ----
+        # ---- Observation: n_obs_steps frames ending at `t` ----
         obs_states = []
         obs_images_list = []
         for i in range(self.n_obs_steps):
-            obs_t = self._get_frame_with_padding(ep, start - self.n_obs_steps + 1 + i)
+            obs_t = self._get_frame_with_padding(ep, t - self.n_obs_steps + 1 + i)
             obs_states.append(self._build_state(ep, obs_t))
 
             # Stack table + wrist camera images: (2, 3, H, W)
@@ -121,29 +116,13 @@ class CriticEpisodeDataset(Dataset):
         obs_state = np.stack(obs_states, axis=0)       # (n_obs, state_dim)
         obs_images = np.stack(obs_images_list, axis=0)  # (n_obs, 2, 3, H, W)
 
-        # ---- Action + bellman_value: horizon frames from `start` ----
-        action = np.zeros((self.horizon, ep["action"].shape[1]), dtype=np.float32)
-        bellman_value = np.zeros(self.horizon, dtype=np.float32)
-        action_is_pad = np.ones(self.horizon, dtype=bool)  # True = padded
-
-        for h in range(self.horizon):
-            t = start + h
-            if t < T:
-                action[h] = ep["action"][t]
-                bellman_value[h] = ep["bellman_value"][t]
-                action_is_pad[h] = False
-            else:
-                # Copy-pad from last valid frame
-                action[h] = ep["action"][T - 1]
-                bellman_value[h] = ep["bellman_value"][T - 1]
-                action_is_pad[h] = True
+        # ---- Scalar MC value target ----
+        mc_value = ep["mc_value"][t]
 
         return {
             "observation.state": torch.from_numpy(obs_state),
             "observation.images": torch.from_numpy(obs_images),
-            "action": torch.from_numpy(action),
-            "bellman_value": torch.from_numpy(bellman_value),
-            "action_is_pad": torch.from_numpy(action_is_pad),
+            "mc_value": torch.tensor(mc_value, dtype=torch.float32),
         }
 
 
@@ -159,7 +138,7 @@ def cosine_schedule(step, total_steps, lr_max, lr_min=0.0):
 
 
 def evaluate(model, dataloader, device, max_batches=50, value_loss_type="mse"):
-    """Evaluate model on test set, return mean loss."""
+    """Evaluate model on val set, return mean loss."""
     model.eval()
     total_loss = 0.0
     count = 0
@@ -168,15 +147,13 @@ def evaluate(model, dataloader, device, max_batches=50, value_loss_type="mse"):
             if i >= max_batches:
                 break
             batch = {k: v.to(device) for k, v in batch.items()}
-            pred_value = model(batch)  # (B, T, 1)
-            target_value = batch["bellman_value"]
+            pred_value = model(batch)  # (B, 1)
+            target_value = batch["mc_value"]  # (B,)
             if value_loss_type == "mse":
-                loss = F.mse_loss(pred_value.squeeze(-1), target_value, reduction="none")
+                loss = F.mse_loss(pred_value.squeeze(-1), target_value)
             elif value_loss_type == "huber":
-                loss = F.huber_loss(pred_value.squeeze(-1), target_value, reduction="none")
-            if "action_is_pad" in batch:
-                loss = loss * (~batch["action_is_pad"]).float()
-            total_loss += loss.mean().item()
+                loss = F.huber_loss(pred_value.squeeze(-1), target_value)
+            total_loss += loss.item()
             count += 1
     model.train()
     return total_loss / max(count, 1)
@@ -219,7 +196,6 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
     # Model
-    parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--n_obs_steps", type=int, default=2)
     parser.add_argument("--crop_shape", type=int, nargs=2, default=[128, 128])
     parser.add_argument("--value_loss_type", type=str, default="mse", choices=["mse", "huber"])
@@ -261,39 +237,40 @@ def main():
 
     # ---- Data ----
     train_npz = Path(args.data_dir) / f"critic_{args.task}_train.npz"
-    test_npz = Path(args.data_dir) / f"critic_{args.task}_test.npz"
+    val_npz = Path(args.data_dir) / f"critic_{args.task}_val.npz"
 
     max_ep = args.overfit_episodes if args.overfit else -1
     train_dataset = CriticEpisodeDataset(
-        str(train_npz), horizon=args.horizon, n_obs_steps=args.n_obs_steps,
+        str(train_npz), n_obs_steps=args.n_obs_steps,
         max_episodes=max_ep,
     )
-    test_dataset = CriticEpisodeDataset(
-        str(test_npz), horizon=args.horizon, n_obs_steps=args.n_obs_steps,
+    val_dataset = CriticEpisodeDataset(
+        str(val_npz), n_obs_steps=args.n_obs_steps,
         max_episodes=max_ep if args.overfit else -1,
     )
 
     if is_main_process(rank):
         print(f"Train samples: {len(train_dataset)}")
-        print(f"Test samples:  {len(test_dataset)}")
+        print(f"Val samples:   {len(val_dataset)}")
 
     # Batch size per GPU
     per_gpu_batch = args.batch_size // world_size
 
     if world_size > 1:
         train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=args.seed)
-        test_sampler = DistributedSampler(test_dataset, shuffle=False)
     else:
         train_sampler = None
-        test_sampler = None
+    # Keep validation on the full dataset so the logged val loss is comparable
+    # across runs and does not depend on the rank-0 shard only.
+    val_sampler = None
 
     train_loader = DataLoader(
         train_dataset, batch_size=per_gpu_batch, shuffle=(train_sampler is None),
         sampler=train_sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True,
     )
-    test_loader = DataLoader(
-        test_dataset, batch_size=per_gpu_batch, shuffle=False,
-        sampler=test_sampler, num_workers=args.num_workers, pin_memory=True,
+    val_loader = DataLoader(
+        val_dataset, batch_size=per_gpu_batch, shuffle=False,
+        sampler=val_sampler, num_workers=args.num_workers, pin_memory=True,
     )
 
     # ---- Model ----
@@ -309,8 +286,6 @@ def main():
             "observation.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
             "observation.wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
         },
-        action_dim=8,
-        horizon=args.horizon,
         n_obs_steps=args.n_obs_steps,
         crop_shape=tuple(args.crop_shape),
         value_loss_type=args.value_loss_type,
@@ -322,13 +297,12 @@ def main():
         use_group_norm=True,
         spatial_softmax_num_keypoints=32,
         use_separate_rgb_encoder_per_camera=False,
-        use_film_scale_modulation=True,
-        down_dims=(512, 1024, 2048),
+        mlp_hidden_dims=(512, 512, 256, 256),
     )
 
     if is_main_process(rank):
         print(f"\nCriticConfig:")
-        print(f"  action_dim={config.action_dim}, horizon={config.horizon}")
+        print(f"  mlp_hidden_dims={config.mlp_hidden_dims}")
         print(f"  state_dim={config.robot_state_feature.shape}")
         print(f"  image_features={list(config.image_features.keys())}")
         print(f"  crop_shape={config.crop_shape}")
@@ -360,7 +334,7 @@ def main():
             "args": vars(args),
             "model_params": n_params,
             "train_samples": len(train_dataset),
-            "test_samples": len(test_dataset),
+            "val_samples": len(val_dataset),
         }
         with open(output_dir / "config.json", "w") as f:
             json.dump(config_dict, f, indent=2, default=str)
@@ -402,19 +376,16 @@ def main():
         # Forward + backward
         optimizer.zero_grad()
         # Call model() (not model.module) so DDP hooks fire for gradient sync
-        pred_value = model(batch)  # (B, T, 1)
+        pred_value = model(batch)  # (B, 1)
         # Compute loss outside model for DDP compatibility
         raw_config = (model.module if isinstance(model, DDP) else model).config
-        target_value = batch["bellman_value"]
+        target_value = batch["mc_value"]  # (B,)
         if raw_config.value_loss_type == "mse":
-            loss = F.mse_loss(pred_value.squeeze(-1), target_value, reduction="none")
+            loss = F.mse_loss(pred_value.squeeze(-1), target_value)
         elif raw_config.value_loss_type == "huber":
-            loss = F.huber_loss(pred_value.squeeze(-1), target_value, reduction="none")
+            loss = F.huber_loss(pred_value.squeeze(-1), target_value)
         else:
             raise ValueError(f"Unsupported: {raw_config.value_loss_type}")
-        if "action_is_pad" in batch:
-            loss = loss * (~batch["action_is_pad"]).float()
-        loss = loss.mean()
         loss.backward()
 
         # Gradient clipping
@@ -447,10 +418,10 @@ def main():
         # ---- Evaluation ----
         if is_main_process(rank) and step % args.eval_freq == 0:
             eval_model = model.module if isinstance(model, DDP) else model
-            test_loss = evaluate(eval_model, test_loader, device,
+            val_loss = evaluate(eval_model, val_loader, device,
                                  value_loss_type=args.value_loss_type)
-            print(f"  [eval] step {step} | test_loss {test_loss:.6f}")
-            writer.add_scalar("eval/loss", test_loss, step)
+            print(f"  [val] step {step} | val_loss {val_loss:.6f}")
+            writer.add_scalar("val/loss", val_loss, step)
 
         # ---- Save checkpoint ----
         if is_main_process(rank) and step % args.save_freq == 0:
@@ -480,10 +451,10 @@ def main():
 
         # Final eval
         eval_model = model.module if isinstance(model, DDP) else model
-        test_loss = evaluate(eval_model, test_loader, device,
+        val_loss = evaluate(eval_model, val_loader, device,
                              value_loss_type=args.value_loss_type)
         print(f"\n{'='*60}")
-        print(f"Training complete. Final test loss: {test_loss:.6f}")
+        print(f"Training complete. Final val loss: {val_loss:.6f}")
         print(f"Checkpoints saved to: {output_dir / 'checkpoints'}")
         print(f"{'='*60}")
 

@@ -174,7 +174,9 @@ def _render_filter_frame(
     status_color = "green" if keep_mask[t] else "red"
     ax1.set_title(f"Value  t={t}/{T}  [{status}]", fontsize=8, color=status_color)
     ax1.set_xlim(0, T)
-    ax1.set_ylim(-0.1, 1.15)
+    v_lo, v_hi = pred_values.min(), pred_values.max()
+    v_margin = max(abs(v_hi - v_lo) * 0.1, 0.05)
+    ax1.set_ylim(v_lo - v_margin, v_hi + v_margin)
     ax1.set_ylabel("V(t)", fontsize=7)
     ax1.tick_params(labelsize=5)
     ax1.grid(True, alpha=0.2)
@@ -322,10 +324,11 @@ def plot_filter_overview_2stage(
         ax1.axvline(x=truncate_t, color="purple", linewidth=2, linestyle="--", label=f"Truncate t={truncate_t}")
     ts_full = np.arange(T_orig)
     ax1.plot(ts_full, pred_values_full, "r-", linewidth=1.5, alpha=0.9, label="V(t) full")
-    ax1.axhline(y=0.99, color="purple", linewidth=0.8, linestyle=":", alpha=0.6, label="V=0.99 threshold")
     ax1.set_ylabel("Value V(t)", fontsize=10)
     ax1.set_xlim(0, T_orig)
-    ax1.set_ylim(-0.1, 1.15)
+    vf_lo, vf_hi = pred_values_full.min(), pred_values_full.max()
+    vf_margin = max(abs(vf_hi - vf_lo) * 0.1, 0.05)
+    ax1.set_ylim(vf_lo - vf_margin, vf_hi + vf_margin)
     ax1.grid(True, alpha=0.2)
     ax1.legend(loc="upper left", fontsize=8)
     ax1.set_title(
@@ -341,7 +344,9 @@ def plot_filter_overview_2stage(
     ax2.plot(ts_trunc, pred_values_trunc, "r-", linewidth=1.5, alpha=0.9, label="V(t) truncated")
     ax2.set_ylabel("Value V(t)", fontsize=10)
     ax2.set_xlim(0, T_trunc)
-    ax2.set_ylim(-0.1, max(pred_values_trunc.max() * 1.1, 0.5))
+    vt_lo, vt_hi = pred_values_trunc.min(), pred_values_trunc.max()
+    vt_margin = max(abs(vt_hi - vt_lo) * 0.1, 0.05)
+    ax2.set_ylim(vt_lo - vt_margin, vt_hi + vt_margin)
     ax2.grid(True, alpha=0.2)
     ax2.legend(loc="upper left", fontsize=8)
     ax2.set_title(
@@ -485,10 +490,14 @@ def parse_args():
     parser.add_argument("--no_terminal_bootstrap", dest="terminal_bootstrap", action="store_false")
 
     # Stage 1: Value truncation
-    parser.add_argument("--value_truncate", type=float, default=0.99,
-                        help="Truncate episode at first timestep where V(t) >= this value. 0 = disable.")
+    parser.add_argument("--value_truncate", type=float, default=None,
+                        help="Truncate episode at first timestep where V(t) >= this value. Omit to disable.")
     parser.add_argument("--truncate_margin", type=int, default=30,
                         help="Keep this many extra frames after the truncation point")
+    parser.add_argument("--step_reward", type=float, default=0.0,
+                        help="Per-step reward for GAE TD error: r_bar(t). "
+                             "For MC value normalized to [-1,0): use -1/(2*R_success), e.g. -1/6000. "
+                             "0 = sparse reward (Exp36 default).")
 
     # Stage 2: Advantage filter params
     parser.add_argument("--smooth_window", type=int, default=16,
@@ -525,11 +534,17 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.gamma == 1.0 and args.step_reward != 0.0 and args.terminal_bootstrap:
+        print(
+            "WARNING: gamma=1 with non-zero step_reward is usually paired with "
+            "--no_terminal_bootstrap for MC-return consistency."
+        )
+
     print(f"{'=' * 60}")
     print(f"GAE Advantage Frame-Level Filter for Reversed B Rollout")
     print(f"  Checkpoint: {args.checkpoint}")
-    print(f"  Stage 1: Truncate at V(t) >= {args.value_truncate}" if args.value_truncate > 0 else "  Stage 1: No truncation")
-    print(f"  Stage 2: GAE γ={args.gamma}, λ={args.lam}, bootstrap={args.terminal_bootstrap}")
+    print(f"  Stage 1: Truncate at V(t) >= {args.value_truncate}" if args.value_truncate is not None else "  Stage 1: No truncation")
+    print(f"  Stage 2: GAE γ={args.gamma}, λ={args.lam}, bootstrap={args.terminal_bootstrap}, step_reward={args.step_reward}")
     print(f"  Filter: window={args.smooth_window}, threshold={args.drop_threshold}, "
           f"min_drop={args.min_drop_length}, min_keep={args.min_keep_length}")
     print(f"  Output: {out_dir}")
@@ -572,7 +587,7 @@ def main():
 
         # --- Stage 1: Truncate at value threshold ---
         truncate_t = T_orig
-        if args.value_truncate > 0:
+        if args.value_truncate is not None:
             above_thresh = np.where(pred_values_full >= args.value_truncate)[0]
             if len(above_thresh) > 0:
                 truncate_t = int(above_thresh[0]) + args.truncate_margin
@@ -599,10 +614,13 @@ def main():
         T = len(pred_values)
 
         # --- Stage 2: GAE + advantage filter on truncated data ---
+        # Build per-step reward array: r_bar(t) = step_reward for all t
+        rewards = np.full(T, args.step_reward, dtype=np.float32) if args.step_reward != 0.0 else None
         advantages = compute_gae_from_values(
             pred_values,
             gamma=args.gamma,
             lam=args.lam,
+            rewards=rewards,
             terminal_bootstrap=args.terminal_bootstrap,
         )
 
@@ -680,6 +698,7 @@ def main():
         "value_truncate": args.value_truncate,
         "gamma": args.gamma,
         "lam": args.lam,
+        "step_reward": args.step_reward,
         "terminal_bootstrap": args.terminal_bootstrap,
         "smooth_window": args.smooth_window,
         "drop_threshold": args.drop_threshold,

@@ -221,54 +221,61 @@ class PickPlaceExpertRandWaypoint:
 
         k = len(env_ids)
 
+        # Fixed XY distance coefficients per waypoint level
+        APPROACH_R = 0.10  # 10 cm
+        ABOVE_R = 0.08     # 8 cm
+        CORRECT_R = 0.04   # 4 cm
+        ALIGN_R = 0.02     # 2 cm
+
         # Global hover height
         self.episode_hover_z[env_ids] = torch.empty(k, device=d).uniform_(0.2, 0.3)
 
-        # ==== PICK SIDE (5 levels) ====
-        # ---- Approach obj: ±20 cm, +3~10 cm Z ----
-        self.approach_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        # ==== PICK SIDE (5 levels) — unified direction ====
+        pick_theta = torch.empty(k, device=d).uniform_(0, 2 * math.pi)
+        pick_dir = torch.stack([torch.cos(pick_theta), torch.sin(pick_theta)], dim=-1)  # (k, 2)
+
+        self.approach_obj_dxy[env_ids] = pick_dir * APPROACH_R
         self.approach_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
 
-        # ---- Above obj: ±8 cm, +0~3 cm Z ----
-        self.above_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.above_obj_dxy[env_ids] = pick_dir * ABOVE_R
         self.above_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
 
-        # ---- Correct obj: ±4 cm, +8~12 cm above obj ----
-        self.correct_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
+        self.correct_obj_dxy[env_ids] = pick_dir * CORRECT_R
         self.correct_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.12)
 
-        # ---- Align obj: ±25 mm, +3~6 cm above obj ----
-        self.align_obj_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.025, 0.025)
+        self.align_obj_dxy[env_ids] = pick_dir * ALIGN_R
         self.align_obj_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.06)
 
-        # ==== LIFT SIDE (4 levels, independent, symmetric Z ranges to pick) ====
-        self.lift_align_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.025, 0.025)
+        # ==== LIFT SIDE (4 levels) — unified direction (independent from pick) ====
+        lift_theta = torch.empty(k, device=d).uniform_(0, 2 * math.pi)
+        lift_dir = torch.stack([torch.cos(lift_theta), torch.sin(lift_theta)], dim=-1)
+
+        self.lift_align_dxy[env_ids] = lift_dir * ALIGN_R
         self.lift_align_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.06)
 
-        self.lift_correct_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
+        self.lift_correct_dxy[env_ids] = lift_dir * CORRECT_R
         self.lift_correct_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.12)
 
-        self.lift_above_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.lift_above_dxy[env_ids] = lift_dir * ABOVE_R
         self.lift_above_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
 
-        self.lift_approach_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        self.lift_approach_dxy[env_ids] = lift_dir * APPROACH_R
         self.lift_approach_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
 
-        # ==== PLACE SIDE (5 levels) ====
-        # ---- Approach place: ±20 cm, +3~10 cm Z ----
-        self.approach_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        # ==== PLACE SIDE (5 levels) — unified direction ====
+        place_theta = torch.empty(k, device=d).uniform_(0, 2 * math.pi)
+        place_dir = torch.stack([torch.cos(place_theta), torch.sin(place_theta)], dim=-1)
+
+        self.approach_place_dxy[env_ids] = place_dir * APPROACH_R
         self.approach_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
 
-        # ---- Above place: ±8 cm, +0~3 cm Z ----
-        self.above_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.above_place_dxy[env_ids] = place_dir * ABOVE_R
         self.above_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
 
-        # ---- Correct place: ±4 cm, +8~12 cm above place ----
-        self.correct_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
+        self.correct_place_dxy[env_ids] = place_dir * CORRECT_R
         self.correct_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.12)
 
-        # ---- Align place: ±25 mm, +3~6 cm above place ----
-        self.align_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.025, 0.025)
+        self.align_place_dxy[env_ids] = place_dir * ALIGN_R
         self.align_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.06)
 
         # ==== GRASP / PLACE NOISE: X +[0, 1cm], Y=0, Z [0, 2cm] ====
@@ -277,17 +284,20 @@ class PickPlaceExpertRandWaypoint:
         self.place_dx[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.01)
         self.place_dz[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.02)
 
-        # ==== DEPARTURE (4 levels, independent, symmetric to place descent) ====
-        self.depart_align_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.025, 0.025)
-        self.depart_align_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
+        # ==== DEPARTURE (4 levels) — unified direction (independent from place) ====
+        depart_theta = torch.empty(k, device=d).uniform_(0, 2 * math.pi)
+        depart_dir = torch.stack([torch.cos(depart_theta), torch.sin(depart_theta)], dim=-1)
 
-        self.depart_correct_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.04, 0.04)
-        self.depart_correct_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
+        self.depart_align_dxy[env_ids] = depart_dir * ALIGN_R
+        self.depart_align_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.06)
 
-        self.depart_above_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.08, 0.08)
+        self.depart_correct_dxy[env_ids] = depart_dir * CORRECT_R
+        self.depart_correct_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.12)
+
+        self.depart_above_dxy[env_ids] = depart_dir * ABOVE_R
         self.depart_above_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
 
-        self.depart_approach_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.20, 0.20)
+        self.depart_approach_dxy[env_ids] = depart_dir * APPROACH_R
         self.depart_approach_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.03, 0.10)
 
         # ---- Orientation perturbation (disabled – no rotation randomisation) ----
@@ -401,11 +411,11 @@ class PickPlaceExpertRandWaypoint:
         # ---- departure waypoints (4 levels, ascending from release, independent) ----
         depart_align_pos = torch.zeros(self.num_envs, 3, device=self.device)
         depart_align_pos[:, :2] = self.place_pose[:, :2] + self.depart_align_dxy
-        depart_align_pos[:, 2] = self.episode_hover_z + self.depart_align_extra_z
+        depart_align_pos[:, 2] = self.place_pose[:, 2] + self.depart_align_extra_z
 
         depart_correct_pos = torch.zeros(self.num_envs, 3, device=self.device)
         depart_correct_pos[:, :2] = self.place_pose[:, :2] + self.depart_correct_dxy
-        depart_correct_pos[:, 2] = self.episode_hover_z + self.depart_correct_extra_z
+        depart_correct_pos[:, 2] = self.place_pose[:, 2] + self.depart_correct_extra_z
 
         depart_above_pos = torch.zeros(self.num_envs, 3, device=self.device)
         depart_above_pos[:, :2] = self.place_pose[:, :2] + self.depart_above_dxy
@@ -455,7 +465,15 @@ class PickPlaceExpertRandWaypoint:
                 action[mask, :3] = at_obj_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_OPEN
-                self._transition(mask, ee_pose, at_obj_pos, ExpertState.CLOSE)
+                # Wait before closing gripper to let EE stabilise
+                dist = torch.norm(ee_pose[mask, :3] - at_obj_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.CLOSE
+                self.wait_counter[transition] = 0
 
             elif state_val == ExpertState.CLOSE:
                 action[mask, :3] = at_obj_pos[mask]
@@ -532,7 +550,15 @@ class PickPlaceExpertRandWaypoint:
                 action[mask, :3] = release_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_CLOSE
-                self._transition(mask, ee_pose, release_pos, ExpertState.OPEN)
+                # Wait before opening gripper to let object settle
+                dist = torch.norm(ee_pose[mask, :3] - release_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.OPEN
+                self.wait_counter[transition] = 0
 
             elif state_val == ExpertState.OPEN:
                 action[mask, :3] = release_pos[mask]

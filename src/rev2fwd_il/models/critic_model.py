@@ -714,12 +714,13 @@ class DiffusionConditionalUnet1d(nn.Module):
         x = einops.rearrange(x, "b d t -> b t d")
         return x
 
+
 class CriticModel(nn.Module):
     """Outer wrapper for critic: visual encoding + obs encoding + value loss.
 
-    Mirrors lerobot's DiffusionModel wrapping of DiffusionConditionalUnet1d.
+    Visual encoding + obs encoding + MLP value head → scalar V(s).
     Supports loading visual encoder weights from an action model checkpoint
-    (not frozen, trained end-to-end with UNet).
+    (not frozen, trained end-to-end with MLP value head).
     """
 
     def __init__(self, config: CriticConfig):
@@ -747,16 +748,21 @@ class CriticModel(nn.Module):
         if config.action_model_checkpoint is not None and self.rgb_encoder is not None:
             self._load_vision_weights_from_action_model(config.action_model_checkpoint)
 
-        # UNet (value head).
-        self.unet = DiffusionConditionalUnet1d(
-            config,
-            global_cond_dim=global_cond_dim * config.n_obs_steps,
-        )
+        # MLP value head: global_cond → scalar value.
+        mlp_input_dim = global_cond_dim * config.n_obs_steps
+        layers = []
+        in_dim = mlp_input_dim
+        for h_dim in config.mlp_hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ReLU())
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.value_head = nn.Sequential(*layers)
 
     def _load_vision_weights_from_action_model(self, checkpoint_path: str):
         """Load rgb_encoder weights from action model checkpoint as initialization.
 
-        After loading, weights are NOT frozen — rgb_encoder trains end-to-end with UNet.
+        After loading, weights are NOT frozen — rgb_encoder trains end-to-end with MLP value head.
 
         Supports both:
           - Directory path (loads model.safetensors inside it)
@@ -808,7 +814,7 @@ class CriticModel(nn.Module):
         missing, unexpected = self.rgb_encoder.load_state_dict(vision_sd, strict=False)
         print(f"[CriticModel] Loaded vision encoder from action model: {checkpoint_path}")
         print(f"  matched keys: {len(vision_sd) - len(unexpected)}")
-        print(f"  (not frozen — will be trained end-to-end with UNet)")
+        print(f"  (not frozen — will be trained end-to-end with MLP value head)")
         if missing:
             print(f"  missing keys: {missing[:5]}...")
         if unexpected:
@@ -858,42 +864,31 @@ class CriticModel(nn.Module):
             batch:
                 "observation.state":  (B, n_obs, state_dim)
                 "observation.images": (B, n_obs, num_cameras, C, H, W)  — optional
-                "action":             (B, T, action_dim)
         Returns:
-            pred_value: (B, T, 1)
+            pred_value: (B, 1)
         """
         global_cond = self._prepare_global_conditioning(batch)
-
-        action = batch["action"]
-        # Fixed timestep=0: critic does not do denoising (Option A).
-        timestep = torch.zeros(action.shape[0], device=action.device, dtype=torch.long)
-
-        pred_value = self.unet(action, timestep, global_cond=global_cond)
+        pred_value = self.value_head(global_cond)  # (B, 1)
         return pred_value
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
         batch must contain:
-            "action":              (B, T, action_dim)
             "observation.state":   (B, n_obs, state_dim)
             "observation.images":  (B, n_obs, num_cameras, C, H, W)  — optional
-            "bellman_value":       (B, T)
-            "action_is_pad":       (B, T)  — optional
+            "mc_value":            (B,)  — scalar MC return target
         """
-        pred_value = self.forward(batch)  # (B, T, 1)
-        target_value = batch["bellman_value"]  # (B, T)
+        pred_value = self.forward(batch)  # (B, 1)
+        target_value = batch["mc_value"]  # (B,)
 
         if self.config.value_loss_type == "mse":
-            loss = F.mse_loss(pred_value.squeeze(-1), target_value, reduction="none")
+            loss = F.mse_loss(pred_value.squeeze(-1), target_value)
         elif self.config.value_loss_type == "huber":
-            loss = F.huber_loss(pred_value.squeeze(-1), target_value, reduction="none")
+            loss = F.huber_loss(pred_value.squeeze(-1), target_value)
         else:
             raise ValueError(f"Unsupported value_loss_type: {self.config.value_loss_type}")
 
-        if "action_is_pad" in batch:
-            loss = loss * (~batch["action_is_pad"]).float()
-
-        return loss.mean()
+        return loss
 
 
 class DiffusionConditionalResidualBlock1d(nn.Module):
