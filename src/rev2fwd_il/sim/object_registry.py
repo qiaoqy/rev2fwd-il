@@ -101,6 +101,14 @@ def _make_cylinder_spawn():
         visual_material=sim_utils.PreviewSurfaceCfg(
             diffuse_color=(0.2, 0.6, 1.0),  # light blue
         ),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=2.0,
+            dynamic_friction=2.0,
+            restitution=0.0,
+            friction_combine_mode="max",
+            compliant_contact_stiffness=1e5,
+            compliant_contact_damping=1e3,
+        ),
     )
 
 
@@ -201,7 +209,7 @@ OBJECT_REGISTRY: dict[str, ObjectConfig] = {
         spawn_cfg_fn=_make_cylinder_spawn,
         init_pos=(0.5, 0.0, 0.030),  # half height = 3cm
         object_height=0.06,
-        grasp_z_offset=0.01,  # grasp slightly above center
+        grasp_z_offset=-0.01,  # lowered 2cm (was 0.01) — grasp below centre to prevent slip
         release_z_offset=-0.03,  # release_z = 0.065-0.03 = 0.035 (safe)
         hover_z=0.25,
         position_threshold=0.015,
@@ -229,7 +237,7 @@ OBJECT_REGISTRY: dict[str, ObjectConfig] = {
         spawn_cfg_fn=_make_bottle_spawn,
         init_pos=(0.5, 0.0, 0.050),  # half height = 5cm
         object_height=0.10,
-        grasp_z_offset=0.02,  # grasp at body midpoint
+        grasp_z_offset=0.01,  # lowered 1cm (was 0.02) — grasp lower on body to prevent slip
         release_z_offset=-0.02,  # release_z = 0.10-0.02 = 0.080 (bottle bottom ~0.03, safe)
         hover_z=0.28,  # higher hover for tall object
         position_threshold=0.015,

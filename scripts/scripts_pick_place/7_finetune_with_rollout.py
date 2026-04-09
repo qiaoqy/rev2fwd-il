@@ -311,6 +311,8 @@ def add_episodes_to_lerobot_dataset(
     total_frames = 0
     start_time = time.time()
     num_episodes = len(episodes)
+    added_episodes = 0
+    skipped_empty_episodes = 0
     
     print(f"\nProcessing {num_episodes} episodes...")
     
@@ -323,11 +325,16 @@ def add_episodes_to_lerobot_dataset(
         eta = (num_episodes - ep_idx) / rate if rate > 0 else 0
         print(f"  [{ep_idx + 1}/{num_episodes}] Processing episode, "
               f"{T} frames | {rate:.1f} ep/s | ETA: {eta:.0f}s")
+
+        if T == 0:
+            skipped_empty_episodes += 1
+            print("    Skipping empty episode")
+            continue
         
         # Extract data
         images = ep["images"]  # (T, H, W, 3) uint8
         ee_pose = ep["ee_pose"]  # (T, 7)
-        obj_pose = ep["obj_pose"]  # (T, 7)
+        obj_pose = ep["obj_pose"] if "obj_pose" in ep else None  # (T, 7) or None
         actions = ep["action"]  # (T, 8)
         wrist_images = ep.get("wrist_images", None)  # (T, H, W, 3) uint8 or None
         
@@ -340,7 +347,7 @@ def add_episodes_to_lerobot_dataset(
             
             # Build state
             state_parts = [ee_pose[t]]  # Always include ee_pose (7,)
-            if include_obj_pose:
+            if include_obj_pose and obj_pose is not None:
                 state_parts.append(obj_pose[t])  # Add obj_pose (7,)
             if include_gripper:
                 gripper_state = np.array([gripper_states[t]], dtype=np.float32)  # (1,)
@@ -366,6 +373,7 @@ def add_episodes_to_lerobot_dataset(
         # Save episode
         dataset.save_episode()
         total_frames += T
+        added_episodes += 1
     
     # Finalize dataset
     print("\nFinalizing dataset (encoding videos)...")
@@ -375,7 +383,8 @@ def add_episodes_to_lerobot_dataset(
     print(f"\n{'='*60}")
     print("Episode Addition Complete!")
     print(f"{'='*60}")
-    print(f"  Added episodes: {num_episodes}")
+    print(f"  Added episodes: {added_episodes}")
+    print(f"  Skipped empty episodes: {skipped_empty_episodes}")
     print(f"  Added frames: {total_frames}")
     print(f"  Time: {elapsed:.1f}s")
     print(f"{'='*60}\n")
@@ -387,7 +396,8 @@ def add_episodes_to_lerobot_dataset(
         "old_frames": old_frames,
         "new_frames": total_frames,
         "old_episodes": old_episodes,
-        "new_episodes": num_episodes,
+        "new_episodes": added_episodes,
+        "skipped_empty_episodes": skipped_empty_episodes,
     }
     
     if total_frames > 0 and old_frames > 0:

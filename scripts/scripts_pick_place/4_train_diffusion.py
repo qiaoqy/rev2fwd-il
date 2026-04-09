@@ -518,7 +518,7 @@ def convert_npz_to_lerobot_format(
                     episodes = load_episodes_from_npz(npz_path, num_episodes=1)
                     ep0 = episodes[0]
                     overfit_env_init = {
-                        "initial_obj_pose": ep0["obj_pose"][0].tolist(),
+                        "initial_obj_pose": ep0["obj_pose"][0].tolist() if "obj_pose" in ep0 else [0.0]*7,
                         "initial_ee_pose": ep0["ee_pose"][0].tolist(),
                         "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
                         "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
@@ -543,7 +543,7 @@ def convert_npz_to_lerobot_format(
     if overfit and len(episodes) > 0:
         ep0 = episodes[0]
         overfit_env_init = {
-            "initial_obj_pose": ep0["obj_pose"][0].tolist(),
+            "initial_obj_pose": ep0["obj_pose"][0].tolist() if "obj_pose" in ep0 else [0.0]*7,
             "initial_ee_pose": ep0["ee_pose"][0].tolist(),
             "place_pose": ep0.get("place_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
             "goal_pose": ep0.get("goal_pose", [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
@@ -678,7 +678,7 @@ def convert_npz_to_lerobot_format(
         # Extract data
         images = ep["images"]  # (T, H, W, 3) uint8
         ee_pose = ep["ee_pose"]  # (T, 7)
-        obj_pose = ep["obj_pose"]  # (T, 7)
+        obj_pose = ep["obj_pose"] if "obj_pose" in ep else None  # (T, 7) or None
         actions = ep["action"]  # (T, 8) - GOAL ACTIONS from script 14
         wrist_images = ep.get("wrist_images", None)  # (T, H, W, 3) uint8 or None
         
@@ -695,7 +695,7 @@ def convert_npz_to_lerobot_format(
             img = images[t]  # (H, W, 3)
             # Build state based on include_obj_pose and include_gripper flags
             state_parts = [ee_pose[t]]  # Always include ee_pose (7,)
-            if include_obj_pose:
+            if include_obj_pose and obj_pose is not None:
                 state_parts.append(obj_pose[t])  # Add obj_pose (7,)
             if include_gripper:
                 gripper_state = np.array([gripper_states[t]], dtype=np.float32)  # (1,)

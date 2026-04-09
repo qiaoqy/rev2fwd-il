@@ -59,14 +59,21 @@ def load_critic_model(checkpoint_path: str, device: str) -> CriticModel:
     """Load trained critic model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
+    # Extract training config from checkpoint to match architecture
+    ckpt_cfg = ckpt.get("config", {})
+    dropout = ckpt_cfg.get("dropout", 0.0)
+    crop_shape = tuple(ckpt_cfg.get("crop_shape", [128, 128]))
+    include_obj_pose = not ckpt_cfg.get("no_obj_pose", False)
+    state_dim = 7 + (7 if include_obj_pose else 0) + 1
+
     config = CriticConfig(
         input_features={
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(15,)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
             "observation.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
             "observation.wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
         },
         n_obs_steps=2,
-        crop_shape=(128, 128),
+        crop_shape=crop_shape,
         value_loss_type="mse",
         action_model_checkpoint=None,
         vision_backbone="resnet18",
@@ -74,20 +81,42 @@ def load_critic_model(checkpoint_path: str, device: str) -> CriticModel:
         spatial_softmax_num_keypoints=32,
         use_separate_rgb_encoder_per_camera=False,
         mlp_hidden_dims=(512, 512, 256, 256),
+        mlp_dropout=dropout,
     )
 
     model = CriticModel(config)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
-    print(f"Loaded critic model from {checkpoint_path} (step={ckpt.get('step', '?')})")
+    model._critic_include_obj_pose = include_obj_pose
+    model._critic_state_dim = state_dim
+    print(
+        f"Loaded critic model from {checkpoint_path} "
+        f"(step={ckpt.get('step', '?')}, dropout={dropout}, crop={crop_shape}, "
+        f"include_obj_pose={include_obj_pose}, state_dim={state_dim})"
+    )
     return model
 
 
-def build_state(ep, t):
-    """Build state: ee_pose(7) + obj_pose(7) + gripper(1) = 15."""
-    parts = [ep["ee_pose"][t], ep["obj_pose"][t],
-             np.array([ep["action"][t, 7]], dtype=np.float32)]
+def build_state(ep, t, include_obj_pose: bool = True):
+    """Build state from episode data.
+
+    Supports both legacy 15D critic inputs (ee + obj + gripper) and the
+    Exp45 8D variant (ee + gripper only).
+    """
+    parts = [ep["ee_pose"][t]]
+    if include_obj_pose:
+        if "obj_pose" in ep:
+            obj_pose = ep["obj_pose"][t]
+        elif "cube_small_pose" in ep:
+            obj_pose = ep["cube_small_pose"][t]
+        else:
+            raise KeyError(
+                "Episode is missing object pose data required by the critic "
+                "(expected 'obj_pose' or 'cube_small_pose')."
+            )
+        parts.append(obj_pose)
+    parts.append(np.array([ep["action"][t, 7]], dtype=np.float32))
     return np.concatenate(parts).astype(np.float32)
 
 
@@ -112,6 +141,7 @@ def predict_episode_values(
     """
     T = len(ep["action"])
     pred_values = np.zeros(T, dtype=np.float32)
+    include_obj_pose = getattr(model, "_critic_include_obj_pose", True)
 
     # Pre-build all samples
     all_obs_states = []
@@ -123,7 +153,7 @@ def predict_episode_values(
         obs_imgs = []
         for i in range(n_obs_steps):
             obs_t = max(0, min(start - n_obs_steps + 1 + i, T - 1))
-            obs_states.append(build_state(ep, obs_t))
+            obs_states.append(build_state(ep, obs_t, include_obj_pose=include_obj_pose))
             table = np.transpose(ep["images"][obs_t], (2, 0, 1)).astype(np.float32) / 255.0
             wrist = np.transpose(ep["wrist_images"][obs_t], (2, 0, 1)).astype(np.float32) / 255.0
             obs_imgs.append(np.stack([table, wrist], axis=0))
@@ -132,7 +162,7 @@ def predict_episode_values(
         all_obs_images.append(np.stack(obs_imgs, axis=0))
 
     # Batched inference
-    all_obs_states = np.stack(all_obs_states)   # (T, n_obs, 15)
+    all_obs_states = np.stack(all_obs_states)
     all_obs_images = np.stack(all_obs_images)   # (T, n_obs, 2, 3, H, W)
 
     with torch.no_grad():

@@ -92,6 +92,9 @@ def split_episodes(
     Ensures both train and val sets contain both successful and failed episodes
     (when available) at approximately the requested ratio.
     """
+    if len(episodes) < 2:
+        raise ValueError("Need at least 2 episodes to create a train/val split")
+
     rng = np.random.RandomState(seed)
 
     success_eps = [ep for ep in episodes if ep.get("success", False)]
@@ -100,15 +103,28 @@ def split_episodes(
     rng.shuffle(success_eps)
     rng.shuffle(failure_eps)
 
-    n_train_success = max(1, int(len(success_eps) * train_ratio))
-    n_train_failure = max(0, int(len(failure_eps) * train_ratio))
+    def _split_classwise(class_eps: list[dict]) -> tuple[list[dict], list[dict]]:
+        n_total = len(class_eps)
+        if n_total == 0:
+            return [], []
+        if n_total == 1:
+            return class_eps[:1], []
 
-    # Handle edge case: if only 1 failure episode, put it in train
-    if len(failure_eps) == 1:
-        n_train_failure = 1
+        n_train = int(n_total * train_ratio)
+        n_train = max(1, min(n_train, n_total - 1))
+        return class_eps[:n_train], class_eps[n_train:]
 
-    train_eps = success_eps[:n_train_success] + failure_eps[:n_train_failure]
-    val_eps = success_eps[n_train_success:] + failure_eps[n_train_failure:]
+    train_success, val_success = _split_classwise(success_eps)
+    train_failure, val_failure = _split_classwise(failure_eps)
+
+    train_eps = train_success + train_failure
+    val_eps = val_success + val_failure
+
+    if not train_eps or not val_eps:
+        raise ValueError(
+            "Unable to create a non-empty train/val split. "
+            f"success={len(success_eps)}, failure={len(failure_eps)}"
+        )
 
     # Shuffle within each set
     rng.shuffle(train_eps)

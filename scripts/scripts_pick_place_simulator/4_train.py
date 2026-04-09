@@ -153,6 +153,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_project", type=str,
                         default="rev2fwd-pick-place-simulator")
 
+    # State composition
+    parser.add_argument("--no_obj_pose", action="store_true",
+                        help="Exclude obj_pose from state (state_dim=8 instead of 15).")
+
     return parser.parse_args()
 
 
@@ -182,8 +186,8 @@ def _patched_diffusion_init(self, **kwargs):
 def main() -> None:
     args = _parse_args()
 
-    # Hard-code state flags (always 15-dim)
-    args.include_obj_pose = True
+    # State flags
+    args.include_obj_pose = not args.no_obj_pose
     args.include_gripper = True
 
     # Attributes expected by the original module but not exposed here
@@ -193,10 +197,11 @@ def main() -> None:
     _ddim_overrides["noise_scheduler_type"] = args.noise_scheduler_type
     _ddim_overrides["num_inference_steps"] = args.num_inference_steps
 
+    state_dim = 7 + (7 if args.include_obj_pose else 0) + 1
     print(f"\n{'='*60}")
     print(f"[DDIM MODE] noise_scheduler_type = {args.noise_scheduler_type}")
     print(f"[DDIM MODE] num_inference_steps  = {args.num_inference_steps}")
-    print(f"[State]     include_obj_pose = True, include_gripper = True  (state_dim=15)")
+    print(f"[State]     include_obj_pose = {args.include_obj_pose}, include_gripper = True  (state_dim={state_dim})")
     print(f"{'='*60}\n")
 
     # Monkey-patch DiffusionConfig.__init__ to inject DDIM defaults
@@ -234,7 +239,7 @@ def main() -> None:
                     repo_id="local/rev2fwd_diffusion_B",
                     force=args.force_convert,
                     num_episodes=args.num_episodes,
-                    include_obj_pose=True,
+                    include_obj_pose=args.include_obj_pose,
                     include_gripper=True,
                 )
                 meta_file = out_dir / ".conversion_meta.json"
@@ -243,7 +248,7 @@ def main() -> None:
                         "image_height": image_height,
                         "image_width": image_width,
                         "has_wrist": has_wrist,
-                        "include_obj_pose": True,
+                        "include_obj_pose": args.include_obj_pose,
                         "include_gripper": True,
                     }, f, indent=2)
 
@@ -300,7 +305,7 @@ def main() -> None:
             image_height=image_height,
             image_width=image_width,
             has_wrist=has_wrist,
-            include_obj_pose=True,
+            include_obj_pose=args.include_obj_pose,
             include_gripper=True,
             train_episodes=train_episodes,
             val_episodes=val_episodes,

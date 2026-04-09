@@ -29,6 +29,7 @@ class CriticConfig:
 
     # === MLP value head params ===
     mlp_hidden_dims: tuple[int, ...] = (512, 512, 256, 256)
+    mlp_dropout: float = 0.0  # Dropout probability between MLP hidden layers (0 = disabled)
 
     # === Observation params ===
     n_obs_steps: int = 2

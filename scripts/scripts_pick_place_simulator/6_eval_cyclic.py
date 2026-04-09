@@ -375,6 +375,7 @@ def main() -> None:
         import traceback
         print(f"\nERROR: {e}")
         traceback.print_exc()
+        raise
     finally:
         simulation_app.close()
 

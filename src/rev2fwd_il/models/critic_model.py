@@ -755,6 +755,8 @@ class CriticModel(nn.Module):
         for h_dim in config.mlp_hidden_dims:
             layers.append(nn.Linear(in_dim, h_dim))
             layers.append(nn.ReLU())
+            if config.mlp_dropout > 0:
+                layers.append(nn.Dropout(config.mlp_dropout))
             in_dim = h_dim
         layers.append(nn.Linear(in_dim, 1))
         self.value_head = nn.Sequential(*layers)

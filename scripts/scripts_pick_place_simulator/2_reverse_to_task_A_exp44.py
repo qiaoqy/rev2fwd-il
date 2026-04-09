@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Step 2: Build Task A data by time-reversing Task B trajectories.
+"""Build Task A (stack) data by time-reversing Task B (partial unstack) trajectories.
 
-Time-reverses all sequences and recomputes action[t][:7] = ee_pose[t+1].
-Drops the last frame (no valid next-frame target).
+Adapted for the Exp44 format (2-round partial unstack, 3 cube poses).
 
 Usage:
     conda activate rev2fwd_il
-    python scripts/scripts_pick_place_simulator/2_reverse_to_task_A.py \
-        --input data/exp_new/task_B_100.npz \
-        --out data/exp_new/task_A_reversed_100.npz --verify
+    python scripts/scripts_pick_place_simulator/2_reverse_to_task_A_exp44.py \
+        --input data/pick_place_isaac_lab_simulation/exp44/task_B_exp44_100.npz \
+        --out data/pick_place_isaac_lab_simulation/exp44/task_A_exp44_100.npz --verify
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import numpy as np
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Time-reverse Task B data to get Task A training data.",
+        description="Time-reverse Task B Exp44 data to get Task A training data.",
     )
     parser.add_argument("--input", type=str, required=True, help="Input Task B NPZ.")
     parser.add_argument("--out", type=str, required=True, help="Output Task A NPZ.")
@@ -39,77 +38,65 @@ def load_episodes(path: str) -> list[dict]:
     return episodes
 
 
-def reverse_episode(ep: dict) -> dict:
-    """Reverse an episode in time.
+# Temporal arrays to reverse and trim (drop last frame)
+_TEMPORAL_KEYS = [
+    "obs", "images", "wrist_images", "ee_pose",
+    "gripper", "fsm_state", "fsm_round",
+    "cube_large_pose", "cube_medium_pose", "cube_small_pose",
+]
 
-    Handles both the original collection format (with obs, gripper, fsm_state)
-    and the rollout format (which only has images, ee_pose, obj_pose, action).
-    For rollout data, gripper is extracted from action[:, 7] and obs/fsm_state
-    are synthesised as zeros.
-    """
+
+def reverse_episode(ep: dict) -> dict:
+    """Reverse an episode in time for the Exp44 task."""
     T = len(ep["images"])
 
-    # Handle fields that may be absent in rollout data
-    has_obs = "obs" in ep
-    has_gripper = "gripper" in ep
-    has_fsm_state = "fsm_state" in ep
+    # Reverse all temporal arrays
+    reversed_arrays = {}
+    for key in _TEMPORAL_KEYS:
+        if key in ep:
+            reversed_arrays[key] = ep[key][::-1].copy()
 
-    if has_obs:
-        obs_rev = ep["obs"][::-1].copy()
-    else:
-        obs_rev = np.zeros((T, 36), dtype=np.float32)
-
-    images_rev = ep["images"][::-1].copy()
-    ee_rev = ep["ee_pose"][::-1].copy()
-    has_obj_pose = "obj_pose" in ep
-    obj_rev = ep["obj_pose"][::-1].copy() if has_obj_pose else None
-
-    if has_gripper:
-        gripper_rev = ep["gripper"][::-1].copy()
-    else:
-        # Extract gripper from action[:, 7]
+    # Recompute actions: action[t][:7] = ee_pose[t+1], action[t][7] = gripper[t]
+    ee_rev = reversed_arrays["ee_pose"]
+    gripper_rev = reversed_arrays.get("gripper")
+    if gripper_rev is None:
         gripper_rev = ep["action"][:, 7][::-1].copy()
+        reversed_arrays["gripper"] = gripper_rev
 
-    if has_fsm_state:
-        fsm_state_rev = ep["fsm_state"][::-1].copy()
-    else:
-        fsm_state_rev = np.zeros(T, dtype=np.int32)
-
-    has_wrist = "wrist_images" in ep
-    if has_wrist:
-        wrist_rev = ep["wrist_images"][::-1].copy()
-
-    # action[t][:7] = ee_pose[t+1], action[t][7] = gripper[t]
     new_actions = np.zeros((T, 8), dtype=np.float32)
     new_actions[:T - 1, :7] = ee_rev[1:]
     new_actions[T - 1, :7] = ee_rev[T - 1]
     new_actions[:, 7] = gripper_rev
 
-    # Drop last frame
-    result = {
-        "obs": obs_rev[:-1].astype(np.float32),
-        "images": images_rev[:-1],
-        "ee_pose": ee_rev[:-1].astype(np.float32),
-        "action": new_actions[:-1].astype(np.float32),
-        "gripper": gripper_rev[:-1].astype(np.float32),
-        "fsm_state": fsm_state_rev[:-1].astype(np.int32),
-        "success": ep["success"],
-    }
-    if has_obj_pose:
-        result["obj_pose"] = obj_rev[:-1].astype(np.float32)
-    # Copy metadata fields if present
-    if "place_pose" in ep:
-        result["place_pose"] = ep["place_pose"].copy() if hasattr(ep["place_pose"], 'copy') else ep["place_pose"]
-    if "goal_pose" in ep:
-        result["goal_pose"] = ep["goal_pose"].copy() if hasattr(ep["goal_pose"], 'copy') else ep["goal_pose"]
-    if has_wrist:
-        result["wrist_images"] = wrist_rev[:-1]
+    # Build result, dropping last frame
+    result = {}
+    for key in _TEMPORAL_KEYS:
+        if key in reversed_arrays:
+            result[key] = reversed_arrays[key][:-1]
+    result["action"] = new_actions[:-1].astype(np.float32)
+
+    # Ensure correct dtypes
+    for key in ["obs", "ee_pose", "gripper",
+                "cube_large_pose", "cube_medium_pose", "cube_small_pose"]:
+        if key in result and result[key].dtype != np.float32:
+            result[key] = result[key].astype(np.float32)
+    for key in ["fsm_state", "fsm_round"]:
+        if key in result and result[key].dtype != np.int32:
+            result[key] = result[key].astype(np.int32)
+
+    # Copy metadata (non-temporal) as-is
+    for key in ["success", "expert_completed", "success_per_cube",
+                "place_targets", "goal_pose"]:
+        if key in ep:
+            val = ep[key]
+            result[key] = val.copy() if hasattr(val, "copy") else val
+
     return result
 
 
-def verify_episode(ep_fwd: dict, ep_idx: int) -> None:
-    ee = ep_fwd["ee_pose"]
-    act = ep_fwd["action"]
+def verify_episode(ep: dict, ep_idx: int) -> None:
+    ee = ep["ee_pose"]
+    act = ep["action"]
     T = len(ee)
     diff = np.linalg.norm(act[:T - 1, :7] - ee[1:], axis=1)
     max_diff = diff.max()
@@ -154,7 +141,7 @@ def main() -> None:
     close_ratio = total_close / total_steps if total_steps else 0
 
     print(f"\n{'='*60}")
-    print(f"Dataset Statistics")
+    print(f"Exp44 Task A Dataset Statistics")
     print(f"{'='*60}")
     print(f"Total episodes:        {len(forward_episodes)}")
     print(f"Total steps:           {total_steps}")
@@ -167,6 +154,9 @@ def main() -> None:
         if "wrist_images" in ep0:
             print(f"Wrist image shape:     {ep0['wrist_images'].shape[1:]}")
         print(f"Action dim:            {ep0['action'].shape[1]}")
+        for key in ["cube_large_pose", "cube_medium_pose", "cube_small_pose"]:
+            if key in ep0:
+                print(f"{key} shape: {ep0[key].shape}")
     print(f"Gripper CLOSE ratio:   {100 * close_ratio:.1f}%")
     print(f"{'='*60}\n")
 

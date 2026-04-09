@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torchvision.transforms as tv_transforms
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -56,6 +57,7 @@ class CriticEpisodeDataset(Dataset):
         include_obj_pose: bool = True,
         include_gripper: bool = True,
         max_episodes: int = -1,
+        color_jitter: bool = False,
     ):
         self.n_obs_steps = n_obs_steps
         self.include_obj_pose = include_obj_pose
@@ -74,6 +76,14 @@ class CriticEpisodeDataset(Dataset):
             T = len(ep["action"])
             for t in range(T):
                 self.samples.append((ep_idx, t))
+
+        # Color jitter augmentation (training only)
+        if color_jitter:
+            self.color_jitter = tv_transforms.ColorJitter(
+                brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05
+            )
+        else:
+            self.color_jitter = None
 
     def __len__(self):
         return len(self.samples)
@@ -119,9 +129,19 @@ class CriticEpisodeDataset(Dataset):
         # ---- Scalar MC value target ----
         mc_value = ep["mc_value"][t]
 
+        obs_images_t = torch.from_numpy(obs_images)
+
+        # Apply color jitter augmentation if enabled
+        if self.color_jitter is not None:
+            # obs_images_t: (n_obs, 2, 3, H, W) -> apply per image
+            n_obs, n_cam, C, H, W = obs_images_t.shape
+            obs_images_t = obs_images_t.reshape(n_obs * n_cam, C, H, W)
+            obs_images_t = self.color_jitter(obs_images_t)
+            obs_images_t = obs_images_t.reshape(n_obs, n_cam, C, H, W)
+
         return {
             "observation.state": torch.from_numpy(obs_state),
-            "observation.images": torch.from_numpy(obs_images),
+            "observation.images": obs_images_t,
             "mc_value": torch.tensor(mc_value, dtype=torch.float32),
         }
 
@@ -137,15 +157,13 @@ def cosine_schedule(step, total_steps, lr_max, lr_min=0.0):
     return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * step / total_steps))
 
 
-def evaluate(model, dataloader, device, max_batches=50, value_loss_type="mse"):
-    """Evaluate model on val set, return mean loss."""
+def evaluate(model, dataloader, device, value_loss_type="mse"):
+    """Evaluate model on full val set, return mean loss."""
     model.eval()
     total_loss = 0.0
     count = 0
     with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if i >= max_batches:
-                break
+        for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
             pred_value = model(batch)  # (B, 1)
             target_value = batch["mc_value"]  # (B,)
@@ -199,6 +217,8 @@ def main():
     parser.add_argument("--n_obs_steps", type=int, default=2)
     parser.add_argument("--crop_shape", type=int, nargs=2, default=[128, 128])
     parser.add_argument("--value_loss_type", type=str, default="mse", choices=["mse", "huber"])
+    parser.add_argument("--dropout", type=float, default=0.0, help="MLP dropout probability")
+    parser.add_argument("--color_jitter", action="store_true", help="Enable color jitter augmentation")
 
     # Eval / logging
     parser.add_argument("--eval_freq", type=int, default=2000)
@@ -211,6 +231,10 @@ def main():
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)
+
+    # State composition
+    parser.add_argument("--no_obj_pose", action="store_true",
+                        help="Exclude obj_pose from state (state_dim=8 instead of 15).")
 
     args = parser.parse_args()
 
@@ -239,14 +263,20 @@ def main():
     train_npz = Path(args.data_dir) / f"critic_{args.task}_train.npz"
     val_npz = Path(args.data_dir) / f"critic_{args.task}_val.npz"
 
+    include_obj_pose = not args.no_obj_pose
+
     max_ep = args.overfit_episodes if args.overfit else -1
     train_dataset = CriticEpisodeDataset(
         str(train_npz), n_obs_steps=args.n_obs_steps,
+        include_obj_pose=include_obj_pose,
         max_episodes=max_ep,
+        color_jitter=args.color_jitter,
     )
     val_dataset = CriticEpisodeDataset(
         str(val_npz), n_obs_steps=args.n_obs_steps,
+        include_obj_pose=include_obj_pose,
         max_episodes=max_ep if args.overfit else -1,
+        color_jitter=False,  # Never augment val data
     )
 
     if is_main_process(rank):
@@ -280,9 +310,11 @@ def main():
         if Path(default_ckpt).exists():
             args.action_model_checkpoint = default_ckpt
 
+    state_dim = 7 + (7 if include_obj_pose else 0) + 1  # ee(7) + obj(7)? + gripper(1)
+
     config = CriticConfig(
         input_features={
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(15,)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
             "observation.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
             "observation.wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128)),
         },
@@ -298,16 +330,19 @@ def main():
         spatial_softmax_num_keypoints=32,
         use_separate_rgb_encoder_per_camera=False,
         mlp_hidden_dims=(512, 512, 256, 256),
+        mlp_dropout=args.dropout,
     )
 
     if is_main_process(rank):
         print(f"\nCriticConfig:")
         print(f"  mlp_hidden_dims={config.mlp_hidden_dims}")
+        print(f"  mlp_dropout={config.mlp_dropout}")
         print(f"  state_dim={config.robot_state_feature.shape}")
         print(f"  image_features={list(config.image_features.keys())}")
         print(f"  crop_shape={config.crop_shape}")
         print(f"  action_model_checkpoint={config.action_model_checkpoint}")
         print(f"  value_loss_type={config.value_loss_type}")
+        print(f"  color_jitter={args.color_jitter}")
 
     model = CriticModel(config).to(device)
 
@@ -335,6 +370,8 @@ def main():
             "model_params": n_params,
             "train_samples": len(train_dataset),
             "val_samples": len(val_dataset),
+            "changes": "B+C+D: dropout={}, color_jitter={}, weight_decay={}, crop_shape={}, full_val_eval, early_stopping".format(
+                args.dropout, args.color_jitter, args.weight_decay, args.crop_shape),
         }
         with open(output_dir / "config.json", "w") as f:
             json.dump(config_dict, f, indent=2, default=str)
@@ -347,6 +384,7 @@ def main():
     step = 0
     epoch = 0
     log_losses = []
+    best_val_loss = float("inf")
     t_start = time.time()
 
     if is_main_process(rank):
@@ -423,6 +461,21 @@ def main():
             print(f"  [val] step {step} | val_loss {val_loss:.6f}")
             writer.add_scalar("val/loss", val_loss, step)
 
+            # Early stopping: save best checkpoint
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                ckpt_dir = output_dir / "checkpoints" / "best"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                save_model = model.module if isinstance(model, DDP) else model
+                torch.save({
+                    "step": step,
+                    "model_state_dict": save_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": vars(args),
+                    "val_loss": val_loss,
+                }, ckpt_dir / "checkpoint.pt")
+                print(f"  [best] new best val_loss {val_loss:.6f} at step {step}")
+
         # ---- Save checkpoint ----
         if is_main_process(rank) and step % args.save_freq == 0:
             ckpt_dir = output_dir / "checkpoints" / f"step_{step}"
@@ -455,6 +508,7 @@ def main():
                              value_loss_type=args.value_loss_type)
         print(f"\n{'='*60}")
         print(f"Training complete. Final val loss: {val_loss:.6f}")
+        print(f"Best val loss: {best_val_loss:.6f}")
         print(f"Checkpoints saved to: {output_dir / 'checkpoints'}")
         print(f"{'='*60}")
 

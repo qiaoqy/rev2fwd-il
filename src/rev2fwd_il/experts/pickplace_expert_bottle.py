@@ -1,0 +1,533 @@
+"""Pick-and-place expert for Bottle with higher transport height (Exp47).
+
+Based on PickPlaceExpertB, with episode_hover_z raised from U(0.2, 0.3) to U(0.4, 0.45)
+to increase object carrying height by ~20cm.
+"""
+
+from __future__ import annotations
+
+from enum import IntEnum
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    import gymnasium as gym
+
+
+class ExpertState(IntEnum):
+    """States for the pick-and-place finite state machine."""
+
+    REST = 0
+    APPROACH_OBJ = 1       # High approach toward object area (large XY randomness)
+    GO_ABOVE_OBJ = 2       # Hover directly above object (small XY offset)
+    ALIGN_TO_OBJ = 3       # Fine alignment above object before descent (tiny XY noise)
+    GO_TO_OBJ = 4          # Descend to grasp position (NO randomness)
+    CLOSE = 5              # Close gripper (NO randomness)
+    LIFT = 6
+    APPROACH_PLACE = 7     # High approach toward place area (moderate XY randomness)
+    GO_ABOVE_PLACE = 8     # Hover above place position (small XY offset)
+    ALIGN_TO_PLACE = 9     # Fine alignment above place before descent (tiny XY noise)
+    GO_TO_PLACE = 10       # Descend to place position (NO randomness)
+    LOWER_TO_RELEASE = 11  # Lower to release height (NO randomness)
+    OPEN = 12              # Open gripper (NO randomness)
+    LIFT_AFTER_RELEASE = 13
+    RETURN_REST = 14
+    DONE = 15
+
+
+# Gripper action values
+GRIPPER_OPEN = 1.0
+GRIPPER_CLOSE = -1.0
+
+
+class PickPlaceExpertBottle:
+    """Finite state machine expert for Bottle pick-and-place with higher transport height.
+
+    This expert outputs absolute EE pose commands (position + quaternion) plus gripper action.
+    Action format: [x, y, z, qw, qx, qy, qz, gripper] = 8 dims
+
+    Gripper convention:
+        - OPEN = +1.0
+        - CLOSE = -1.0
+
+    Compared to PickPlaceExpertB, the only difference is:
+        episode_hover_z ~ U(0.4, 0.45) instead of U(0.2, 0.3)
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        device: str | torch.device,
+        hover_z: float = 0.25,
+        grasp_z_offset: float = 0.02,  # grasp slightly into the object
+        release_z_offset: float = -0.03,  # lower slightly into the object for stable release
+        position_threshold: float = 0.01,
+        wait_steps: int = 15,
+    ):
+        """Initialize the expert.
+
+        Args:
+            num_envs: Number of parallel environments.
+            device: Torch device.
+            hover_z: Height for hovering above objects.
+            grasp_z_offset: Offset from object top when grasping.
+            release_z_offset: Offset for release height (negative = lower).
+            position_threshold: Distance threshold for reaching waypoints.
+            wait_steps: Steps to wait after reaching a waypoint.
+        """
+        self.num_envs = num_envs
+        self.device = torch.device(device)
+        self.hover_z = hover_z
+        self.grasp_z_offset = grasp_z_offset
+        self.release_z_offset = release_z_offset
+        self.position_threshold = position_threshold
+        self.wait_steps = wait_steps
+
+        # State tracking per environment
+        self.state = torch.full((num_envs,), ExpertState.REST, dtype=torch.int32, device=self.device)
+        self.wait_counter = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+
+        # Store rest pose (recorded at reset)
+        self.rest_pose = None  # (num_envs, 7)
+
+        # Store place target pose
+        self.place_pose = None  # (num_envs, 7)
+
+        # Fixed grasp orientation: gripper pointing down
+        # wxyz format: [w, x, y, z] = [0, 1, 0, 0] represents 180° rotation around x-axis
+        self.grasp_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device)
+
+        # Randomization parameters per environment (initialized in reset)
+        self.episode_hover_z = None      # (num_envs,)
+        self.above_obj_dxy = None        # (num_envs, 2)
+        self.above_place_dxy = None      # (num_envs, 2)
+        # New approach/align randomization
+        self.approach_obj_dxy = None      # (num_envs, 2) — large offset for rough approach
+        self.approach_obj_extra_z = None  # (num_envs,)   — extra height above hover_z
+        self.align_obj_dxy = None         # (num_envs, 2) — tiny offset for fine alignment
+        self.align_obj_dz = None          # (num_envs,)   — small descent below hover_z
+        self.approach_place_dxy = None    # (num_envs, 2) — moderate offset for approach
+        self.approach_place_extra_z = None  # (num_envs,) — extra height above hover_z
+        self.above_obj_extra_z = None     # (num_envs,)   — small extra Z for GO_ABOVE_OBJ
+        self.above_place_extra_z = None   # (num_envs,)   — small extra Z for GO_ABOVE_PLACE
+        self.align_place_dxy = None       # (num_envs, 2) — tiny offset for fine alignment
+        self.align_place_dz = None        # (num_envs,)   — small descent below hover_z
+
+    def reset(
+        self,
+        ee_pose: torch.Tensor,
+        place_xy: tuple[float, float],
+        place_z: float = 0.055,
+        env_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Reset the expert state.
+
+        Args:
+            ee_pose: Current EE pose (num_envs, 7) [x, y, z, qw, qx, qy, qz].
+            place_xy: Target (x, y) for placing the object.
+            place_z: Height for place pose.
+            env_ids: Environment indices to reset. If None, reset all.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        # Initialize randomization parameters if not present
+        n = self.num_envs
+        if self.episode_hover_z is None:
+            self.episode_hover_z = torch.zeros(n, device=self.device)
+            self.above_obj_dxy = torch.zeros(n, 2, device=self.device)
+            self.above_place_dxy = torch.zeros(n, 2, device=self.device)
+            self.approach_obj_dxy = torch.zeros(n, 2, device=self.device)
+            self.approach_obj_extra_z = torch.zeros(n, device=self.device)
+            self.align_obj_dxy = torch.zeros(n, 2, device=self.device)
+            self.align_obj_dz = torch.zeros(n, device=self.device)
+            self.approach_place_dxy = torch.zeros(n, 2, device=self.device)
+            self.approach_place_extra_z = torch.zeros(n, device=self.device)
+            self.above_obj_extra_z = torch.zeros(n, device=self.device)
+            self.above_place_extra_z = torch.zeros(n, device=self.device)
+            self.align_place_dxy = torch.zeros(n, 2, device=self.device)
+            self.align_place_dz = torch.zeros(n, device=self.device)
+        
+        k = len(env_ids)
+        # ★ Exp47: Higher transport height — U(0.4, 0.45) instead of U(0.2, 0.3)
+        self.episode_hover_z[env_ids] = torch.empty(k, device=self.device).uniform_(0.4, 0.45)
+        
+        # GO_ABOVE_OBJ / GO_ABOVE_PLACE: small XY offset (±1cm), extra Z (+0~3cm)
+        self.above_obj_dxy[env_ids] = torch.empty(k, 2, device=self.device).uniform_(-0.01, 0.01)
+        self.above_obj_extra_z[env_ids] = torch.empty(k, device=self.device).uniform_(0.0, 0.03)
+        self.above_place_dxy[env_ids] = torch.empty(k, 2, device=self.device).uniform_(-0.01, 0.01)
+        self.above_place_extra_z[env_ids] = torch.empty(k, device=self.device).uniform_(0.0, 0.03)
+        
+        # APPROACH_OBJ: large XY offset (±3cm), extra Z height (+3~8cm above hover)
+        self.approach_obj_dxy[env_ids] = torch.empty(k, 2, device=self.device).uniform_(-0.03, 0.03)
+        self.approach_obj_extra_z[env_ids] = torch.empty(k, device=self.device).uniform_(0.03, 0.08)
+        
+        # ALIGN_TO_OBJ: tiny XY offset (±3mm), small descent (0~2cm below hover)
+        self.align_obj_dxy[env_ids] = torch.empty(k, 2, device=self.device).uniform_(-0.003, 0.003)
+        self.align_obj_dz[env_ids] = torch.empty(k, device=self.device).uniform_(-0.02, 0.0)
+        
+        # APPROACH_PLACE: moderate XY offset (±3cm), extra Z height (+3~8cm)
+        self.approach_place_dxy[env_ids] = torch.empty(k, 2, device=self.device).uniform_(-0.03, 0.03)
+        self.approach_place_extra_z[env_ids] = torch.empty(k, device=self.device).uniform_(0.03, 0.08)
+        
+        # ALIGN_TO_PLACE: tiny XY offset (±3mm), small descent (0~2cm below hover)
+        self.align_place_dxy[env_ids] = torch.empty(k, 2, device=self.device).uniform_(-0.003, 0.003)
+        self.align_place_dz[env_ids] = torch.empty(k, device=self.device).uniform_(-0.02, 0.0)
+
+        # Store rest pose (keep XYZ position, but override orientation to gripper-down)
+        # The robot's default home has the gripper facing forward, which creates
+        # large unnecessary rotations when transitioning to/from the working pose.
+        # Using grasp_quat (gripper down) at rest eliminates this overhead.
+        if self.rest_pose is None:
+            self.rest_pose = ee_pose.clone()
+            self.rest_pose[:, 3:7] = self.grasp_quat
+        else:
+            self.rest_pose[env_ids] = ee_pose[env_ids].clone()
+            self.rest_pose[env_ids, 3:7] = self.grasp_quat
+
+        # Create place pose
+        if self.place_pose is None:
+            self.place_pose = torch.zeros(self.num_envs, 7, device=self.device)
+
+        self.place_pose[env_ids, 0] = place_xy[0]
+        self.place_pose[env_ids, 1] = place_xy[1]
+        self.place_pose[env_ids, 2] = place_z
+        self.place_pose[env_ids, 3:7] = self.grasp_quat
+
+        # Reset state — start with the new approach phase
+        self.state[env_ids] = ExpertState.APPROACH_OBJ
+        self.wait_counter[env_ids] = 0
+
+    def act(
+        self,
+        ee_pose: torch.Tensor,
+        object_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute action based on current state.
+
+        Args:
+            ee_pose: Current EE pose (num_envs, 7) [x, y, z, qw, qx, qy, qz].
+            object_pose: Current object pose (num_envs, 7) [x, y, z, qw, qx, qy, qz].
+
+        Returns:
+            Action tensor (num_envs, 8) [x, y, z, qw, qx, qy, qz, gripper].
+        """
+        # Initialize action with current pose and open gripper
+        action = torch.zeros(self.num_envs, 8, device=self.device)
+        action[:, :7] = ee_pose.clone()
+        action[:, 7] = GRIPPER_OPEN
+
+        # Compute target positions for each state
+        obj_xy = object_pose[:, :2]
+        obj_z = object_pose[:, 2]
+
+        # --- New: Approach object position (high, rough XY) ---
+        approach_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        approach_obj_pos[:, :2] = obj_xy + self.approach_obj_dxy
+        approach_obj_pos[:, 2] = self.episode_hover_z + self.approach_obj_extra_z
+
+        # Above object position (standard hover + small extra Z)
+        above_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        above_obj_pos[:, :2] = obj_xy + self.above_obj_dxy
+        above_obj_pos[:, 2] = self.episode_hover_z + self.above_obj_extra_z
+
+        # --- New: Align-to-object position (fine correction, slightly lower) ---
+        align_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        align_obj_pos[:, :2] = obj_xy + self.align_obj_dxy
+        align_obj_pos[:, 2] = self.episode_hover_z + self.align_obj_dz
+
+        # At object position (for grasping) — NO randomness
+        at_obj_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        at_obj_pos[:, :2] = obj_xy
+        at_obj_pos[:, 2] = obj_z + self.grasp_z_offset
+
+        # --- New: Approach place position (high, moderate XY) ---
+        approach_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        approach_place_pos[:, :2] = self.place_pose[:, :2] + self.approach_place_dxy
+        approach_place_pos[:, 2] = self.episode_hover_z + self.approach_place_extra_z
+
+        # Above place position (standard hover + small extra Z)
+        above_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        above_place_pos[:, :2] = self.place_pose[:, :2] + self.above_place_dxy
+        above_place_pos[:, 2] = self.episode_hover_z + self.above_place_extra_z
+
+        # --- New: Align-to-place position (fine correction, slightly lower) ---
+        align_place_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        align_place_pos[:, :2] = self.place_pose[:, :2] + self.align_place_dxy
+        align_place_pos[:, 2] = self.episode_hover_z + self.align_place_dz
+
+        # At place position (approach height) — NO randomness
+        at_place_pos = self.place_pose[:, :3].clone()
+
+        # Release position (lower than place position for stable release) — NO randomness
+        release_pos = self.place_pose[:, :3].clone()
+        release_pos[:, 2] = self.place_pose[:, 2] + self.release_z_offset
+
+        # Process each state
+        for state_val in ExpertState:
+            mask = self.state == state_val
+
+            if not mask.any():
+                continue
+
+            if state_val == ExpertState.REST:
+                # Stay at rest, open gripper
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+
+            elif state_val == ExpertState.APPROACH_OBJ:
+                # High approach toward object area (large random XY offset)
+                action[mask, :3] = approach_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                dist = torch.norm(ee_pose[mask, :3] - approach_obj_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.GO_ABOVE_OBJ
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.GO_ABOVE_OBJ:
+                # Hover directly above object (small XY offset)
+                action[mask, :3] = above_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                dist = torch.norm(ee_pose[mask, :3] - above_obj_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.ALIGN_TO_OBJ
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.ALIGN_TO_OBJ:
+                # Fine alignment directly above object (tiny offset, slightly lower)
+                action[mask, :3] = align_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                dist = torch.norm(ee_pose[mask, :3] - align_obj_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.GO_TO_OBJ
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.GO_TO_OBJ:
+                # Move down to object
+                action[mask, :3] = at_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                # Check if reached
+                dist = torch.norm(ee_pose[mask, :3] - at_obj_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.CLOSE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.CLOSE:
+                # Close gripper at object
+                action[mask, :3] = at_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                # Wait for gripper to close
+                self.wait_counter[mask] += 1
+                transition = mask & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.LIFT
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.LIFT:
+                # Lift object
+                action[mask, :3] = above_obj_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                # Check if reached hover height
+                dist = torch.norm(ee_pose[mask, :3] - above_obj_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.APPROACH_PLACE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.APPROACH_PLACE:
+                # High approach toward place area (moderate random XY offset)
+                action[mask, :3] = approach_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                dist = torch.norm(ee_pose[mask, :3] - approach_place_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.GO_ABOVE_PLACE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.GO_ABOVE_PLACE:
+                # Move above place position
+                action[mask, :3] = above_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                dist = torch.norm(ee_pose[mask, :3] - above_place_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.ALIGN_TO_PLACE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.ALIGN_TO_PLACE:
+                # Fine alignment above place position (tiny offset, slightly lower)
+                action[mask, :3] = align_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                dist = torch.norm(ee_pose[mask, :3] - align_place_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.GO_TO_PLACE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.GO_TO_PLACE:
+                # Move down to place position (first stage)
+                action[mask, :3] = at_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                dist = torch.norm(ee_pose[mask, :3] - at_place_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.LOWER_TO_RELEASE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.LOWER_TO_RELEASE:
+                # Lower further for stable release
+                action[mask, :3] = release_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_CLOSE
+
+                dist = torch.norm(ee_pose[mask, :3] - release_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                # 等待时间恢复正常
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.OPEN
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.OPEN:
+                # Open gripper to release object (stay at release height)
+                action[mask, :3] = release_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                # Wait for gripper to open and object to settle
+                self.wait_counter[mask] += 1
+                transition = mask & (self.wait_counter >= self.wait_steps)  # 恢复正常等待时间
+                self.state[transition] = ExpertState.LIFT_AFTER_RELEASE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.LIFT_AFTER_RELEASE:
+                # Lift to hover height after release
+                action[mask, :3] = above_place_pos[mask]
+                action[mask, 3:7] = self.grasp_quat
+                action[mask, 7] = GRIPPER_OPEN
+
+                dist = torch.norm(ee_pose[mask, :3] - above_place_pos[mask], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.RETURN_REST
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.RETURN_REST:
+                # Return to rest pose
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+
+                dist = torch.norm(ee_pose[mask, :3] - self.rest_pose[mask, :3], dim=-1)
+                reached = dist < self.position_threshold
+
+                reached_envs = mask.clone()
+                reached_envs[mask] = reached
+                self.wait_counter[reached_envs] += 1
+
+                transition = reached_envs & (self.wait_counter >= self.wait_steps)
+                self.state[transition] = ExpertState.DONE
+                self.wait_counter[transition] = 0
+
+            elif state_val == ExpertState.DONE:
+                # Stay at rest
+                action[mask, :3] = self.rest_pose[mask, :3]
+                action[mask, 3:7] = self.rest_pose[mask, 3:7]
+                action[mask, 7] = GRIPPER_OPEN
+
+        return action
+
+    def get_state_names(self) -> list[str]:
+        """Get state names for all environments.
+
+        Returns:
+            List of state names.
+        """
+        return [ExpertState(s.item()).name for s in self.state]
+
+    def is_done(self) -> torch.Tensor:
+        """Check if expert has finished for each environment.
+
+        Returns:
+            Boolean tensor (num_envs,).
+        """
+        return self.state == ExpertState.DONE

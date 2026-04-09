@@ -103,6 +103,19 @@ gym.register(
 )
 
 ##
+# Exp39: Rod-Insert (IK-Abs)
+##
+
+gym.register(
+    id="Isaac-RodInsert-Franka-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rod_insert_env_cfg:FrankaRodInsertEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
+##
 # Exp38: 3-Cube Stack (IK-Abs)
 ##
 
@@ -111,6 +124,19 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cube_stack_env_cfg:FrankaCubeStackEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
+##
+# Exp44: 3-Cube Partial Unstack (IK-Abs)
+##
+
+gym.register(
+    id="Isaac-Exp44-CubeStack-Franka-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.exp44_env_cfg:FrankaExp44EnvCfg",
     },
     disable_env_checker=True,
 )

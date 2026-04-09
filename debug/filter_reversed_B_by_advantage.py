@@ -568,6 +568,7 @@ def main():
     print(f"\n[Step 3] Running per-episode inference + advantage filtering...")
     filtered_episodes = []
     all_stats = []
+    dropped_empty_episodes = 0
 
     # For visualization
     vis_data = []
@@ -644,7 +645,12 @@ def main():
 
         # Filter the truncated episode
         filtered_ep = filter_episode_frames(ep_trunc, keep_mask)
-        filtered_episodes.append(filtered_ep)
+        kept_length = int(filtered_ep.get("_kept_length", len(filtered_ep.get("images", []))))
+        if kept_length > 0:
+            filtered_episodes.append(filtered_ep)
+        else:
+            dropped_empty_episodes += 1
+            print("    Stage 2: dropping empty filtered episode")
 
         # Stats
         stats = {
@@ -707,6 +713,7 @@ def main():
         "checkpoint": args.checkpoint,
         "num_episodes": len(episodes),
         "num_filtered_episodes": len(filtered_episodes),
+        "num_dropped_empty_episodes": dropped_empty_episodes,
     }
     with open(out_dir / "filter_config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -744,6 +751,8 @@ def main():
     print(f"  Overall: {total_orig} → {total_kept} frames ({total_kept/total_orig:.1%} of original)")
     print(f"  Mean keep ratio (of truncated): {mean_keep_of_trunc:.1%}")
     print(f"  Mean keep ratio (of original): {mean_keep_of_orig:.1%}")
+    print(f"  Non-empty filtered episodes: {len(filtered_episodes)}")
+    print(f"  Dropped empty episodes: {dropped_empty_episodes}")
     print(f"  Output: {out_dir}")
     print(f"\nPer-episode:")
     for s in all_stats:
