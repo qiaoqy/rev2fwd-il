@@ -87,6 +87,9 @@ class CubeUnstackExpert:
         # place targets: (N, 3, 2) — 3 rounds × (x, y)
         self.place_targets = None
 
+        # frozen EE pose at grasp — set when entering CLOSE, used by CLOSE & LIFT
+        self.grasp_pos = torch.zeros(num_envs, 3, device=self.device)
+
         # per-round randomization buffers
         self._rand_init = False
         self._alloc_randomization()
@@ -111,6 +114,7 @@ class CubeUnstackExpert:
         self.above_place_extra_z = torch.zeros(n, device=d)
         self.align_place_dxy = torch.zeros(n, 2, device=d)
         self.align_place_dz = torch.zeros(n, device=d)
+        self.lift_extra_z = torch.zeros(n, device=d)
         self._rand_init = True
 
     def _randomize_waypoints(self, env_ids=None):
@@ -133,6 +137,7 @@ class CubeUnstackExpert:
         self.above_place_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.0, 0.03)
         self.align_place_dxy[env_ids] = torch.empty(k, 2, device=d).uniform_(-0.003, 0.003)
         self.align_place_dz[env_ids] = torch.empty(k, device=d).uniform_(-0.02, 0.0)
+        self.lift_extra_z[env_ids] = torch.empty(k, device=d).uniform_(0.08, 0.10)
 
     # ------------------------------------------------------------------
     # Reset
@@ -258,6 +263,10 @@ class CubeUnstackExpert:
         release_pos = place_pose[:, :3].clone()
         release_pos[:, 2] = place_pose[:, 2] + release_z_off
 
+        lift_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        lift_pos[:, :2] = self.grasp_pos[:, :2]
+        lift_pos[:, 2] = self.episode_hover_z + self.lift_extra_z
+
         # State machine transitions
         for sv in UnstackState:
             mask = self.state == sv
@@ -291,10 +300,18 @@ class CubeUnstackExpert:
                 action[mask, :3] = at_obj_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_OPEN
+                # snapshot EE XYZ right before transitioning to CLOSE
+                dist = torch.norm(ee_pose[mask, :3] - at_obj_pos[mask], dim=-1)
+                about_to_close = dist < self.position_threshold
+                snapshot_envs = mask.clone()
+                snapshot_envs[mask] = about_to_close
+                if snapshot_envs.any():
+                    self.grasp_pos[snapshot_envs] = ee_pose[snapshot_envs, :3]
                 self._transition_on_reach(mask, ee_pose, at_obj_pos, UnstackState.CLOSE)
 
             elif sv == UnstackState.CLOSE:
-                action[mask, :3] = at_obj_pos[mask]
+                # use fully frozen grasp_pos (XYZ) — no live cube tracking
+                action[mask, :3] = self.grasp_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_CLOSE
                 self.wait_counter[mask] += 1
@@ -303,10 +320,10 @@ class CubeUnstackExpert:
                 self.wait_counter[transition] = 0
 
             elif sv == UnstackState.LIFT:
-                action[mask, :3] = above_obj_pos[mask]
+                action[mask, :3] = lift_pos[mask]
                 action[mask, 3:7] = self.grasp_quat
                 action[mask, 7] = GRIPPER_CLOSE
-                self._transition_on_reach(mask, ee_pose, above_obj_pos, UnstackState.APPROACH_PLACE)
+                self._transition_on_reach(mask, ee_pose, lift_pos, UnstackState.APPROACH_PLACE)
 
             elif sv == UnstackState.APPROACH_PLACE:
                 action[mask, :3] = approach_place_pos[mask]

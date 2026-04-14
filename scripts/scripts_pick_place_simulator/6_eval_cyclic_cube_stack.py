@@ -9,8 +9,9 @@ Runs N A→B cycles in the Exp44 three-cube environment.  After every task
 Success criteria (per-frame real-time detection + early stop after 20-frame buffer):
   Task A: 2-round stacking — each round requires gripper open + target cube
           height at expected z ± tolerance for 10 consecutive frames.
-          Round 1: cube_medium on cube_large (z_expected ≈ 0.07m)
-          Round 2: cube_small on cube_medium (z_expected ≈ 0.12m)
+          Round 1: cube_medium on cube_large (z_expected ≈ 0.110m, from registry init_z)
+          Round 2: cube_small on cube_medium (z_expected ≈ 0.160m, from registry init_z)
+          stable_frames=100 (cube must remain stable for 100 consecutive frames)
   Task B: cube_small AND cube_medium both XY > 10cm from stack_pos AND z < 5cm
 
 State: 8-dim (ee_pose(7) + gripper(1)), NO obj_pose.
@@ -63,7 +64,7 @@ def _parse_args() -> argparse.Namespace:
     # Task A success parameters
     parser.add_argument("--height_tolerance", type=float, default=0.015,
                         help="Z tolerance (m) for Task A height check (default: 1.5cm).")
-    parser.add_argument("--stable_frames", type=int, default=10,
+    parser.add_argument("--stable_frames", type=int, default=100,
                         help="Consecutive frames required for Task A round success.")
 
     # Task B success parameters
@@ -161,10 +162,9 @@ def main() -> None:
         stack_xy = np.array(cfg.stack_xy, dtype=np.float64)
 
         # Expected stacked heights for Task A success detection
-        # cube_medium on cube_large: large_half(0.04) + medium_half(0.03)
-        z_expected_medium = 0.07
-        # cube_small on cube_medium on cube_large: 0.04 + 0.06 + 0.02
-        z_expected_small = 0.12
+        # Use init_z from registry (= centre z when correctly stacked)
+        z_expected_medium = get_cube_def_44("cube_medium").init_z   # 0.110
+        z_expected_small = get_cube_def_44("cube_small").init_z     # 0.160
 
         # Fixed scatter positions for Task A start / Task B target
         scatter_positions = {

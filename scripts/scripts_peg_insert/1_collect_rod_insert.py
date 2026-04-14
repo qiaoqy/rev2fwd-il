@@ -13,15 +13,16 @@ For each episode:
     - ee_pose:          (T, 7)    End-effector pose [x, y, z, qw, qx, qy, qz]
     - action:           (T, 8)    Action = next-frame ee_pose(7) + gripper(1)
     - images:           (T, H, W, 3)   Table camera RGB (uint8)
-    - wrist_wrist_cam:  (T, H, W, 3)   Wrist camera RGB (uint8)
+    - wrist_images:     (T, H, W, 3)   Wrist camera RGB (uint8)
     - joint_pos:        (T, 9)    Robot joint positions (7 arm + 2 finger)
-    - rod_pose:         (T, 7)    Rod pose [x, y, z, qw, qx, qy, qz]
-    - block_pose:       (T, 7)    Block pose
+    - gripper:          (T,)      Gripper command (-1 = closed)
     - phase:            (T,)      FSM phase ID
     - episode_length:   int
     - success:          bool
     - task_type:        str ("insert")
     - phase_names:      list[str]
+
+Note: rod_pose / block_pose are NOT saved (visual-only pipeline, Exp46+).
 
 =============================================================================
 USAGE

@@ -237,8 +237,6 @@ def run_task(
     success_step = -1
     policy.reset()
 
-    action_queue = []
-
     for t in range(horizon):
         # ---- Observation ----
         ee_pos = ee_frame.data.target_pos_w[:, 0, :] - rl_env.scene.env_origins
@@ -262,46 +260,37 @@ def run_task(
         image_list.append(table_img_np)
         wrist_image_list.append(wrist_img_np)
 
-        # ---- Policy inference (when action queue is empty) ----
-        if len(action_queue) == 0:
-            # Build state
-            state_parts = [ee_pose[0:1]]  # (1, 7)
-            if include_gripper:
-                gripper_t = torch.tensor([[gripper_override]], device=device, dtype=torch.float32)
-                state_parts.append(gripper_t)
-            state = torch.cat(state_parts, dim=-1)  # (1, 7|8)
+        # ---- Policy inference (every step, like exp41) ----
+        # Build state
+        state_parts = [ee_pose[0:1]]  # (1, 7)
+        if include_gripper:
+            gripper_t = torch.tensor([[gripper_override]], device=device, dtype=torch.float32)
+            state_parts.append(gripper_t)
+        state = torch.cat(state_parts, dim=-1)  # (1, 7|8)
 
-            # Build image input: (1, 3, H, W) float [0,1]
-            table_chw = table_rgb[0].permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-            policy_inputs = {
-                "observation.image": table_chw,
-                "observation.state": state,
-            }
-            if has_wrist:
-                wrist_chw = wrist_rgb[0].permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-                policy_inputs["observation.wrist_image"] = wrist_chw
+        # Build image input: (1, 3, H, W) float [0,1]
+        table_chw = table_rgb[0].permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+        policy_inputs = {
+            "observation.image": table_chw,
+            "observation.state": state,
+        }
+        if has_wrist:
+            wrist_chw = wrist_rgb[0].permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+            policy_inputs["observation.wrist_image"] = wrist_chw
 
-            # Preprocess (normalize)
-            if preprocessor is not None:
-                policy_inputs = preprocessor(policy_inputs)
+        # Preprocess (normalize)
+        if preprocessor is not None:
+            policy_inputs = preprocessor(policy_inputs)
 
-            with torch.no_grad():
-                raw_action = policy.select_action(policy_inputs)
+        with torch.no_grad():
+            raw_action = policy.select_action(policy_inputs)
 
-            # Postprocess (unnormalize)
-            if postprocessor is not None:
-                raw_action = postprocessor(raw_action)
+        # Postprocess (unnormalize)
+        if postprocessor is not None:
+            raw_action = postprocessor(raw_action)
 
-            # raw_action shape: (1, 8) or (n_action_steps, 8)
-            if raw_action.dim() == 2 and raw_action.shape[0] > 1:
-                action_queue = list(raw_action.cpu().numpy())
-            elif raw_action.dim() == 3:
-                action_queue = list(raw_action[0].cpu().numpy())
-            else:
-                action_queue = [raw_action[0].cpu().numpy()] * n_action_steps
-
-        # ---- Get action from queue ----
-        action_np = action_queue.pop(0)
+        # select_action() returns a single action (1, 8) from internal queue
+        action_np = raw_action[0].cpu().numpy()
         # Override gripper to stay closed for rod tasks
         action_np[7] = gripper_override
         action_list.append(action_np.copy())
