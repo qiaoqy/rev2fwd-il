@@ -232,6 +232,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)
 
+    # Initialization
+    parser.add_argument("--init_checkpoint", type=str, default=None,
+                        help="Path to a critic checkpoint to initialize weights from "
+                             "(e.g. V_pre for RECAP). Loads model_state_dict only.")
+
     # State composition
     parser.add_argument("--no_obj_pose", action="store_true",
                         help="Exclude obj_pose from state (state_dim=8 instead of 15).")
@@ -345,6 +350,14 @@ def main():
         print(f"  color_jitter={args.color_jitter}")
 
     model = CriticModel(config).to(device)
+
+    # ---- Load init checkpoint (e.g. V_pre for RECAP) ----
+    if args.init_checkpoint is not None:
+        ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if is_main_process(rank):
+            init_step = ckpt.get("step", "?")
+            print(f"  Initialized from checkpoint: {args.init_checkpoint} (step={init_step})")
 
     if is_main_process(rank):
         n_params = sum(p.numel() for p in model.parameters())

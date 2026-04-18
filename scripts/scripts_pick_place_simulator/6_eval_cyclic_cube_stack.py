@@ -77,6 +77,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--early_stop_buffer", type=int, default=20,
                         help="Extra frames to record after success before stopping.")
 
+    # Post-success settle (arm → rest/home)
+    parser.add_argument("--post_success_settle_steps", type=int, default=250,
+                        help="Frames to record after success while arm returns to rest pose.")
+
     # Save options
     parser.add_argument("--save_all", action="store_true",
                         help="Save all episodes (success+failure).")
@@ -232,6 +236,9 @@ def main() -> None:
         # ── initial setup ─────────────────────────────────────────────────
         env.reset()
         pre_position_gripper_down(env)
+
+        # Capture rest/home EE pose for post-success settle
+        rest_ee_pose = get_ee_pose_w(env)[0].clone()  # (7,) — gripper-down home
 
         # ── helper: observation → policy input ────────────────────────────
         def _get_obs_gpu():
@@ -466,6 +473,33 @@ def main() -> None:
             if not success:
                 print(f"    [{task_name}] FAILED (no success within {args.horizon} steps)")
 
+            # ── post-success settle: arm → rest/home pose ─────────────────
+            if success and args.post_success_settle_steps > 0:
+                n_settle = args.post_success_settle_steps
+                print(f"    [{task_name}] Recording {n_settle} settle frames (arm → rest)")
+                settle_action_gpu = torch.zeros(1, env.action_space.shape[-1],
+                                                device=device)
+                settle_action_gpu[0, :7] = rest_ee_pose[:7]
+                settle_action_gpu[0, 7] = 1.0  # gripper open
+                settle_action_np = settle_action_gpu[0].cpu().numpy()
+
+                for _st in range(n_settle):
+                    table_rgb, wrist_rgb, ee_pose_gpu = _get_obs_gpu()
+
+                    images_list.append(
+                        table_rgb[0].cpu().numpy().astype(np.uint8))
+                    wrist_images_list.append(
+                        wrist_rgb[0].cpu().numpy().astype(np.uint8))
+                    ee_pose_list.append(ee_pose_gpu.cpu().numpy())
+                    action_list.append(settle_action_np.copy())
+
+                    for cd in CUBE_DEFS_44:
+                        cp = get_object_pose_w(
+                            env, name=cd.scene_key)[0].cpu().numpy()
+                        cube_poses[cd.scene_key].append(cp)
+
+                    env.step(settle_action_gpu)
+
             episode = {
                 "images": np.array(images_list, dtype=np.uint8),
                 "wrist_images": np.array(wrist_images_list, dtype=np.uint8),
@@ -571,6 +605,7 @@ def main() -> None:
                 "unstack_xy_threshold": args.unstack_xy_threshold,
                 "unstack_z_threshold": args.unstack_z_threshold,
                 "early_stop_buffer": args.early_stop_buffer,
+                "post_success_settle_steps": args.post_success_settle_steps,
                 "n_action_steps": args.n_action_steps,
             },
             "summary": {
